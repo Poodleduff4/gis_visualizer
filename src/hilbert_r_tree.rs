@@ -72,23 +72,19 @@ impl SpatialIndex for HilbertRTree {
         self.entries.clear();
     }
 
-    /// Hilbert path through feature centroids, skipping long inter-quadrant jumps.
     fn shapes(&self) -> Vec<LineSegment> {
-        let threshold_sq = self.jump_threshold_sq();
-        self.entries
-            .windows(2)
-            .filter_map(|w| {
-                let [ax, ay] = w[0].centroid;
-                let [bx, by] = w[1].centroid;
-                let dx = bx - ax;
-                let dy = by - ay;
-                if dx * dx + dy * dy <= threshold_sq {
-                    Some(LineSegment::new([ax, ay], [bx, by]))
-                } else {
-                    None
+        let n = 1u64 << (2 * self.order);
+        (0..n - 1)
+            .map(|i| {
+                let point1 = HilbertCurve::idx_to_point(self.order, i as u64, &self.data_rect);
+                let point2 =
+                    HilbertCurve::idx_to_point(self.order, (i + 1) as u64, &self.data_rect);
+                LineSegment {
+                    start: point1,
+                    end: point2,
                 }
             })
-            .collect()
+            .collect::<Vec<LineSegment>>()
     }
 
     fn get_capacity(&self) -> Option<usize> {

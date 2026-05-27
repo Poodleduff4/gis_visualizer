@@ -1,7 +1,8 @@
 use egui::{CentralPanel, Color32, UiKind};
+use std::sync::mpsc::{self, TryRecvError};
 
 use crate::basemap::BasemapCache;
-use crate::gis_layer::{GisLayer, LayerEntry};
+use crate::gis_layer::{GisFeature, GisLayer, LayerDescriptor, LayerEntry};
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
@@ -14,11 +15,10 @@ const LAYER_PANEL_WIDTH: f32 = 180.0;
 const FILL_NORMAL: Color32 = Color32::from_rgb(100, 149, 237);
 const FILL_SELECTED: Color32 = Color32::from_rgb(255, 165, 0);
 
-// ── App state ─────────────────────────────────────────────────────────────────
-
 pub struct GisEditorApp {
     layers: Vec<LayerEntry>,
     active_layer_idx: Option<usize>,
+    layer_picker_window_open: bool,
     viewport: Viewport,
     selected_id: Option<usize>,
     add_form: AddAttributeForm,
@@ -31,6 +31,11 @@ pub struct GisEditorApp {
     index_kind: IndexKind,
     show_heatmap: bool,
 
+    // Layer selector state (populated after file pick, before load)
+    pending_file: Option<String>,
+    pending_layers: Vec<(LayerDescriptor, bool)>,
+    load_rx: Option<mpsc::Receiver<(usize, Vec<GisFeature>)>>,
+
     // GPU point cloud state
     has_gpu: bool,
     pub point_size: f32,
@@ -42,6 +47,8 @@ pub struct GisEditorApp {
     gpu_points_buf: Vec<GpuPoint>,
     spatial_index_split_density: usize,
     last_split_density: usize,
+    hilbert_order: u32,
+    last_hilbert_order: u32,
 }
 
 impl GisEditorApp {
@@ -57,6 +64,9 @@ impl GisEditorApp {
         GisEditorApp {
             layers: Vec::new(),
             active_layer_idx: None,
+            layer_picker_window_open: false,
+            pending_file: None,
+            pending_layers: Vec::new(),
             viewport: Viewport::default(),
             selected_id: None,
             add_form: AddAttributeForm::default(),
@@ -78,13 +88,35 @@ impl GisEditorApp {
             gpu_points_buf: Vec::new(),
             spatial_index_split_density: 50,
             last_split_density: 50,
+            hilbert_order: 6,
+            last_hilbert_order: 6,
+            load_rx: None,
         }
     }
 
     fn open_file(&mut self, path: &str) {
-        match GisLayer::load_all(path) {
-            Ok(layers) if layers.is_empty() => {
+        match GisLayer::get_layers(path) {
+            Ok(descriptors) if descriptors.is_empty() => {
                 self.status = "No layers found in file.".to_string();
+            }
+            Ok(descriptors) => {
+                self.pending_layers = descriptors.into_iter().map(|d| (d, true)).collect();
+                self.pending_file = Some(path.to_string());
+            }
+            Err(e) => {
+                self.status = format!("Error reading layers: {e}");
+            }
+        }
+    }
+
+    fn load_pending(&mut self, selected_layer_indices: Vec<usize>) {
+        let Some(path) = self.pending_file.take() else {
+            return;
+        };
+        self.pending_layers.clear();
+        match GisLayer::load_selected(&path, &selected_layer_indices) {
+            Ok(layers) if layers.is_empty() => {
+                self.status = "No layers loaded.".to_string();
             }
             Ok(layers) => {
                 let total: usize = layers.iter().map(|l| l.features.len()).sum();
@@ -133,21 +165,30 @@ fn collect_gpu_points(
         }
         let is_active = active_idx == Some(i);
         for feature in &entry.layer.features {
-            if feature.tessellated.points.is_empty() {
-                continue;
-            }
             let fill = if is_active && selected_id == Some(feature.id) {
                 FILL_SELECTED
             } else {
                 FILL_NORMAL
             };
             let packed = pack_color(fill);
-            for &[wx, wy] in &feature.tessellated.points {
-                out.push(GpuPoint {
-                    position: [wx as f32, wy as f32],
-                    color: packed,
-                    size: point_size,
-                });
+            match &feature.geometry {
+                geo_types::Geometry::Point(p) => {
+                    out.push(GpuPoint {
+                        position: [p.x() as f32, p.y() as f32],
+                        color: packed,
+                        size: point_size,
+                    });
+                }
+                geo_types::Geometry::MultiPoint(mp) => {
+                    for p in &mp.0 {
+                        out.push(GpuPoint {
+                            position: [p.x() as f32, p.y() as f32],
+                            color: packed,
+                            size: point_size,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -157,7 +198,6 @@ fn collect_gpu_points(
 
 impl eframe::App for GisEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        // ── Menu bar ──────────────────────────────────────────────────────────
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("View", |ui| {
@@ -173,10 +213,17 @@ impl eframe::App for GisEditorApp {
                             );
                         });
                     }
-                    ui.add(
-                        egui::Slider::new(&mut self.spatial_index_split_density, 5..=500)
-                            .step_by(5.0),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Heatmap Opacity:");
+                        ui.add(
+                            egui::Slider::new(&mut self.spatial_index_split_density, 5..=500)
+                                .step_by(5.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Heatmap Opacity:");
+                        ui.add(egui::Slider::new(&mut self.hilbert_order, 1..=12).step_by(1.0));
+                    });
                     ui.checkbox(&mut self.show_heatmap, "Quadtree Heatmap");
                     ui.horizontal(|ui| {
                         ui.label("Heatmap Opacity:");
@@ -212,6 +259,87 @@ impl eframe::App for GisEditorApp {
                 });
             });
         });
+
+        // ── Layer selector (shown after file pick) ────────────────────────────
+        let mut load_indices: Option<Vec<usize>> = None;
+        let mut cancel_pending = false;
+        if self.pending_file.is_some() {
+            egui::Window::new("Select Layers")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label("Choose which layers to load:");
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for (desc, selected) in &mut self.pending_layers {
+                                ui.checkbox(
+                                    selected,
+                                    format!("{} ({} features)", desc.name, desc.num_features),
+                                );
+                            }
+                        });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let any_selected = self.pending_layers.iter().any(|(_, s)| *s);
+                        if ui
+                            .add_enabled(any_selected, egui::Button::new("Load"))
+                            .clicked()
+                        {
+                            load_indices = Some(
+                                self.pending_layers
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, (_, s))| *s)
+                                    .map(|(i, _)| i)
+                                    .collect(),
+                            );
+                            self.layer_picker_window_open = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_pending = true;
+                        }
+                    });
+                });
+        }
+        if let Some(indices) = load_indices {
+            let (tx, rx) = mpsc::sync_channel::<(usize, Vec<GisFeature>)>(4);
+            let path = self.pending_file.as_ref().unwrap().clone();
+            let layers = GisLayer::load_selected_without_features(&path, &indices)
+                .expect("Error loading featureless layers!");
+            let first_new = self.layers.len();
+            self.layers.extend(layers.into_iter());
+            self.active_layer_idx = Some(first_new);
+            self.status = format!("Loading {} layer(s)…", indices.len());
+            std::thread::spawn(move || {
+                for (pos, file_idx) in indices.into_iter().enumerate() {
+                    GisLayer::load_layer_batched(
+                        path.as_str(),
+                        file_idx,
+                        first_new + pos,
+                        tx.clone(),
+                    )
+                    .expect("Died inside batch layer read!");
+                }
+            });
+            self.load_rx = Some(rx);
+        } else if cancel_pending {
+            self.pending_file = None;
+            self.pending_layers.clear();
+        }
+
+        if let Some(rx) = &self.load_rx {
+            for (layer_idx, batch) in rx.try_iter() {
+                self.layers[layer_idx].layer.features.extend(batch);
+                self.points_dirty = true;
+            }
+            if let Err(TryRecvError::Disconnected) = rx.try_recv() {
+                self.load_rx = None;
+                self.status = "Ready".to_string();
+            }
+        }
 
         // ── Status bar ────────────────────────────────────────────────────────
         egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
@@ -339,6 +467,14 @@ impl eframe::App for GisEditorApp {
                 entry.layer.rebuild_quadtree(capacity);
             }
             self.last_split_density = capacity;
+            self.points_dirty = true;
+        }
+        if self.hilbert_order != self.last_hilbert_order {
+            let order = self.hilbert_order;
+            for entry in &mut self.layers {
+                entry.layer.rebuild_hilbert_tree(order);
+            }
+            self.last_hilbert_order = order;
             self.points_dirty = true;
         }
 

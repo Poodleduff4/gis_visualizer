@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc;
 
 use crate::hilbert_r_tree::HilbertRTree;
 use crate::quadtree::Quadtree;
 use crate::spatial_index::{IndexKind, SpatialIndex};
 use anyhow::{anyhow, Result};
-use gdal::vector::{FieldValue, LayerAccess, OGRFieldType, OGRwkbGeometryType};
+use gdal::vector::{FieldValue, Layer, LayerAccess, OGRFieldType, OGRwkbGeometryType};
 use gdal::Dataset;
 use geo::BoundingRect;
 use geo_types::{
@@ -211,7 +212,6 @@ pub struct GisFeature {
     pub geometry: Geometry<f64>,
     pub tessellated: TessellatedGeom,
     pub attributes: HashMap<String, AttributeValue>,
-    pub bbox: [f64; 4],
 }
 
 impl GisFeature {
@@ -220,15 +220,20 @@ impl GisFeature {
         geometry: Geometry<f64>,
         attributes: HashMap<String, AttributeValue>,
     ) -> Self {
-        let tessellated = tessellate(&geometry);
-        let bbox = bounding_box(&geometry);
+        let tessellated = match &geometry {
+            Geometry::Point(_) | Geometry::MultiPoint(_) => TessellatedGeom::empty(),
+            _ => tessellate(&geometry),
+        };
         GisFeature {
             id,
             geometry,
             tessellated,
             attributes,
-            bbox,
         }
+    }
+
+    pub fn bbox(&self) -> [f64; 4] {
+        bounding_box(&self.geometry)
     }
 }
 
@@ -284,13 +289,60 @@ impl GisLayer {
     pub fn rebuild_quadtree(&mut self, capacity: usize) {
         let mut qt: Box<dyn SpatialIndex> = Box::new(Quadtree::new(self.world_bbox, capacity));
         for f in &self.features {
-            qt.insert(f.id, f.bbox);
+            qt.insert(f.id, f.bbox());
         }
         self.quadtree = qt;
+    }
+
+    pub fn rebuild_hilbert_tree(&mut self, order: u32) {
+        let mut ht: Box<dyn SpatialIndex> = Box::new(HilbertRTree::new(self.world_bbox, order));
+        for f in &self.features {
+            ht.insert(f.id, f.bbox());
+        }
+        self.hilbert = ht;
     }
 }
 
 impl GisLayer {
+    pub fn get_layers(path: &str) -> Result<Vec<LayerDescriptor>, Box<dyn std::error::Error>> {
+        let dataset = Dataset::open(Path::new(path)).expect("Invalid file path!");
+        let count = dataset.layer_count();
+        Ok((0..count)
+            .map(|i| {
+                let layer = dataset.layer(i).unwrap();
+                LayerDescriptor {
+                    name: layer.name(),
+                    num_features: layer.feature_count(),
+                }
+            })
+            .collect::<Vec<LayerDescriptor>>())
+    }
+
+    pub fn load_selected_without_features(
+        path: &str,
+        indices: &[usize],
+    ) -> Result<Vec<LayerEntry>, Box<dyn std::error::Error>> {
+        let dataset = Dataset::open(Path::new(path))?;
+        let mut layers = Vec::new();
+        for &i in indices {
+            match GisLayer::load_layer_without_features(&dataset, i, &path) {
+                Ok(layer) => {
+                    let name = layer.name.clone();
+                    layers.push(LayerEntry {
+                        visible: true,
+                        color: [0, 0, 255],
+                        opacity: 255,
+                        layer,
+                        name,
+                    });
+                }
+
+                Err(_) => {}
+            }
+        }
+        Ok(layers)
+    }
+
     pub fn load_all(path: &str) -> Result<Vec<Self>> {
         let dataset = Dataset::open(Path::new(path))?;
         let count = dataset.layer_count();
@@ -302,6 +354,58 @@ impl GisLayer {
             }
         }
         Ok(layers)
+    }
+
+    pub fn load_selected(path: &str, indices: &[usize]) -> Result<Vec<Self>> {
+        let dataset = Dataset::open(Path::new(path))?;
+        let mut layers = Vec::new();
+        for &i in indices {
+            match Self::load_layer(&dataset, i, path) {
+                Ok(layer) => layers.push(layer),
+                Err(_) => {}
+            }
+        }
+        Ok(layers)
+    }
+
+    pub fn load_selected_batched(
+        path: &str,
+        indices: &[usize],
+        tx: mpsc::SyncSender<Vec<GisFeature>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dataset = Dataset::open(Path::new(path))?;
+        // let mut layers = Vec::new();
+        // for &i in indices {
+        //     match Self::load_layer_batched(&dataset, i, path, tx.clone()) {
+        //         Ok(layer) => layers.push(layer),
+        //         Err(_) => {}
+        //     }
+        // }
+        Ok(())
+    }
+
+    pub fn load_layer_without_features(
+        dataset: &Dataset,
+        layer_idx: usize,
+        path: &str,
+    ) -> Result<Self> {
+        let mut layer = dataset.layer(layer_idx)?;
+        let name = layer.name();
+
+        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
+        let num_features = layer.feature_count() as usize;
+        let features: Vec<GisFeature> = Vec::with_capacity(num_features);
+        Ok(GisLayer {
+            name,
+            file_path: path.to_string(),
+            features,
+            field_names,
+            extra_field_names: Vec::new(),
+            quadtree: Box::new(Quadtree::new([0.0, 0.0, 0.0, 0.0], 100)),
+            hilbert: Box::new(HilbertRTree::new([0.0, 0.0, 0.0, 0.0], 1)),
+            point_only: true,
+            world_bbox: [0.0, 0.0, 0.0, 0.0],
+        })
     }
 
     fn load_layer(dataset: &Dataset, layer_idx: usize, path: &str) -> Result<Self> {
@@ -344,10 +448,11 @@ impl GisLayer {
             let mut xmax = f64::MIN;
             let mut ymax = f64::MIN;
             for f in &features {
-                xmin = xmin.min(f.bbox[0]);
-                ymin = ymin.min(f.bbox[1]);
-                xmax = xmax.max(f.bbox[2]);
-                ymax = ymax.max(f.bbox[3]);
+                let bb = f.bbox();
+                xmin = xmin.min(bb[0]);
+                ymin = ymin.min(bb[1]);
+                xmax = xmax.max(bb[2]);
+                ymax = ymax.max(bb[3]);
             }
             let pad_x = (xmax - xmin).abs() * 0.01;
             let pad_y = (ymax - ymin).abs() * 0.01;
@@ -355,11 +460,11 @@ impl GisLayer {
         };
 
         let mut quadtree: Box<dyn SpatialIndex> = Box::new(Quadtree::new(world_bbox, 100));
-        let mut hilbert: Box<dyn SpatialIndex> = Box::new(HilbertRTree::new(world_bbox, 12));
+        let mut hilbert: Box<dyn SpatialIndex> = Box::new(HilbertRTree::new(world_bbox, 4));
         let mut point_only = true;
         for f in &features {
-            quadtree.insert(f.id, f.bbox);
-            hilbert.insert(f.id, f.bbox);
+            quadtree.insert(f.id, f.bbox());
+            hilbert.insert(f.id, f.bbox());
             if !f.tessellated.fill_idx.is_empty() || !f.tessellated.outlines.is_empty() {
                 point_only = false;
             }
@@ -376,6 +481,57 @@ impl GisLayer {
             point_only,
             world_bbox,
         })
+    }
+
+    pub fn load_layer_batched(
+        path: &str,
+        layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<(usize, Vec<GisFeature>)>,
+    ) -> Result<()> {
+        let dataset = Dataset::open(path)?;
+        let mut layer = dataset.layer(layer_idx)?;
+        let name = layer.name();
+
+        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
+
+        // let mut features: Vec<GisFeature> = Vec::new();
+
+        let mut batch: Vec<GisFeature> = Vec::with_capacity(10000);
+        let mut count = 0;
+        for feature in layer.features() {
+            let mut attributes: HashMap<String, AttributeValue> = HashMap::new();
+
+            for (i, fname) in field_names.iter().enumerate() {
+                if let Ok(Some(val)) = feature.field(i) {
+                    let attr = match val {
+                        FieldValue::IntegerValue(v) => AttributeValue::Integer(v as i64),
+                        FieldValue::Integer64Value(v) => AttributeValue::Integer(v),
+                        FieldValue::RealValue(v) => AttributeValue::Float(v),
+                        FieldValue::StringValue(v) => AttributeValue::Text(v),
+                        _ => continue,
+                    };
+                    attributes.insert(fname.clone(), attr);
+                }
+            }
+
+            if let Some(geom_ref) = feature.geometry() {
+                if let Some(geo_geom) = gdal_geom_to_geo(geom_ref) {
+                    let id = count;
+                    batch.push(GisFeature::new(id, geo_geom, attributes));
+                    count += 1;
+
+                    if batch.len() >= batch.capacity() {
+                        tx.send((dest_idx, std::mem::replace(&mut batch, Vec::with_capacity(10000)))).ok();
+                    }
+                }
+            }
+        }
+        if !batch.is_empty() {
+            tx.send((dest_idx, batch))?;
+        }
+
+        Ok(())
     }
 
     /// Returns IDs of features whose center points fall within the viewport.
@@ -426,10 +582,11 @@ impl GisLayer {
         let mut xmax = f64::MIN;
         let mut ymax = f64::MIN;
         for f in &self.features {
-            xmin = xmin.min(f.bbox[0]);
-            ymin = ymin.min(f.bbox[1]);
-            xmax = xmax.max(f.bbox[2]);
-            ymax = ymax.max(f.bbox[3]);
+            let bb = f.bbox();
+            xmin = xmin.min(bb[0]);
+            ymin = ymin.min(bb[1]);
+            xmax = xmax.max(bb[2]);
+            ymax = ymax.max(bb[3]);
         }
         Some([xmin, ymin, xmax, ymax])
     }
@@ -666,4 +823,9 @@ fn infer_ogr_type(geom: &Geometry<f64>) -> OGRwkbGeometryType::Type {
         Geometry::MultiPolygon(_) => OGRwkbGeometryType::wkbMultiPolygon,
         _ => OGRwkbGeometryType::wkbUnknown,
     }
+}
+
+pub struct LayerDescriptor {
+    pub name: String,
+    pub num_features: u64,
 }
