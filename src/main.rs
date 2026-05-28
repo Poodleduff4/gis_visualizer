@@ -10,6 +10,7 @@ mod point_cloud_layer;
 mod quadtree;
 mod sidebar;
 mod spatial_index;
+mod uncertainty_quadtree;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {

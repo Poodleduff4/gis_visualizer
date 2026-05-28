@@ -50,6 +50,9 @@ pub struct GisEditorApp {
     last_split_density: usize,
     hilbert_order: u32,
     last_hilbert_order: u32,
+    last_viewport_center: [f64; 2],
+    last_viewport_ppu: f64,
+    last_canvas_rect: Option<egui::Rect>,
 }
 
 impl GisEditorApp {
@@ -92,6 +95,9 @@ impl GisEditorApp {
             hilbert_order: 6,
             last_hilbert_order: 6,
             load_rx: None,
+            last_viewport_center: Default::default(),
+            last_viewport_ppu: Default::default(),
+            last_canvas_rect: None,
         }
     }
 
@@ -157,6 +163,7 @@ fn collect_gpu_points(
     layers: &[LayerEntry],
     active_idx: Option<usize>,
     selected_id: Option<usize>,
+    viewport_bbox: Option<[f64; 4]>,
     point_size: f32,
     out: &mut Vec<GpuPoint>,
 ) {
@@ -175,7 +182,14 @@ fn collect_gpu_points(
             LayerKind::Points(pc) => pc,
             LayerKind::Vector(gis_layer) => panic!("Unexpected layer kind in collect_gpu_points!"),
         };
-        for (idx, point) in point_cloud_layer.points.iter().enumerate() {
+        let indices: Box<dyn Iterator<Item = usize>> =
+            if let (Some(bbox), Some(index)) = (viewport_bbox, &point_cloud_layer.index) {
+                Box::new(index.search(&bbox).into_iter())
+            } else {
+                Box::new(0..point_cloud_layer.points.len())
+            };
+        for idx in indices {
+            let point = point_cloud_layer.points[idx];
             let fill = if is_active && selected_id == Some(idx) {
                 FILL_SELECTED
             } else {
@@ -302,7 +316,7 @@ impl eframe::App for GisEditorApp {
                 });
         }
         if let Some(indices) = load_indices {
-            let (tx, rx) = mpsc::sync_channel::<BatchMessage>(4);
+            let (tx, rx) = mpsc::sync_channel::<BatchMessage>(10);
             let path = self.pending_file.take().unwrap();
             self.pending_layers.clear();
             let layers = GisLayer::load_selected_without_features(&path, &indices)
@@ -549,8 +563,15 @@ impl eframe::App for GisEditorApp {
             let layer_changed = self.layers.len() != self.last_layer_count;
             let selection_changed = self.selected_id != self.last_selected_id;
             let size_changed = self.point_size != self.last_point_size;
+            let viewport_changed = self.viewport.center != self.last_viewport_center
+                || self.last_viewport_ppu != self.viewport.pixels_per_unit;
 
-            if self.points_dirty || layer_changed || selection_changed || size_changed {
+            if self.points_dirty
+                || layer_changed
+                || selection_changed
+                || size_changed
+                || viewport_changed
+            {
                 if let Some(wrs) = frame.wgpu_render_state() {
                     let device = &wrs.device;
                     let queue = &wrs.queue;
@@ -562,6 +583,8 @@ impl eframe::App for GisEditorApp {
                             &self.layers,
                             self.active_layer_idx,
                             self.selected_id,
+                            self.last_canvas_rect
+                                .map(|rect| self.viewport.viewport_bbox(rect)),
                             self.point_size,
                             &mut self.gpu_points_buf,
                         );
@@ -572,6 +595,8 @@ impl eframe::App for GisEditorApp {
                 self.last_selected_id = self.selected_id;
                 self.last_point_size = self.point_size;
                 self.last_layer_count = self.layers.len();
+                self.last_viewport_center = self.viewport.center;
+                self.last_viewport_ppu = self.viewport.pixels_per_unit;
             }
         }
 
@@ -595,6 +620,7 @@ impl eframe::App for GisEditorApp {
 
             let (response, painter) =
                 ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+            self.last_canvas_rect = Some(response.rect);
 
             // CPU geometry: background, basemap, polygons, lines.
             // Points are skipped here when the GPU path is active.

@@ -225,6 +225,14 @@ impl PointCloudPipeline {
         queue: &wgpu::Queue,
         points: &[GpuPoint],
     ) {
+        // wgpu hard limit is 256 MiB; clamp silently until viewport culling lands.
+        const MAX_POINTS: usize = (256 * 1024 * 1024) / std::mem::size_of::<GpuPoint>();
+        let points = if points.len() > MAX_POINTS {
+            &points[..MAX_POINTS]
+        } else {
+            points
+        };
+
         self.point_count = points.len() as u32;
         if points.is_empty() {
             return;
