@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::fmt::Error;
 use std::path::Path;
 use std::sync::mpsc;
 
 use crate::hilbert_r_tree::HilbertRTree;
+use crate::point_cloud_layer::PointCloudLayer;
 use crate::quadtree::Quadtree;
 use crate::spatial_index::{IndexKind, SpatialIndex};
 use anyhow::{anyhow, Result};
-use gdal::vector::{FieldValue, Layer, LayerAccess, OGRFieldType, OGRwkbGeometryType};
+use gdal::vector::{FieldValue, LayerAccess, OGRFieldType, OGRwkbGeometryType};
 use gdal::Dataset;
 use geo::BoundingRect;
 use geo_types::{
@@ -257,49 +259,156 @@ fn bounding_box(geom: &Geometry<f64>) -> [f64; 4] {
     }
 }
 
+pub enum BatchMessage {
+    Points(usize, Vec<[f64; 2]>),
+    Vector(usize, Vec<GisFeature>),
+}
+
+pub enum LayerKind {
+    Points(PointCloudLayer),
+    Vector(GisLayer),
+}
+impl LayerKind {
+    pub fn features_in_bbox(&self, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Vec<usize> {
+        self.index(IndexKind::Quadtree)
+            .map(|i| i.search(&[xmin, ymin, xmax, ymax]))
+            .unwrap_or(Vec::new())
+    }
+    pub fn feature_count(&self) -> usize {
+        match self {
+            LayerKind::Vector(gis_layer) => gis_layer.features.len(),
+            LayerKind::Points(point_cloud_layer) => point_cloud_layer.points.len(),
+        }
+    }
+    pub fn feature(&self, idx: usize) -> Option<&GisFeature> {
+        match self {
+            LayerKind::Vector(gis_layer) => Some(&gis_layer.features[idx]),
+            LayerKind::Points(point_cloud_layer) => None,
+        }
+    }
+    pub fn field_names(&self) -> Vec<String> {
+        match self {
+            LayerKind::Points(point_cloud_layer) => point_cloud_layer.field_names.clone(),
+            LayerKind::Vector(gis_layer) => gis_layer.field_names.clone(),
+        }
+    }
+    pub fn index(&self, kind: IndexKind) -> Option<&dyn SpatialIndex> {
+        match self {
+            LayerKind::Points(point_cloud_layer) => {
+                point_cloud_layer.index.as_ref().map(|b| b.as_ref())
+            }
+            LayerKind::Vector(gis_layer) => gis_layer.index(kind),
+        }
+    }
+    pub fn extent(&self) -> Option<[f64; 4]> {
+        match self {
+            LayerKind::Points(point_cloud_layer) => point_cloud_layer.bbox,
+            LayerKind::Vector(gis_layer) => Some(gis_layer.world_bbox),
+        }
+    }
+    pub fn hit_test(&self, x: f64, y: f64, tolerance: f64) -> Option<usize> {
+        match self {
+            LayerKind::Points(point_cloud_layer) => point_cloud_layer.hit_test(x, y, tolerance),
+            LayerKind::Vector(gis_layer) => gis_layer.hit_test(x, y, tolerance),
+        }
+    }
+}
 // LayerEntry
 pub struct LayerEntry {
-    pub layer: GisLayer,
+    pub data: LayerKind,
     pub visible: bool,
     pub name: String,
     pub color: [u8; 3],
     pub opacity: u8,
 }
+impl LayerEntry {
+    pub fn load_point_layer_without_features(
+        dataset: &Dataset,
+        layer_idx: usize,
+        path: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut layer = dataset.layer(layer_idx)?;
+        let name = layer.name();
+        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
+        let num_features = layer.feature_count() as usize;
 
+        let layer_kind = layer
+            .feature(0)
+            .and_then(|f| match gdal_geom_to_geo(f.geometry()?) {
+                Some(geo_types::Geometry::Point::<f64>(_)) => {
+                    Some(LayerKind::Points(PointCloudLayer::default()))
+                }
+                _ => Some(LayerKind::Vector(GisLayer::default())),
+            })
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "Could not determine layer kind from first feature".into()
+            })?;
+
+        Ok(LayerEntry {
+            data: layer_kind,
+            visible: true,
+            name,
+            color: [0, 0, 255],
+            opacity: 255,
+        })
+    }
+}
+
+#[derive(Default)]
 pub struct GisLayer {
     pub name: String,
     pub file_path: String,
     pub features: Vec<GisFeature>,
     pub field_names: Vec<String>,
     pub extra_field_names: Vec<String>,
-    pub quadtree: Box<dyn SpatialIndex>,
-    pub hilbert: Box<dyn SpatialIndex>,
+    pub quadtree: Option<Box<dyn SpatialIndex>>,
+    pub hilbert: Option<Box<dyn SpatialIndex>>,
     pub point_only: bool,
     pub world_bbox: [f64; 4],
 }
 
 impl GisLayer {
-    pub fn index(&self, kind: IndexKind) -> &dyn SpatialIndex {
+    pub fn index(&self, kind: IndexKind) -> Option<&dyn SpatialIndex> {
         match kind {
-            IndexKind::Quadtree => self.quadtree.as_ref(),
-            IndexKind::Hilbert => self.hilbert.as_ref(),
+            IndexKind::Quadtree => self.quadtree.as_ref().map(|b| b.as_ref()),
+            IndexKind::Hilbert => self.hilbert.as_ref().map(|b| b.as_ref()),
         }
     }
 
+    fn ensure_world_bbox(&mut self) {
+        if self.features.is_empty() {
+            return;
+        }
+        let mut xmin = f64::MAX;
+        let mut ymin = f64::MAX;
+        let mut xmax = f64::MIN;
+        let mut ymax = f64::MIN;
+        for f in &self.features {
+            let bb = f.bbox();
+            xmin = xmin.min(bb[0]);
+            ymin = ymin.min(bb[1]);
+            xmax = xmax.max(bb[2]);
+            ymax = ymax.max(bb[3]);
+        }
+        self.world_bbox = [xmin, ymin, xmax, ymax];
+    }
+
     pub fn rebuild_quadtree(&mut self, capacity: usize) {
+        self.ensure_world_bbox();
         let mut qt: Box<dyn SpatialIndex> = Box::new(Quadtree::new(self.world_bbox, capacity));
         for f in &self.features {
             qt.insert(f.id, f.bbox());
         }
-        self.quadtree = qt;
+        self.quadtree = Some(qt);
     }
 
     pub fn rebuild_hilbert_tree(&mut self, order: u32) {
+        self.ensure_world_bbox();
         let mut ht: Box<dyn SpatialIndex> = Box::new(HilbertRTree::new(self.world_bbox, order));
         for f in &self.features {
             ht.insert(f.id, f.bbox());
         }
-        self.hilbert = ht;
+        self.hilbert = Some(ht);
     }
 }
 
@@ -329,10 +438,10 @@ impl GisLayer {
                 Ok(layer) => {
                     let name = layer.name.clone();
                     layers.push(LayerEntry {
+                        data: layer.data,
                         visible: true,
                         color: [0, 0, 255],
                         opacity: 255,
-                        layer,
                         name,
                     });
                 }
@@ -343,151 +452,147 @@ impl GisLayer {
         Ok(layers)
     }
 
-    pub fn load_all(path: &str) -> Result<Vec<Self>> {
-        let dataset = Dataset::open(Path::new(path))?;
-        let count = dataset.layer_count();
-        let mut layers = Vec::new();
-        for i in 0..count {
-            match Self::load_layer(&dataset, i, path) {
-                Ok(layer) => layers.push(layer),
-                Err(_) => {}
-            }
-        }
-        Ok(layers)
-    }
+    // pub fn load_all(path: &str) -> Result<Vec<Self>> {
+    //     let dataset = Dataset::open(Path::new(path))?;
+    //     let count = dataset.layer_count();
+    //     let mut layers = Vec::new();
+    //     for i in 0..count {
+    //         match Self::load_layer(&dataset, i, path) {
+    //             Ok(layer) => layers.push(layer),
+    //             Err(_) => {}
+    //         }
+    //     }
+    //     Ok(layers)
+    // }
 
-    pub fn load_selected(path: &str, indices: &[usize]) -> Result<Vec<Self>> {
-        let dataset = Dataset::open(Path::new(path))?;
-        let mut layers = Vec::new();
-        for &i in indices {
-            match Self::load_layer(&dataset, i, path) {
-                Ok(layer) => layers.push(layer),
-                Err(_) => {}
-            }
-        }
-        Ok(layers)
-    }
-
-    pub fn load_selected_batched(
-        path: &str,
-        indices: &[usize],
-        tx: mpsc::SyncSender<Vec<GisFeature>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let dataset = Dataset::open(Path::new(path))?;
-        // let mut layers = Vec::new();
-        // for &i in indices {
-        //     match Self::load_layer_batched(&dataset, i, path, tx.clone()) {
-        //         Ok(layer) => layers.push(layer),
-        //         Err(_) => {}
-        //     }
-        // }
-        Ok(())
-    }
+    // pub fn load_selected(path: &str, indices: &[usize]) -> Result<Vec<Self>> {
+    //     let dataset = Dataset::open(Path::new(path))?;
+    //     let mut layers = Vec::new();
+    //     for &i in indices {
+    //         match Self::load_layer(&dataset, i, path) {
+    //             Ok(layer) => layers.push(layer),
+    //             Err(_) => {}
+    //         }
+    //     }
+    //     Ok(layers)
+    // }
 
     pub fn load_layer_without_features(
         dataset: &Dataset,
         layer_idx: usize,
         path: &str,
-    ) -> Result<Self> {
+    ) -> Result<LayerEntry> {
         let mut layer = dataset.layer(layer_idx)?;
         let name = layer.name();
 
         let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
         let num_features = layer.feature_count() as usize;
+        if num_features == 0 {
+            return Err(anyhow!("No Features in Layer"));
+        }
         let features: Vec<GisFeature> = Vec::with_capacity(num_features);
-        Ok(GisLayer {
-            name,
-            file_path: path.to_string(),
-            features,
-            field_names,
-            extra_field_names: Vec::new(),
-            quadtree: Box::new(Quadtree::new([0.0, 0.0, 0.0, 0.0], 100)),
-            hilbert: Box::new(HilbertRTree::new([0.0, 0.0, 0.0, 0.0], 1)),
-            point_only: true,
-            world_bbox: [0.0, 0.0, 0.0, 0.0],
-        })
-    }
-
-    fn load_layer(dataset: &Dataset, layer_idx: usize, path: &str) -> Result<Self> {
-        let mut layer = dataset.layer(layer_idx)?;
-        let name = layer.name();
-
-        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
-
-        let mut features: Vec<GisFeature> = Vec::new();
-
-        for feature in layer.features() {
-            let mut attributes: HashMap<String, AttributeValue> = HashMap::new();
-
-            for (i, fname) in field_names.iter().enumerate() {
-                if let Ok(Some(val)) = feature.field(i) {
-                    let attr = match val {
-                        FieldValue::IntegerValue(v) => AttributeValue::Integer(v as i64),
-                        FieldValue::Integer64Value(v) => AttributeValue::Integer(v),
-                        FieldValue::RealValue(v) => AttributeValue::Float(v),
-                        FieldValue::StringValue(v) => AttributeValue::Text(v),
-                        _ => continue,
-                    };
-                    attributes.insert(fname.clone(), attr);
-                }
+        let layer_kind = match gdal_geom_to_geo(
+            layer
+                .features()
+                .next()
+                .unwrap()
+                .geometry()
+                .expect("Feature missing geometry!"),
+        ) {
+            Some(geo_types::Geometry::Point::<f64>(p)) => {
+                LayerKind::Points(PointCloudLayer::default())
             }
-
-            if let Some(geom_ref) = feature.geometry() {
-                if let Some(geo_geom) = gdal_geom_to_geo(geom_ref) {
-                    let id = features.len();
-                    features.push(GisFeature::new(id, geo_geom, attributes));
-                }
-            }
-        }
-
-        let world_bbox = if features.is_empty() {
-            [-180.0, -90.0, 180.0, 90.0]
-        } else {
-            let mut xmin = f64::MAX;
-            let mut ymin = f64::MAX;
-            let mut xmax = f64::MIN;
-            let mut ymax = f64::MIN;
-            for f in &features {
-                let bb = f.bbox();
-                xmin = xmin.min(bb[0]);
-                ymin = ymin.min(bb[1]);
-                xmax = xmax.max(bb[2]);
-                ymax = ymax.max(bb[3]);
-            }
-            let pad_x = (xmax - xmin).abs() * 0.01;
-            let pad_y = (ymax - ymin).abs() * 0.01;
-            [xmin - pad_x, ymin - pad_y, xmax + pad_x, ymax + pad_y]
+            _ => LayerKind::Vector(GisLayer::default()),
         };
-
-        let mut quadtree: Box<dyn SpatialIndex> = Box::new(Quadtree::new(world_bbox, 100));
-        let mut hilbert: Box<dyn SpatialIndex> = Box::new(HilbertRTree::new(world_bbox, 4));
-        let mut point_only = true;
-        for f in &features {
-            quadtree.insert(f.id, f.bbox());
-            hilbert.insert(f.id, f.bbox());
-            if !f.tessellated.fill_idx.is_empty() || !f.tessellated.outlines.is_empty() {
-                point_only = false;
-            }
-        }
-
-        Ok(GisLayer {
+        Ok(LayerEntry {
+            data: layer_kind,
+            visible: true,
             name,
-            file_path: path.to_string(),
-            features,
-            field_names,
-            extra_field_names: Vec::new(),
-            quadtree,
-            hilbert,
-            point_only,
-            world_bbox,
+            color: [0, 0, 255],
+            opacity: 255,
         })
     }
+
+    // fn load_layer(dataset: &Dataset, layer_idx: usize, path: &str) -> Result<Self> {
+    //     let mut layer = dataset.layer(layer_idx)?;
+    //     let name = layer.name();
+
+    //     let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
+
+    //     let mut features: Vec<GisFeature> = Vec::new();
+
+    //     for feature in layer.features() {
+    //         let mut attributes: HashMap<String, AttributeValue> = HashMap::new();
+
+    //         for (i, fname) in field_names.iter().enumerate() {
+    //             if let Ok(Some(val)) = feature.field(i) {
+    //                 let attr = match val {
+    //                     FieldValue::IntegerValue(v) => AttributeValue::Integer(v as i64),
+    //                     FieldValue::Integer64Value(v) => AttributeValue::Integer(v),
+    //                     FieldValue::RealValue(v) => AttributeValue::Float(v),
+    //                     FieldValue::StringValue(v) => AttributeValue::Text(v),
+    //                     _ => continue,
+    //                 };
+    //                 attributes.insert(fname.clone(), attr);
+    //             }
+    //         }
+
+    //         if let Some(geom_ref) = feature.geometry() {
+    //             if let Some(geo_geom) = gdal_geom_to_geo(geom_ref) {
+    //                 let id = features.len();
+    //                 features.push(GisFeature::new(id, geo_geom, attributes));
+    //             }
+    //         }
+    //     }
+
+    //     let world_bbox = if features.is_empty() {
+    //         [-180.0, -90.0, 180.0, 90.0]
+    //     } else {
+    //         let mut xmin = f64::MAX;
+    //         let mut ymin = f64::MAX;
+    //         let mut xmax = f64::MIN;
+    //         let mut ymax = f64::MIN;
+    //         for f in &features {
+    //             let bb = f.bbox();
+    //             xmin = xmin.min(bb[0]);
+    //             ymin = ymin.min(bb[1]);
+    //             xmax = xmax.max(bb[2]);
+    //             ymax = ymax.max(bb[3]);
+    //         }
+    //         let pad_x = (xmax - xmin).abs() * 0.01;
+    //         let pad_y = (ymax - ymin).abs() * 0.01;
+    //         [xmin - pad_x, ymin - pad_y, xmax + pad_x, ymax + pad_y]
+    //     };
+
+    //     let mut quadtree: Box<dyn SpatialIndex> = Box::new(Quadtree::new(world_bbox, 100));
+    //     let mut hilbert: Box<dyn SpatialIndex> = Box::new(HilbertRTree::new(world_bbox, 4));
+    //     let mut point_only = true;
+    //     for f in &features {
+    //         quadtree.insert(f.id, f.bbox());
+    //         hilbert.insert(f.id, f.bbox());
+    //         if !f.tessellated.fill_idx.is_empty() || !f.tessellated.outlines.is_empty() {
+    //             point_only = false;
+    //         }
+    //     }
+
+    //     Ok(GisLayer {
+    //         name,
+    //         file_path: path.to_string(),
+    //         features,
+    //         field_names,
+    //         extra_field_names: Vec::new(),
+    //         quadtree,
+    //         hilbert,
+    //         point_only,
+    //         world_bbox,
+    //     })
+    // }
 
     pub fn load_layer_batched(
         path: &str,
         layer_idx: usize,
         dest_idx: usize,
-        tx: mpsc::SyncSender<(usize, Vec<GisFeature>)>,
+        tx: mpsc::SyncSender<BatchMessage>,
     ) -> Result<()> {
         let dataset = Dataset::open(path)?;
         let mut layer = dataset.layer(layer_idx)?;
@@ -522,30 +627,83 @@ impl GisLayer {
                     count += 1;
 
                     if batch.len() >= batch.capacity() {
-                        tx.send((dest_idx, std::mem::replace(&mut batch, Vec::with_capacity(10000)))).ok();
+                        tx.send(BatchMessage::Vector(
+                            dest_idx,
+                            std::mem::replace(&mut batch, Vec::with_capacity(10000)),
+                        ))
+                        .ok();
                     }
                 }
             }
         }
         if !batch.is_empty() {
-            tx.send((dest_idx, batch))?;
+            tx.send(BatchMessage::Vector(dest_idx, batch))?;
         }
 
         Ok(())
     }
 
+    pub fn load_point_layer_batched(
+        path: &str,
+        layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+    ) -> Result<()> {
+        let dataset = gdal::Dataset::open(path)?;
+        let mut layer = dataset.layer(layer_idx)?;
+        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
+        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(10000);
+        for feature in layer.features() {
+            // let mut attributes: HashMap<String, AttributeValue> = HashMap::new();
+            // for (i, fname) in field_names.iter().enumerate() {
+            //     if let Ok(Some(val)) = feature.field(i) {
+            //         let attr = match val {
+            //             FieldValue::IntegerValue(v) => AttributeValue::Integer(v as i64),
+            //             FieldValue::Integer64Value(v) => AttributeValue::Integer(v),
+            //             FieldValue::RealValue(v) => AttributeValue::Float(v),
+            //             FieldValue::StringValue(v) => AttributeValue::Text(v),
+            //             _ => continue,
+            //         };
+            //         attributes.insert(fname.clone(), attr);
+            //     }
+            // }
+            if let Some(geom_ref) = feature.geometry() {
+                if let Some(geo_types::Geometry::Point(p)) = gdal_geom_to_geo(geom_ref) {
+                    batch.push([p.x(), p.y()]);
+                    if batch.len() >= batch.capacity() {
+                        tx.send(BatchMessage::Points(
+                            dest_idx,
+                            std::mem::replace(&mut batch, Vec::with_capacity(10000)),
+                        ))
+                        .ok();
+                    }
+                }
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Points(dest_idx, batch))?;
+        }
+        Ok(())
+    }
+
     /// Returns IDs of features whose center points fall within the viewport.
     pub fn features_in_bbox(&self, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Vec<usize> {
-        self.quadtree.search(&[xmin, ymin, xmax, ymax])
+        self.quadtree
+            .as_ref()
+            .map(|i| i.search(&[xmin, ymin, xmax, ymax]))
+            .unwrap_or(Vec::new())
     }
 
     /// Returns the ID of the first feature containing (or near) the world point.
     pub fn hit_test(&self, x: f64, y: f64, tolerance: f64) -> Option<usize> {
         use geo::{Contains, Distance, Euclidean};
 
-        let candidates: Vec<usize> =
-            self.quadtree
-                .search(&[x - tolerance, y - tolerance, x + tolerance, y + tolerance]);
+        let candidates: Vec<usize> = self
+            .index(IndexKind::Quadtree)
+            .map(|index| {
+                index.search(&[x - tolerance, y - tolerance, x + tolerance, y + tolerance])
+            })
+            .unwrap_or(Vec::new());
 
         let pt = Point::new(x, y);
 
@@ -672,7 +830,7 @@ impl GisLayer {
     }
 }
 
-fn gdal_geom_to_geo(geom: &gdal::vector::Geometry) -> Option<Geometry<f64>> {
+fn gdal_geom_to_geo(geom: &gdal::vector::Geometry) -> Option<geo_types::Geometry> {
     use OGRwkbGeometryType as T;
 
     let gt = geom.geometry_type();

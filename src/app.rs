@@ -1,8 +1,9 @@
 use egui::{CentralPanel, Color32, UiKind};
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc::{self, SyncSender, TryRecvError};
+use wgpu::naga::proc::vector_size_str;
 
 use crate::basemap::BasemapCache;
-use crate::gis_layer::{GisFeature, GisLayer, LayerDescriptor, LayerEntry};
+use crate::gis_layer::{BatchMessage, GisLayer, LayerDescriptor, LayerEntry, LayerKind};
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
@@ -34,7 +35,7 @@ pub struct GisEditorApp {
     // Layer selector state (populated after file pick, before load)
     pending_file: Option<String>,
     pending_layers: Vec<(LayerDescriptor, bool)>,
-    load_rx: Option<mpsc::Receiver<(usize, Vec<GisFeature>)>>,
+    load_rx: Option<mpsc::Receiver<BatchMessage>>,
 
     // GPU point cloud state
     has_gpu: bool,
@@ -86,8 +87,8 @@ impl GisEditorApp {
             last_layer_count: 0,
             heatmap_opacity: 255,
             gpu_points_buf: Vec::new(),
-            spatial_index_split_density: 50,
-            last_split_density: 50,
+            spatial_index_split_density: 10000,
+            last_split_density: 10000,
             hilbert_order: 6,
             last_hilbert_order: 6,
             load_rx: None,
@@ -109,39 +110,40 @@ impl GisEditorApp {
         }
     }
 
-    fn load_pending(&mut self, selected_layer_indices: Vec<usize>) {
-        let Some(path) = self.pending_file.take() else {
-            return;
-        };
-        self.pending_layers.clear();
-        match GisLayer::load_selected(&path, &selected_layer_indices) {
-            Ok(layers) if layers.is_empty() => {
-                self.status = "No layers loaded.".to_string();
-            }
-            Ok(layers) => {
-                let total: usize = layers.iter().map(|l| l.features.len()).sum();
-                self.status = format!("Loaded {} layer(s), {} total features", layers.len(), total);
-                let first_new = self.layers.len();
-                self.layers.extend(layers.into_iter().map(|l| {
-                    let name = l.name.clone();
-                    LayerEntry {
-                        layer: l,
-                        visible: true,
-                        name,
-                        color: [100, 149, 237],
-                        opacity: 255,
-                    }
-                }));
-                self.active_layer_idx = Some(first_new);
-                self.selected_id = None;
-                self.fitted = false;
-                self.points_dirty = true;
-            }
-            Err(e) => {
-                self.status = format!("Error: {e}");
-            }
-        }
-    }
+    // UNUSED
+    // fn load_pending(&mut self, selected_layer_indices: Vec<usize>) {
+    //     let Some(path) = self.pending_file.take() else {
+    //         return;
+    //     };
+    //     self.pending_layers.clear();
+    //     match GisLayer::load_selected(&path, &selected_layer_indices) {
+    //         Ok(layers) if layers.is_empty() => {
+    //             self.status = "No layers loaded.".to_string();
+    //         }
+    //         Ok(layers) => {
+    //             let total: usize = layers.iter().map(|l| l.features.len()).sum();
+    //             self.status = format!("Loaded {} layer(s), {} total features", layers.len(), total);
+    //             let first_new = self.layers.len();
+    //             self.layers.extend(layers.into_iter().map(|l| {
+    //                 let name = l.name.clone();
+    //                 LayerEntry {
+    //                     layer: l,
+    //                     visible: true,
+    //                     name,
+    //                     color: [100, 149, 237],
+    //                     opacity: 255,
+    //                 }
+    //             }));
+    //             self.active_layer_idx = Some(first_new);
+    //             self.selected_id = None;
+    //             self.fitted = false;
+    //             self.points_dirty = true;
+    //         }
+    //         Err(e) => {
+    //             self.status = format!("Error: {e}");
+    //         }
+    //     }
+    // }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -160,36 +162,31 @@ fn collect_gpu_points(
 ) {
     out.clear();
     for (i, entry) in layers.iter().enumerate() {
-        if !entry.visible {
+        if !entry.visible
+            || match &entry.data {
+                LayerKind::Points(point_cloud_layer) => false,
+                LayerKind::Vector(gis_layer) => true,
+            }
+        {
             continue;
         }
         let is_active = active_idx == Some(i);
-        for feature in &entry.layer.features {
-            let fill = if is_active && selected_id == Some(feature.id) {
+        let point_cloud_layer = match &entry.data {
+            LayerKind::Points(pc) => pc,
+            LayerKind::Vector(gis_layer) => panic!("Unexpected layer kind in collect_gpu_points!"),
+        };
+        for (idx, point) in point_cloud_layer.points.iter().enumerate() {
+            let fill = if is_active && selected_id == Some(idx) {
                 FILL_SELECTED
             } else {
                 FILL_NORMAL
             };
             let packed = pack_color(fill);
-            match &feature.geometry {
-                geo_types::Geometry::Point(p) => {
-                    out.push(GpuPoint {
-                        position: [p.x() as f32, p.y() as f32],
-                        color: packed,
-                        size: point_size,
-                    });
-                }
-                geo_types::Geometry::MultiPoint(mp) => {
-                    for p in &mp.0 {
-                        out.push(GpuPoint {
-                            position: [p.x() as f32, p.y() as f32],
-                            color: packed,
-                            size: point_size,
-                        });
-                    }
-                }
-                _ => {}
-            }
+            out.push(GpuPoint {
+                position: [point[0] as f32, point[1] as f32],
+                color: packed,
+                size: point_size,
+            });
         }
     }
 }
@@ -216,7 +213,7 @@ impl eframe::App for GisEditorApp {
                     ui.horizontal(|ui| {
                         ui.label("Heatmap Opacity:");
                         ui.add(
-                            egui::Slider::new(&mut self.spatial_index_split_density, 5..=500)
+                            egui::Slider::new(&mut self.spatial_index_split_density, 100..=10000)
                                 .step_by(5.0),
                         );
                     });
@@ -305,23 +302,34 @@ impl eframe::App for GisEditorApp {
                 });
         }
         if let Some(indices) = load_indices {
-            let (tx, rx) = mpsc::sync_channel::<(usize, Vec<GisFeature>)>(4);
-            let path = self.pending_file.as_ref().unwrap().clone();
+            let (tx, rx) = mpsc::sync_channel::<BatchMessage>(4);
+            let path = self.pending_file.take().unwrap();
+            self.pending_layers.clear();
             let layers = GisLayer::load_selected_without_features(&path, &indices)
                 .expect("Error loading featureless layers!");
             let first_new = self.layers.len();
+            // Record which dest indices are point layers before consuming layers
+            let is_points: Vec<bool> = layers
+                .iter()
+                .map(|l| matches!(l.data, LayerKind::Points(_)))
+                .collect();
             self.layers.extend(layers.into_iter());
             self.active_layer_idx = Some(first_new);
             self.status = format!("Loading {} layer(s)…", indices.len());
             std::thread::spawn(move || {
                 for (pos, file_idx) in indices.into_iter().enumerate() {
-                    GisLayer::load_layer_batched(
-                        path.as_str(),
-                        file_idx,
-                        first_new + pos,
-                        tx.clone(),
-                    )
-                    .expect("Died inside batch layer read!");
+                    let dest = first_new + pos;
+                    let result = if is_points[pos] {
+                        GisLayer::load_point_layer_batched(
+                            path.as_str(),
+                            file_idx,
+                            dest,
+                            tx.clone(),
+                        )
+                    } else {
+                        GisLayer::load_layer_batched(path.as_str(), file_idx, dest, tx.clone())
+                    };
+                    result.expect("Batch layer read failed");
                 }
             });
             self.load_rx = Some(rx);
@@ -331,9 +339,22 @@ impl eframe::App for GisEditorApp {
         }
 
         if let Some(rx) = &self.load_rx {
-            for (layer_idx, batch) in rx.try_iter() {
-                self.layers[layer_idx].layer.features.extend(batch);
-                self.points_dirty = true;
+            for msg in rx.try_iter() {
+                match msg {
+                    BatchMessage::Points(layer_idx, pts) => {
+                        if let LayerKind::Points(pc) = &mut self.layers[layer_idx].data {
+                            pc.points.extend(pts);
+                            // pc.attributes — commented out until columnar layout is implemented
+                        }
+                        self.points_dirty = true;
+                    }
+                    BatchMessage::Vector(layer_idx, features) => {
+                        if let LayerKind::Vector(gl) = &mut self.layers[layer_idx].data {
+                            gl.features.extend(features);
+                        }
+                        self.points_dirty = true;
+                    }
+                }
             }
             if let Err(TryRecvError::Disconnected) = rx.try_recv() {
                 self.load_rx = None;
@@ -358,6 +379,8 @@ impl eframe::App for GisEditorApp {
                     ui.label("No layers loaded.");
                 } else {
                     let mut remove_idx: Option<usize> = None;
+                    let mut rebuild_quadtree_idx: Option<usize> = None;
+                    let mut rebuild_hilbert_idx: Option<usize> = None;
                     let mut visibility_changed = false;
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for (i, entry) in self.layers.iter_mut().enumerate() {
@@ -371,7 +394,8 @@ impl eframe::App for GisEditorApp {
                                 } else {
                                     egui::RichText::new(&entry.name)
                                 };
-                                if ui.selectable_label(is_active, label).clicked() {
+                                let label_resp = ui.selectable_label(is_active, label);
+                                if label_resp.clicked() {
                                     if !is_active {
                                         self.active_layer_idx = Some(i);
                                         self.selected_id = None;
@@ -379,6 +403,16 @@ impl eframe::App for GisEditorApp {
                                         self.points_dirty = true;
                                     }
                                 }
+                                label_resp.context_menu(|ui| {
+                                    if ui.button("Build Quadtree").clicked() {
+                                        rebuild_quadtree_idx = Some(i);
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
+                                    if ui.button("Build Hilbert").clicked() {
+                                        rebuild_hilbert_idx = Some(i);
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
+                                });
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -406,6 +440,20 @@ impl eframe::App for GisEditorApp {
                         self.selected_id = None;
                         self.points_dirty = true;
                     }
+                    if let Some(idx) = rebuild_quadtree_idx {
+                        let capacity = self.spatial_index_split_density;
+                        match &mut self.layers[idx].data {
+                            LayerKind::Points(pc) => pc.rebuild_quadtree(capacity),
+                            LayerKind::Vector(gl) => gl.rebuild_quadtree(capacity),
+                        }
+                    }
+                    if let Some(idx) = rebuild_hilbert_idx {
+                        let order = self.hilbert_order;
+                        match &mut self.layers[idx].data {
+                            LayerKind::Points(pc) => pc.rebuild_hilbert_tree(order),
+                            LayerKind::Vector(gl) => gl.rebuild_hilbert_tree(order),
+                        }
+                    }
                     if visibility_changed {
                         self.points_dirty = true;
                     }
@@ -432,28 +480,30 @@ impl eframe::App for GisEditorApp {
                             name,
                             value,
                         } => {
-                            if let Some(entry) =
-                                self.active_layer_idx.and_then(|i| self.layers.get_mut(i))
-                            {
-                                if !entry.layer.extra_field_names.contains(&name) {
-                                    entry.layer.extra_field_names.push(name.clone());
-                                }
-                                entry.layer.features[feature_id]
-                                    .attributes
-                                    .insert(name.clone(), value);
-                                self.status =
-                                    format!("Added attribute '{name}' to feature #{feature_id}");
-                            }
+                            // COMMENTED OUT FOR NOW BECAUSE THIS BRANCH IS MORE ABOUT VIEWING
+                            // if let Some(entry) =
+                            //     self.active_layer_idx.and_then(|i| self.layers.get_mut(i))
+                            // {
+                            //     if !entry.layer.extra_field_names.contains(&name) {
+                            //         entry.layer.extra_field_names.push(name.clone());
+                            //     }
+                            //     entry.layer.features[feature_id]
+                            //         .attributes
+                            //         .insert(name.clone(), value);
+                            //     self.status =
+                            //         format!("Added attribute '{name}' to feature #{feature_id}");
+                            // }
                         }
                         SidebarAction::SaveAs(path) => {
-                            if let Some(entry) =
-                                self.active_layer_idx.and_then(|i| self.layers.get(i))
-                            {
-                                match entry.layer.save(&path) {
-                                    Ok(()) => self.status = format!("Saved to {path}"),
-                                    Err(e) => self.status = format!("Save failed: {e}"),
-                                }
-                            }
+                            // COMMENTED OUT FOR NOW BECAUSE THIS BRANCH IS MORE ABOUT VIEWING
+                            // if let Some(entry) =
+                            //     self.active_layer_idx.and_then(|i| self.layers.get(i))
+                            // {
+                            //     match entry.layer.save(&path) {
+                            //         Ok(()) => self.status = format!("Saved to {path}"),
+                            //         Err(e) => self.status = format!("Save failed: {e}"),
+                            //     }
+                            // }
                         }
                         SidebarAction::None => {}
                     }
@@ -464,7 +514,14 @@ impl eframe::App for GisEditorApp {
         if self.spatial_index_split_density != self.last_split_density {
             let capacity = self.spatial_index_split_density;
             for entry in &mut self.layers {
-                entry.layer.rebuild_quadtree(capacity);
+                match &mut entry.data {
+                    LayerKind::Points(point_layer) => {
+                        point_layer.rebuild_quadtree(capacity);
+                    }
+                    LayerKind::Vector(vector_layer) => {
+                        vector_layer.rebuild_quadtree(capacity);
+                    }
+                }
             }
             self.last_split_density = capacity;
             self.points_dirty = true;
@@ -472,7 +529,14 @@ impl eframe::App for GisEditorApp {
         if self.hilbert_order != self.last_hilbert_order {
             let order = self.hilbert_order;
             for entry in &mut self.layers {
-                entry.layer.rebuild_hilbert_tree(order);
+                match &mut entry.data {
+                    LayerKind::Points(point_layer) => {
+                        point_layer.rebuild_hilbert_tree(order);
+                    }
+                    LayerKind::Vector(vector_layer) => {
+                        vector_layer.rebuild_hilbert_tree(order);
+                    }
+                }
             }
             self.last_hilbert_order = order;
             self.points_dirty = true;
@@ -515,7 +579,7 @@ impl eframe::App for GisEditorApp {
         CentralPanel::default().show_inside(ui, |ui| {
             if !self.fitted {
                 if let Some(entry) = active_layer {
-                    if let Some(extent) = entry.layer.extent() {
+                    if let Some(extent) = entry.data.extent() {
                         self.viewport
                             .fit_to(extent, ui.available_rect_before_wrap());
                         self.fitted = true;
@@ -575,8 +639,11 @@ impl eframe::App for GisEditorApp {
             if self.show_heatmap {
                 let heatmap = active_layer
                     .map(|e| {
-                        HeatmapLayer::build_from_spatial_index(e.layer.index(IndexKind::Quadtree))
+                        e.data
+                            .index(IndexKind::Quadtree)
+                            .map(|index| HeatmapLayer::build_from_spatial_index(index))
                     })
+                    .unwrap_or(Some(HeatmapLayer { cells: vec![] }))
                     .unwrap_or(HeatmapLayer { cells: vec![] });
                 show_quadtree_heatmap(
                     &painter,
@@ -588,7 +655,9 @@ impl eframe::App for GisEditorApp {
             }
 
             if self.show_index {
-                let index = active_layer.map(|e| e.layer.index(self.index_kind));
+                let index = active_layer
+                    .map(|e| e.data.index(self.index_kind))
+                    .flatten();
                 show_spatial_index_grid(&painter, index, &mut self.viewport, response.rect);
             }
         });

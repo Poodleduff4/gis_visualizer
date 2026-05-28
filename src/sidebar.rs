@@ -45,11 +45,11 @@ pub fn show_sidebar(
         return action;
     };
 
-    let layer = &layer_entries[active_idx].layer;
+    let layer = &layer_entries[active_idx];
 
     // ── Layer info ────────────────────────────────────────────────────────────
     ui.label(RichText::new(&layer.name).strong());
-    ui.label(format!("{} features", layer.features.len()));
+    ui.label(format!("{} features", layer.data.feature_count()));
     ui.separator();
 
     // ── Selected feature attributes ───────────────────────────────────────────
@@ -58,13 +58,14 @@ pub fn show_sidebar(
         return action;
     };
 
-    let feature = &layer.features[sel_id];
+    let feature = layer.data.feature(sel_id);
     ui.label(RichText::new(format!("Feature #{sel_id}")).strong());
     ui.add_space(4.0);
 
     // Attribute table
     let all_names: Vec<String> = layer
-        .all_field_names()
+        .data
+        .field_names()
         .into_iter()
         .map(|s| s.to_string())
         .collect();
@@ -79,12 +80,12 @@ pub fn show_sidebar(
                 ui.label(RichText::new("Value").strong());
                 ui.end_row();
 
-                for name in &all_names {
-                    ui.label(name.as_str());
-                    let val = feature.attributes.get(name.as_str());
-                    ui.label(val.map(|v| v.as_display_string()).unwrap_or_default());
-                    ui.end_row();
-                }
+                // for name in &all_names {
+                //     ui.label(name.as_str());
+                //     let val = feature.attributes.get(name.as_str());
+                //     ui.label(val.map(|v| v.as_display_string()).unwrap_or_default());
+                //     ui.end_row();
+                // }
             });
     });
 

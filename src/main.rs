@@ -6,6 +6,7 @@ mod hilbert_curve;
 mod hilbert_r_tree;
 mod map_view;
 mod point_cloud;
+mod point_cloud_layer;
 mod quadtree;
 mod sidebar;
 mod spatial_index;

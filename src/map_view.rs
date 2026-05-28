@@ -1,7 +1,8 @@
 use crate::basemap::BasemapCache;
-use crate::gis_layer::{LayerEntry, TessellatedGeom};
+use crate::gis_layer::{LayerEntry, LayerKind, TessellatedGeom};
 use crate::heatmap::HeatmapLayer;
-use crate::spatial_index::{LineSegment, SpatialIndex};
+use crate::spatial_index::{IndexKind, LineSegment, SpatialIndex};
+use anyhow::bail;
 use egui::epaint::Mesh;
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Ui, Vec2};
 
@@ -129,7 +130,7 @@ pub fn show_map(
             if let Some(entry) = active_entry {
                 let [wx, wy] = viewport.screen_to_world(pos.x, pos.y, rect);
                 let tolerance = 8.0 / viewport.pixels_per_unit;
-                *selected_id = entry.layer.hit_test(wx, wy, tolerance);
+                *selected_id = entry.data.hit_test(wx, wy, tolerance);
             }
         }
     }
@@ -139,13 +140,21 @@ pub fn show_map(
     let active_layer_name = active_entry.map(|e| e.name.as_str());
     for entry in layers.iter().filter(|e| e.visible) {
         // When GPU handles points, skip layers that have no polygons or lines.
-        if !render_points && entry.layer.point_only {
+        if !render_points
+            && match &entry.data {
+                LayerKind::Points(point_cloud_layer) => true,
+                LayerKind::Vector(gis_layer) => false,
+            }
+        {
             continue;
         }
+        let LayerKind::Vector(layer) = &entry.data else {
+            continue;
+        };
         let is_active = active_layer_name == Some(entry.name.as_str());
-        let visible_ids = entry.layer.features_in_bbox(xmin, ymin, xmax, ymax);
+        let visible_ids = layer.features_in_bbox(xmin, ymin, xmax, ymax);
         for id in visible_ids {
-            let feature = &entry.layer.features[id];
+            let feature = &layer.features[id];
             let tess = &feature.tessellated;
             if !render_points && tess.fill_idx.is_empty() && tess.outlines.is_empty() {
                 continue;
