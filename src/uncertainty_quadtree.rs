@@ -51,6 +51,15 @@ impl UncertaintyQuadtree {
         self.insert_point(Entry::new(id, [cx, cy], measurement_value));
     }
 
+    pub fn insert_batch(&mut self, items: impl IntoIterator<Item = (usize, [f64; 4], f64)>) {
+        for (id, rect, value) in items {
+            let cx = (rect[0] + rect[2]) / 2.0;
+            let cy = (rect[1] + rect[3]) / 2.0;
+            self.insert_raw(Entry::new(id, [cx, cy], value));
+        }
+        self.finalize_splits();
+    }
+
     pub fn search(&self, rect: &[f64; 4]) -> Vec<usize> {
         self.range_query(rect).into_iter().map(|e| e.id).collect()
     }
@@ -154,14 +163,50 @@ impl UncertaintyQuadtree {
     }
 
     pub fn should_split(&self) -> bool {
-        if let Some(split) = self
-            .uncertainty
+        self.uncertainty
             .as_ref()
-            .map(|u| u.variance > self.uncertainty_threshold as f64)
-        {
-            return true;
+            .map_or(false, |u| u.variance > self.uncertainty_threshold as f64)
+    }
+
+    fn insert_raw(&mut self, entry: Entry) -> bool {
+        if !self.contains(&entry) {
+            return false;
         }
-        return false;
+        if self.divided {
+            for child in &mut self.children {
+                if child.insert_raw(entry.clone()) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            self.entries.push(entry);
+            true
+        }
+    }
+
+    fn finalize_splits(&mut self) {
+        if self.divided {
+            for child in &mut self.children {
+                child.finalize_splits();
+            }
+            return;
+        }
+        if self.entries.is_empty() {
+            return;
+        }
+        self.calculate_uncertainty();
+        let should_split = self.depth < MAX_DEPTH
+            && self
+                .uncertainty
+                .as_ref()
+                .map_or(false, |u| u.variance > self.uncertainty_threshold as f64);
+        if should_split {
+            self.subdivide();
+            for child in &mut self.children {
+                child.finalize_splits();
+            }
+        }
     }
 
     fn insert_point(&mut self, entry: Entry) -> bool {
@@ -173,13 +218,10 @@ impl UncertaintyQuadtree {
             self.entries.push(entry);
             self.calculate_uncertainty();
             let should_split = self.depth < MAX_DEPTH
-                && self.uncertainty.as_ref().map_or(false, |u| {
-                    if u.mean.abs() < f64::EPSILON {
-                        return false;
-                    }
-                    let cv = u.std_dev / u.mean.abs();
-                    cv > self.uncertainty_threshold as f64
-                });
+                && self
+                    .uncertainty
+                    .as_ref()
+                    .map_or(false, |u| u.variance > self.uncertainty_threshold as f64);
             if should_split {
                 self.subdivide();
             }
@@ -220,37 +262,29 @@ impl UncertaintyQuadtree {
     }
 
     pub fn calculate_uncertainty(&mut self) {
-        let n = (self.entries.len().max(1)) as f64;
+        if self.entries.is_empty() {
+            return;
+        }
+        let total = self.entries.len();
+        let sample_size = ((total as f64 / 10.).min(5.) as usize).max(1).min(total);
         let mut rng = rand::rng();
-        let sample = self
+        let sample: Vec<f64> = self
             .entries
             .iter()
-            .sample(&mut rng, (n / 10.).min(5.) as usize);
-
-        let attrs: Vec<f64> = sample
-            .iter()
+            .choose_multiple(&mut rng, sample_size)
+            .into_iter()
             .map(|e| e.measurement_value)
-            .collect::<Vec<f64>>();
+            .collect();
 
-        let mean = attrs.iter().sum::<f64>() / n;
+        let n = sample.len() as f64;
+        let mean = sample.iter().sum::<f64>() / n;
+        let variance = sample.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
 
-        let dists: Vec<f64> = sample
-            .iter()
-            .enumerate()
-            .map(|(i, _)| attrs[i] - mean)
-            .collect::<Vec<f64>>();
-
-        let mean_d = dists.iter().sum::<f64>() / n;
-        let variance = dists.iter().map(|d| (d - mean_d).powi(2)).sum::<f64>() / n;
-        let min_d = dists.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_d = dists.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-        let uncertainty = UncertaintyMeasurement {
+        self.uncertainty = Some(UncertaintyMeasurement {
             std_dev: variance.sqrt(),
             variance,
             mean,
-        };
-        self.uncertainty = Some(uncertainty);
+        });
     }
 
     fn subdivide(&mut self) {
@@ -309,7 +343,7 @@ impl UncertaintyQuadtree {
         let entries = std::mem::take(&mut self.entries);
         for entry in entries {
             for child in &mut self.children {
-                if child.insert_point(entry.clone()) {
+                if child.insert_raw(entry.clone()) {
                     break;
                 }
             }

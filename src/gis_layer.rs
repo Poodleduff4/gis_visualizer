@@ -260,7 +260,7 @@ fn bounding_box(geom: &Geometry<f64>) -> [f64; 4] {
 }
 
 pub enum BatchMessage {
-    Points(usize, Vec<[f64; 2]>, Vec<AttributeColumn>),
+    Points(usize, Vec<[f64; 2]>, Vec<(String, AttributeColumn)>),
     Vector(usize, Vec<GisFeature>),
 }
 
@@ -292,6 +292,12 @@ impl LayerKind {
             LayerKind::Vector(gis_layer) => gis_layer.field_names.clone(),
         }
     }
+    pub fn numeric_field_names(&self) -> Vec<String> {
+        match self {
+            LayerKind::Points(pc) => pc.numeric_field_names(),
+            LayerKind::Vector(gl) => gl.field_names.clone(),
+        }
+    }
     pub fn index(&self, kind: IndexKind) -> Option<&SpatialIndex> {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.index.as_ref(),
@@ -312,9 +318,12 @@ impl LayerKind {
     }
     pub fn point_attrs_display(&self, idx: usize) -> Option<Vec<String>> {
         match self {
-            LayerKind::Points(pc) if !pc.attributes.is_empty() => {
-                Some(pc.attributes.iter().map(|col| col.get_display(idx)).collect())
-            }
+            LayerKind::Points(pc) if !pc.attributes.is_empty() => Some(
+                pc.attributes
+                    .iter()
+                    .map(|col| col.get_display(idx))
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -438,11 +447,12 @@ impl GisLayer {
     pub fn load_selected_without_features(
         path: &str,
         indices: &[usize],
+        attr_fields: Option<Vec<String>>,
     ) -> Result<Vec<LayerEntry>, Box<dyn std::error::Error>> {
         let dataset = Dataset::open(Path::new(path))?;
         let mut layers = Vec::new();
         for &i in indices {
-            match GisLayer::load_layer_without_features(&dataset, i, &path) {
+            match GisLayer::load_layer_without_features(&dataset, i, &path, attr_fields.clone()) {
                 Ok(layer) => {
                     let name = layer.name.clone();
                     layers.push(LayerEntry {
@@ -489,16 +499,21 @@ impl GisLayer {
         dataset: &Dataset,
         layer_idx: usize,
         path: &str,
+        attr_fields: Option<Vec<String>>,
     ) -> Result<LayerEntry> {
         let mut layer = dataset.layer(layer_idx)?;
         let name = layer.name();
 
-        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
+        println!(
+            "Loading empty layer idx: {} with attrs: {:?}",
+            layer_idx,
+            attr_fields.as_ref()
+        );
+        let field_names = attr_fields.unwrap_or(Vec::new());
         let num_features = layer.feature_count() as usize;
         if num_features == 0 {
             return Err(anyhow!("No Features in Layer"));
         }
-        let features: Vec<GisFeature> = Vec::with_capacity(num_features);
         let layer_kind = match gdal_geom_to_geo(
             layer
                 .features()
@@ -508,9 +523,7 @@ impl GisLayer {
                 .expect("Feature missing geometry!"),
         ) {
             Some(geo_types::Geometry::Point::<f64>(_)) => {
-                let mut pc = PointCloudLayer::default();
-                pc.field_names = field_names;
-                LayerKind::Points(pc)
+                LayerKind::Points(PointCloudLayer::default())
             }
             _ => LayerKind::Vector(GisLayer::default()),
         };
@@ -665,48 +678,69 @@ impl GisLayer {
         layer_idx: usize,
         dest_idx: usize,
         tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
     ) -> Result<()> {
         let dataset = gdal::Dataset::open(path)?;
         let mut layer = dataset.layer(layer_idx)?;
-        let field_ogr_types: Vec<OGRFieldType::Type> =
-            layer.defn().fields().map(|f| f.field_type()).collect();
 
-        let make_cols = |cap: usize| -> Vec<AttributeColumn> {
-            field_ogr_types
+        let field_defs: Vec<(String, OGRFieldType::Type)> = layer
+            .defn()
+            .fields()
+            .map(|f| (f.name(), f.field_type()))
+            .collect();
+
+        // (file_field_index, name, ogr_type) — empty when geometry-only
+        let load_fields: Vec<(usize, String, OGRFieldType::Type)> = match selected_fields {
+            None => Vec::new(),
+            Some(ref sel) => {
+                let sel_set: std::collections::HashSet<&str> =
+                    sel.iter().map(|s| s.as_str()).collect();
+                field_defs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (name, _))| sel_set.contains(name.as_str()))
+                    .map(|(i, (name, t))| (i, name.clone(), *t))
+                    .collect()
+            }
+        };
+
+        let empty_col = |t: OGRFieldType::Type, cap: usize| -> AttributeColumn {
+            match t {
+                OGRFieldType::OFTInteger | OGRFieldType::OFTInteger64 => {
+                    AttributeColumn::Integer(Vec::with_capacity(cap))
+                }
+                OGRFieldType::OFTReal => AttributeColumn::Float(Vec::with_capacity(cap)),
+                _ => AttributeColumn::Text(Vec::with_capacity(cap)),
+            }
+        };
+
+        let make_batch_cols = |cap: usize| -> Vec<(String, AttributeColumn)> {
+            load_fields
                 .iter()
-                .map(|t| match *t {
-                    OGRFieldType::OFTInteger | OGRFieldType::OFTInteger64 => {
-                        AttributeColumn::Integer(Vec::with_capacity(cap))
-                    }
-                    OGRFieldType::OFTReal => AttributeColumn::Float(Vec::with_capacity(cap)),
-                    _ => AttributeColumn::Text(Vec::with_capacity(cap)),
-                })
+                .map(|(_, name, t)| (name.clone(), empty_col(*t, cap)))
                 .collect()
         };
 
         const BATCH: usize = 10_000;
         let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH);
-        let mut batch_cols: Vec<AttributeColumn> = make_cols(BATCH);
+        let mut batch_cols: Vec<(String, AttributeColumn)> = make_batch_cols(BATCH);
 
         for feature in layer.features() {
             if let Some(geom_ref) = feature.geometry() {
                 if let Some(geo_types::Geometry::Point(p)) = gdal_geom_to_geo(geom_ref) {
                     batch.push([p.x(), p.y()]);
-                    for (i, col) in batch_cols.iter_mut().enumerate() {
-                        match feature.field(i) {
+                    for (col_idx, (field_idx, _, _)) in load_fields.iter().enumerate() {
+                        let col = &mut batch_cols[col_idx].1;
+                        match feature.field(*field_idx) {
                             Ok(Some(val)) => match (col, val) {
-                                (AttributeColumn::Float(v), FieldValue::RealValue(f)) => {
-                                    v.push(f)
-                                }
+                                (AttributeColumn::Float(v), FieldValue::RealValue(f)) => v.push(f),
                                 (AttributeColumn::Integer(v), FieldValue::IntegerValue(i)) => {
                                     v.push(i as i64)
                                 }
                                 (AttributeColumn::Integer(v), FieldValue::Integer64Value(i)) => {
                                     v.push(i)
                                 }
-                                (AttributeColumn::Text(v), FieldValue::StringValue(s)) => {
-                                    v.push(s)
-                                }
+                                (AttributeColumn::Text(v), FieldValue::StringValue(s)) => v.push(s),
                                 (col, _) => col.push_default(),
                             },
                             _ => col.push_default(),
@@ -716,7 +750,7 @@ impl GisLayer {
                         tx.send(BatchMessage::Points(
                             dest_idx,
                             std::mem::replace(&mut batch, Vec::with_capacity(BATCH)),
-                            std::mem::replace(&mut batch_cols, make_cols(BATCH)),
+                            std::mem::replace(&mut batch_cols, make_batch_cols(BATCH)),
                         ))
                         .ok();
                     }

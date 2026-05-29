@@ -144,8 +144,7 @@ impl GisEditorApp {
                     }
                 }
                 all_fields.sort();
-                self.pending_field_selection =
-                    all_fields.into_iter().map(|f| (f, true)).collect();
+                self.pending_field_selection = all_fields.into_iter().map(|f| (f, true)).collect();
                 self.pending_load_mode = LoadMode::GeometryOnly;
                 self.pending_layers = descriptors.into_iter().map(|d| (d, true)).collect();
                 self.pending_file = Some(path.to_string());
@@ -431,8 +430,9 @@ impl eframe::App for GisEditorApp {
 
             self.pending_layers.clear();
             self.pending_field_selection.clear();
-            let layers = GisLayer::load_selected_without_features(&path, &indices)
-                .expect("Error loading featureless layers!");
+            let layers =
+                GisLayer::load_selected_without_features(&path, &indices, attr_fields.clone())
+                    .expect("Error loading featureless layers!");
             let first_new = self.layers.len();
             // Record which dest indices are point layers before consuming layers
             let is_points: Vec<bool> = layers
@@ -451,6 +451,7 @@ impl eframe::App for GisEditorApp {
                             file_idx,
                             dest,
                             tx.clone(),
+                            attr_fields.clone(),
                         )
                     } else {
                         GisLayer::load_layer_batched(
@@ -474,15 +475,18 @@ impl eframe::App for GisEditorApp {
         if let Some(rx) = &self.load_rx {
             for msg in rx.try_iter() {
                 match msg {
-                    BatchMessage::Points(layer_idx, pts, cols) => {
+                    BatchMessage::Points(layer_idx, pts, named_cols) => {
                         if let Some(LayerKind::Points(pc)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
                         {
                             pc.points.extend(pts);
-                            if pc.attributes.is_empty() {
-                                pc.attributes = cols;
+                            if pc.attributes.is_empty() && !named_cols.is_empty() {
+                                for (name, col) in named_cols {
+                                    pc.field_names.push(name);
+                                    pc.attributes.push(col);
+                                }
                             } else {
-                                for (dst, src) in pc.attributes.iter_mut().zip(cols) {
+                                for (dst, (_, src)) in pc.attributes.iter_mut().zip(named_cols) {
                                     dst.extend_from(src);
                                 }
                             }
@@ -526,8 +530,6 @@ impl eframe::App for GisEditorApp {
                     let mut rebuild_uncertainty_quadtree_idx: Option<usize> = None;
                     let mut rebuild_hilbert_idx: Option<usize> = None;
                     let mut visibility_changed = false;
-                    let layer_field_names: Vec<Vec<String>> =
-                        self.layers.iter().map(|l| l.data.field_names()).collect();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for (i, entry) in self.layers.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
@@ -555,7 +557,8 @@ impl eframe::App for GisEditorApp {
                                         ui.close_kind(egui::UiKind::Menu);
                                     }
                                     ui.separator();
-                                    let field_names = &layer_field_names[i];
+
+                                    let field_names = entry.data.field_names().clone();
                                     if !field_names.is_empty() {
                                         let attr_label = format!(
                                             "Uncertainty attribute: {}",

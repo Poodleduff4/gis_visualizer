@@ -224,6 +224,8 @@ pub fn show_spatial_index_grid(
     }
 }
 
+const MAX_HEATMAP_CELLS: usize = 50_000;
+
 pub fn show_quadtree_heatmap(
     painter: &Painter,
     heatmap: &HeatmapLayer,
@@ -231,6 +233,7 @@ pub fn show_quadtree_heatmap(
     rect: Rect,
     opacity: u8,
 ) {
+    let vp = viewport.viewport_bbox(rect);
     let max_depth = heatmap
         .cells
         .iter()
@@ -238,7 +241,15 @@ pub fn show_quadtree_heatmap(
         .max()
         .unwrap_or(1)
         .max(1);
-    for cell in &heatmap.cells {
+    let visible: Vec<_> = heatmap
+        .cells
+        .iter()
+        .filter(|c| {
+            c.bbox[0] <= vp[2] && c.bbox[2] >= vp[0] && c.bbox[1] <= vp[3] && c.bbox[3] >= vp[1]
+        })
+        .take(MAX_HEATMAP_CELLS)
+        .collect();
+    for cell in visible {
         let t = (cell.depth as f32 / max_depth as f32).powf(1.5);
         let color = heat_color(t, opacity);
         let p1 = viewport.world_to_screen(cell.bbox[0], cell.bbox[1], rect);

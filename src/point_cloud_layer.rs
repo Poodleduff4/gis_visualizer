@@ -117,12 +117,21 @@ impl PointCloudLayer {
         }
     }
 
+    pub fn numeric_field_names(&self) -> Vec<String> {
+        self.field_names
+            .iter()
+            .zip(self.attributes.iter())
+            .filter(|(_, col)| !matches!(col, AttributeColumn::Text(_)))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub fn rebuild_uncertainty_quadtree(&mut self, attribute: String, threshold: f32) {
         self.ensure_bbox();
         let Some(bbox) = self.bbox else { return };
         let field_idx = self.field_names.iter().position(|n| n == &attribute);
-        let mut uq = UncertaintyQuadtree::new(bbox, attribute, threshold);
-        for (i, p) in self.points.iter().enumerate() {
+        let mut uq = UncertaintyQuadtree::new(bbox, attribute.clone(), threshold);
+        uq.insert_batch(self.points.iter().enumerate().map(|(i, p)| {
             let value = field_idx
                 .and_then(|fi| self.attributes.get(fi))
                 .map(|col| match col {
@@ -130,9 +139,12 @@ impl PointCloudLayer {
                     AttributeColumn::Integer(v) => v.get(i).copied().unwrap_or(0) as f64,
                     AttributeColumn::Text(_) => 0.0,
                 })
-                .unwrap_or(0.0);
-            uq.insert(i, [p[0], p[1], p[0], p[1]], value);
-        }
+                .unwrap_or_else(|| {
+                    eprintln!("attribute '{}' not found", attribute);
+                    0.0
+                });
+            (i, [p[0], p[1], p[0], p[1]], value)
+        }));
         self.index = Some(SpatialIndex::UncertaintyQuadtree(uq));
     }
 }
