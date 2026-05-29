@@ -5,7 +5,7 @@ pub struct HeatmapLayer {
 }
 
 impl HeatmapLayer {
-    pub fn build_from_spatial_index(index: &dyn SpatialIndex) -> Self {
+    pub fn build_from_spatial_index(index: &SpatialIndex) -> Self {
         HeatmapLayer {
             cells: index.heatmap_cells(),
         }

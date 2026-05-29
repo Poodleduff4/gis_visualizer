@@ -1,7 +1,9 @@
+use crate::app::ClickTarget;
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{LayerEntry, LayerKind, TessellatedGeom};
 use crate::heatmap::HeatmapLayer;
 use crate::spatial_index::{IndexKind, LineSegment, SpatialIndex};
+use crate::uncertainty_quadtree::UncertaintyMeasurement;
 use anyhow::bail;
 use egui::epaint::Mesh;
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Ui, Vec2};
@@ -87,6 +89,8 @@ pub fn show_map(
     selected_id: &mut Option<usize>,
     basemap: Option<&BasemapCache>,
     render_points: bool,
+    click_target: &ClickTarget,
+    selected_index_cell_data: &mut Option<UncertaintyMeasurement>,
 ) {
     let ctx = ui.ctx().clone();
     let rect = response.rect;
@@ -129,8 +133,28 @@ pub fn show_map(
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(entry) = active_entry {
                 let [wx, wy] = viewport.screen_to_world(pos.x, pos.y, rect);
-                let tolerance = 8.0 / viewport.pixels_per_unit;
-                *selected_id = entry.data.hit_test(wx, wy, tolerance);
+                match click_target {
+                    ClickTarget::Feature => {
+                        let tolerance = 8.0 / viewport.pixels_per_unit;
+                        *selected_id = entry.data.hit_test(wx, wy, tolerance);
+                    }
+                    ClickTarget::GridCell => {
+                        if let Some(data) = entry.data.index(IndexKind::Quadtree) {
+                            let selected_cell = match data {
+                                SpatialIndex::UncertaintyQuadtree(uncertainty_quadtree) => {
+                                    uncertainty_quadtree
+                                        .pos_to_node([wx, wy])
+                                        .map(|qt| qt.uncertainty.as_ref())
+                                }
+                                _ => None,
+                            }
+                            .flatten();
+                            if let Some(c) = selected_cell {
+                                *selected_index_cell_data = Some(c.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -185,7 +209,7 @@ pub fn show_map(
 
 pub fn show_spatial_index_grid(
     painter: &Painter,
-    index: Option<&dyn SpatialIndex>,
+    index: Option<&SpatialIndex>,
     viewport: &mut Viewport,
     rect: Rect,
 ) {

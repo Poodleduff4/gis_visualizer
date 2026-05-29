@@ -10,11 +10,17 @@ use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
 use crate::quadtree::Quadtree;
 use crate::sidebar::{show_sidebar, AddAttributeForm, SidebarAction};
 use crate::spatial_index::IndexKind;
+use crate::uncertainty_quadtree::UncertaintyMeasurement;
 
 const LAYER_PANEL_WIDTH: f32 = 180.0;
 
 const FILL_NORMAL: Color32 = Color32::from_rgb(100, 149, 237);
 const FILL_SELECTED: Color32 = Color32::from_rgb(255, 165, 0);
+#[derive(PartialEq)]
+pub enum ClickTarget {
+    Feature,
+    GridCell,
+}
 
 pub struct GisEditorApp {
     layers: Vec<LayerEntry>,
@@ -31,6 +37,7 @@ pub struct GisEditorApp {
     show_index: bool,
     index_kind: IndexKind,
     show_heatmap: bool,
+    click_target: ClickTarget,
 
     // Layer selector state (populated after file pick, before load)
     pending_file: Option<String>,
@@ -53,6 +60,10 @@ pub struct GisEditorApp {
     last_viewport_center: [f64; 2],
     last_viewport_ppu: f64,
     last_canvas_rect: Option<egui::Rect>,
+    selected_uncertainty_attribute: Option<String>,
+    selected_index_cell_data: Option<UncertaintyMeasurement>,
+    uncertainty_split_threshold: f32,
+    viewport_culling: bool,
 }
 
 impl GisEditorApp {
@@ -82,6 +93,7 @@ impl GisEditorApp {
             show_index: false,
             index_kind: IndexKind::Quadtree,
             show_heatmap: false,
+            click_target: ClickTarget::GridCell,
             has_gpu,
             point_size: 5.0,
             points_dirty: false,
@@ -98,6 +110,10 @@ impl GisEditorApp {
             last_viewport_center: Default::default(),
             last_viewport_ppu: Default::default(),
             last_canvas_rect: None,
+            selected_uncertainty_attribute: None,
+            selected_index_cell_data: None,
+            uncertainty_split_threshold: 0.5,
+            viewport_culling: true,
         }
     }
 
@@ -225,10 +241,17 @@ impl eframe::App for GisEditorApp {
                         });
                     }
                     ui.horizontal(|ui| {
-                        ui.label("Heatmap Opacity:");
+                        ui.label("Quadtree Split Density:");
                         ui.add(
                             egui::Slider::new(&mut self.spatial_index_split_density, 100..=10000)
                                 .step_by(5.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Uncertainty Quadtree Threshold:");
+                        ui.add(
+                            egui::Slider::new(&mut self.uncertainty_split_threshold, 0_f32..=2.)
+                                .step_by(0.01),
                         );
                     });
                     ui.horizontal(|ui| {
@@ -247,7 +270,17 @@ impl eframe::App for GisEditorApp {
                                 egui::Slider::new(&mut self.point_size, 1.0..=20.0).step_by(0.5),
                             );
                         });
+                        if ui
+                            .checkbox(&mut self.viewport_culling, "Viewport Culling")
+                            .changed()
+                        {
+                            self.points_dirty = true;
+                        }
                     }
+                    ui.separator();
+                    ui.label("Click target:");
+                    ui.radio_value(&mut self.click_target, ClickTarget::Feature, "Feature");
+                    ui.radio_value(&mut self.click_target, ClickTarget::GridCell, "Grid Cell");
                 });
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
@@ -355,15 +388,25 @@ impl eframe::App for GisEditorApp {
         if let Some(rx) = &self.load_rx {
             for msg in rx.try_iter() {
                 match msg {
-                    BatchMessage::Points(layer_idx, pts) => {
-                        if let LayerKind::Points(pc) = &mut self.layers[layer_idx].data {
+                    BatchMessage::Points(layer_idx, pts, cols) => {
+                        if let Some(LayerKind::Points(pc)) =
+                            &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
+                        {
                             pc.points.extend(pts);
-                            // pc.attributes — commented out until columnar layout is implemented
+                            if pc.attributes.is_empty() {
+                                pc.attributes = cols;
+                            } else {
+                                for (dst, src) in pc.attributes.iter_mut().zip(cols) {
+                                    dst.extend_from(src);
+                                }
+                            }
                         }
                         self.points_dirty = true;
                     }
                     BatchMessage::Vector(layer_idx, features) => {
-                        if let LayerKind::Vector(gl) = &mut self.layers[layer_idx].data {
+                        if let Some(LayerKind::Vector(gl)) =
+                            &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
+                        {
                             gl.features.extend(features);
                         }
                         self.points_dirty = true;
@@ -394,8 +437,11 @@ impl eframe::App for GisEditorApp {
                 } else {
                     let mut remove_idx: Option<usize> = None;
                     let mut rebuild_quadtree_idx: Option<usize> = None;
+                    let mut rebuild_uncertainty_quadtree_idx: Option<usize> = None;
                     let mut rebuild_hilbert_idx: Option<usize> = None;
                     let mut visibility_changed = false;
+                    let layer_field_names: Vec<Vec<String>> =
+                        self.layers.iter().map(|l| l.data.field_names()).collect();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for (i, entry) in self.layers.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
@@ -422,6 +468,35 @@ impl eframe::App for GisEditorApp {
                                         rebuild_quadtree_idx = Some(i);
                                         ui.close_kind(egui::UiKind::Menu);
                                     }
+                                    ui.separator();
+                                    let field_names = &layer_field_names[i];
+                                    if !field_names.is_empty() {
+                                        let attr_label = format!(
+                                            "Uncertainty attribute: {}",
+                                            self.selected_uncertainty_attribute
+                                                .as_deref()
+                                                .unwrap_or("—")
+                                        );
+                                        ui.menu_button(attr_label, |ui| {
+                                            for name in field_names.iter() {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.selected_uncertainty_attribute,
+                                                        Some(name.clone()),
+                                                        name.as_str(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    ui.close_kind(UiKind::Menu);
+                                                }
+                                            }
+                                        });
+                                    }
+                                    if ui.button("Build Uncertainty Quadtree").clicked() {
+                                        rebuild_uncertainty_quadtree_idx = Some(i);
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
+                                    ui.separator();
                                     if ui.button("Build Hilbert").clicked() {
                                         rebuild_hilbert_idx = Some(i);
                                         ui.close_kind(egui::UiKind::Menu);
@@ -461,6 +536,19 @@ impl eframe::App for GisEditorApp {
                             LayerKind::Vector(gl) => gl.rebuild_quadtree(capacity),
                         }
                     }
+                    if let Some(idx) = rebuild_uncertainty_quadtree_idx {
+                        match &mut self.layers[idx].data {
+                            LayerKind::Points(pc) => {
+                                if let Some(attr) = &self.selected_uncertainty_attribute {
+                                    pc.rebuild_uncertainty_quadtree(
+                                        attr.clone(),
+                                        self.uncertainty_split_threshold,
+                                    );
+                                }
+                            }
+                            LayerKind::Vector(gl) => {}
+                        }
+                    }
                     if let Some(idx) = rebuild_hilbert_idx {
                         let order = self.hilbert_order;
                         match &mut self.layers[idx].data {
@@ -486,6 +574,7 @@ impl eframe::App for GisEditorApp {
                         self.selected_id,
                         &mut self.add_form,
                         &mut self.save_path,
+                        self.selected_index_cell_data.as_ref(),
                     );
 
                     match action {
@@ -583,8 +672,12 @@ impl eframe::App for GisEditorApp {
                             &self.layers,
                             self.active_layer_idx,
                             self.selected_id,
-                            self.last_canvas_rect
-                                .map(|rect| self.viewport.viewport_bbox(rect)),
+                            if self.viewport_culling {
+                                self.last_canvas_rect
+                                    .map(|rect| self.viewport.viewport_bbox(rect))
+                            } else {
+                                None
+                            },
                             self.point_size,
                             &mut self.gpu_points_buf,
                         );
@@ -635,6 +728,8 @@ impl eframe::App for GisEditorApp {
                 &mut self.selected_id,
                 bm,
                 render_points,
+                &self.click_target,
+                &mut self.selected_index_cell_data,
             );
 
             // GPU point cloud — added AFTER show_map so it composites on top

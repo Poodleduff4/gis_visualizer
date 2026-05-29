@@ -1,7 +1,4 @@
-use crate::{
-    hilbert_curve::HilbertCurve,
-    spatial_index::{LineSegment, SpatialIndex},
-};
+use crate::{hilbert_curve::HilbertCurve, spatial_index::LineSegment};
 
 struct HilbertEntry {
     lhv: u64,
@@ -33,8 +30,8 @@ impl HilbertRTree {
     }
 }
 
-impl SpatialIndex for HilbertRTree {
-    fn insert(&mut self, id: usize, rect: [f64; 4]) {
+impl HilbertRTree {
+    pub fn insert(&mut self, id: usize, rect: [f64; 4]) {
         let lhv = match HilbertCurve::hilbert_index(self.order, &rect, &self.data_rect) {
             Some(h) => h,
             None => return,
@@ -52,7 +49,7 @@ impl SpatialIndex for HilbertRTree {
         );
     }
 
-    fn search(&self, rect: &[f64; 4]) -> Vec<usize> {
+    pub fn search(&self, rect: &[f64; 4]) -> Vec<usize> {
         self.entries
             .iter()
             .filter(|e| intersects(&e.rect, rect))
@@ -60,19 +57,23 @@ impl SpatialIndex for HilbertRTree {
             .collect()
     }
 
-    fn delete(&mut self, id: usize) {
+    pub fn delete(&mut self, id: usize) {
         self.entries.retain(|e| e.id != id);
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    fn clear(&mut self) {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
         self.entries.clear();
     }
 
-    fn shapes(&self) -> Vec<LineSegment> {
+    pub fn shapes(&self) -> Vec<LineSegment> {
         let n = 1u64 << (2 * self.order);
         (0..n - 1)
             .map(|i| {
@@ -87,7 +88,7 @@ impl SpatialIndex for HilbertRTree {
             .collect::<Vec<LineSegment>>()
     }
 
-    fn get_capacity(&self) -> Option<usize> {
+    pub fn get_capacity(&self) -> Option<usize> {
         None
     }
 }

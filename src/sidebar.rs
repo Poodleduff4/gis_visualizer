@@ -1,6 +1,9 @@
 use egui::{ComboBox, RichText, ScrollArea, Ui};
 
-use crate::gis_layer::{AttributeType, AttributeValue, LayerEntry};
+use crate::{
+    gis_layer::{AttributeType, AttributeValue, LayerEntry},
+    uncertainty_quadtree::UncertaintyMeasurement,
+};
 
 // ── Add-attribute form state ──────────────────────────────────────────────────
 
@@ -33,6 +36,7 @@ pub fn show_sidebar(
     selected_id: Option<usize>,
     form: &mut AddAttributeForm,
     save_path: &mut String,
+    selected_index_cell_data: Option<&UncertaintyMeasurement>,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
 
@@ -51,6 +55,13 @@ pub fn show_sidebar(
     ui.label(RichText::new(&layer.name).strong());
     ui.label(format!("{} features", layer.data.feature_count()));
     ui.separator();
+    if let Some(cell_data) = selected_index_cell_data {
+        ui.label(RichText::new("Selected index cell").strong());
+        ui.label(format!("Standard Deviation: {}", cell_data.std_dev));
+        ui.label(format!("Variance: {}", cell_data.variance));
+        ui.label(format!("Mean: {}", cell_data.mean));
+        ui.separator();
+    }
 
     // ── Selected feature attributes ───────────────────────────────────────────
     let Some(sel_id) = selected_id else {
@@ -59,6 +70,7 @@ pub fn show_sidebar(
     };
 
     let feature = layer.data.feature(sel_id);
+    let point_attrs = layer.data.point_attrs_display(sel_id);
     ui.label(RichText::new(format!("Feature #{sel_id}")).strong());
     ui.add_space(4.0);
 
@@ -80,12 +92,20 @@ pub fn show_sidebar(
                 ui.label(RichText::new("Value").strong());
                 ui.end_row();
 
-                // for name in &all_names {
-                //     ui.label(name.as_str());
-                //     let val = feature.attributes.get(name.as_str());
-                //     ui.label(val.map(|v| v.as_display_string()).unwrap_or_default());
-                //     ui.end_row();
-                // }
+                if let Some(ref vals) = point_attrs {
+                    for (name, val) in all_names.iter().zip(vals.iter()) {
+                        ui.label(name.as_str());
+                        ui.label(val.as_str());
+                        ui.end_row();
+                    }
+                } else if let Some(feat) = feature {
+                    for name in &all_names {
+                        ui.label(name.as_str());
+                        let val = feat.attributes.get(name.as_str());
+                        ui.label(val.map(|v| v.as_display_string()).unwrap_or_default());
+                        ui.end_row();
+                    }
+                }
             });
     });
 

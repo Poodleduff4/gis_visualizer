@@ -1,4 +1,4 @@
-use crate::spatial_index::{HeatmapCell, LineSegment, SpatialIndex};
+use crate::spatial_index::{HeatmapCell, LineSegment};
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -20,39 +20,39 @@ pub struct Quadtree {
     divided: bool,
 }
 
-impl SpatialIndex for Quadtree {
-    fn insert(&mut self, id: usize, rect: [f64; 4]) {
+impl Quadtree {
+    pub fn insert(&mut self, id: usize, rect: [f64; 4]) {
         let cx = (rect[0] + rect[2]) / 2.0;
         let cy = (rect[1] + rect[3]) / 2.0;
         self.insert_point(Entry::new(id, [cx, cy]));
     }
 
-    fn search(&self, rect: &[f64; 4]) -> Vec<usize> {
+    pub fn search(&self, rect: &[f64; 4]) -> Vec<usize> {
         self.range_query(rect).into_iter().map(|e| e.id).collect()
     }
 
-    fn delete(&mut self, id: usize) {
+    pub fn delete(&mut self, id: usize) {
         self.entries.retain(|e| e.id != id);
         for child in &mut self.children {
             child.delete(id);
         }
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.entries.len() + self.children.iter().map(|c| c.len()).sum::<usize>()
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.children.iter().all(|c| c.is_empty())
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.entries.clear();
         self.children.clear();
         self.divided = false;
     }
 
-    fn shapes(&self) -> Vec<LineSegment> {
+    pub fn shapes(&self) -> Vec<LineSegment> {
         let mut segments = Vec::new();
         if !self.divided {
             segments.push(LineSegment::new(
@@ -79,11 +79,11 @@ impl SpatialIndex for Quadtree {
         segments
     }
 
-    fn heatmap_cells(&self) -> Vec<HeatmapCell> {
+    pub fn heatmap_cells(&self) -> Vec<HeatmapCell> {
         self.collect_cells_inner(0)
     }
 
-    fn get_capacity(&self) -> Option<usize> {
+    pub fn get_capacity(&self) -> Option<usize> {
         Some(self.capacity)
     }
 }

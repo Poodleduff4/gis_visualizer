@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use crate::hilbert_r_tree::HilbertRTree;
-use crate::point_cloud_layer::PointCloudLayer;
+use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 use crate::quadtree::Quadtree;
 use crate::spatial_index::{IndexKind, SpatialIndex};
 use anyhow::{anyhow, Result};
@@ -260,7 +260,7 @@ fn bounding_box(geom: &Geometry<f64>) -> [f64; 4] {
 }
 
 pub enum BatchMessage {
-    Points(usize, Vec<[f64; 2]>),
+    Points(usize, Vec<[f64; 2]>, Vec<AttributeColumn>),
     Vector(usize, Vec<GisFeature>),
 }
 
@@ -292,11 +292,9 @@ impl LayerKind {
             LayerKind::Vector(gis_layer) => gis_layer.field_names.clone(),
         }
     }
-    pub fn index(&self, kind: IndexKind) -> Option<&dyn SpatialIndex> {
+    pub fn index(&self, kind: IndexKind) -> Option<&SpatialIndex> {
         match self {
-            LayerKind::Points(point_cloud_layer) => {
-                point_cloud_layer.index.as_ref().map(|b| b.as_ref())
-            }
+            LayerKind::Points(point_cloud_layer) => point_cloud_layer.index.as_ref(),
             LayerKind::Vector(gis_layer) => gis_layer.index(kind),
         }
     }
@@ -310,6 +308,14 @@ impl LayerKind {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.hit_test(x, y, tolerance),
             LayerKind::Vector(gis_layer) => gis_layer.hit_test(x, y, tolerance),
+        }
+    }
+    pub fn point_attrs_display(&self, idx: usize) -> Option<Vec<String>> {
+        match self {
+            LayerKind::Points(pc) if !pc.attributes.is_empty() => {
+                Some(pc.attributes.iter().map(|col| col.get_display(idx)).collect())
+            }
+            _ => None,
         }
     }
 }
@@ -361,17 +367,17 @@ pub struct GisLayer {
     pub features: Vec<GisFeature>,
     pub field_names: Vec<String>,
     pub extra_field_names: Vec<String>,
-    pub quadtree: Option<Box<dyn SpatialIndex>>,
-    pub hilbert: Option<Box<dyn SpatialIndex>>,
+    pub quadtree: Option<SpatialIndex>,
+    pub hilbert: Option<SpatialIndex>,
     pub point_only: bool,
     pub world_bbox: [f64; 4],
 }
 
 impl GisLayer {
-    pub fn index(&self, kind: IndexKind) -> Option<&dyn SpatialIndex> {
+    pub fn index(&self, kind: IndexKind) -> Option<&SpatialIndex> {
         match kind {
-            IndexKind::Quadtree => self.quadtree.as_ref().map(|b| b.as_ref()),
-            IndexKind::Hilbert => self.hilbert.as_ref().map(|b| b.as_ref()),
+            IndexKind::Quadtree => self.quadtree.as_ref(),
+            IndexKind::Hilbert => self.hilbert.as_ref(),
         }
     }
 
@@ -395,7 +401,7 @@ impl GisLayer {
 
     pub fn rebuild_quadtree(&mut self, capacity: usize) {
         self.ensure_world_bbox();
-        let mut qt: Box<dyn SpatialIndex> = Box::new(Quadtree::new(self.world_bbox, capacity));
+        let mut qt = SpatialIndex::Quadtree(Quadtree::new(self.world_bbox, capacity));
         for f in &self.features {
             qt.insert(f.id, f.bbox());
         }
@@ -404,7 +410,7 @@ impl GisLayer {
 
     pub fn rebuild_hilbert_tree(&mut self, order: u32) {
         self.ensure_world_bbox();
-        let mut ht: Box<dyn SpatialIndex> = Box::new(HilbertRTree::new(self.world_bbox, order));
+        let mut ht = SpatialIndex::HilbertCurve(HilbertRTree::new(self.world_bbox, order));
         for f in &self.features {
             ht.insert(f.id, f.bbox());
         }
@@ -499,8 +505,10 @@ impl GisLayer {
                 .geometry()
                 .expect("Feature missing geometry!"),
         ) {
-            Some(geo_types::Geometry::Point::<f64>(p)) => {
-                LayerKind::Points(PointCloudLayer::default())
+            Some(geo_types::Geometry::Point::<f64>(_)) => {
+                let mut pc = PointCloudLayer::default();
+                pc.field_names = field_names;
+                LayerKind::Points(pc)
             }
             _ => LayerKind::Vector(GisLayer::default()),
         };
@@ -651,29 +659,55 @@ impl GisLayer {
     ) -> Result<()> {
         let dataset = gdal::Dataset::open(path)?;
         let mut layer = dataset.layer(layer_idx)?;
-        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
-        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(10000);
+        let field_ogr_types: Vec<OGRFieldType::Type> =
+            layer.defn().fields().map(|f| f.field_type()).collect();
+
+        let make_cols = |cap: usize| -> Vec<AttributeColumn> {
+            field_ogr_types
+                .iter()
+                .map(|t| match *t {
+                    OGRFieldType::OFTInteger | OGRFieldType::OFTInteger64 => {
+                        AttributeColumn::Integer(Vec::with_capacity(cap))
+                    }
+                    OGRFieldType::OFTReal => AttributeColumn::Float(Vec::with_capacity(cap)),
+                    _ => AttributeColumn::Text(Vec::with_capacity(cap)),
+                })
+                .collect()
+        };
+
+        const BATCH: usize = 10_000;
+        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH);
+        let mut batch_cols: Vec<AttributeColumn> = make_cols(BATCH);
+
         for feature in layer.features() {
-            // let mut attributes: HashMap<String, AttributeValue> = HashMap::new();
-            // for (i, fname) in field_names.iter().enumerate() {
-            //     if let Ok(Some(val)) = feature.field(i) {
-            //         let attr = match val {
-            //             FieldValue::IntegerValue(v) => AttributeValue::Integer(v as i64),
-            //             FieldValue::Integer64Value(v) => AttributeValue::Integer(v),
-            //             FieldValue::RealValue(v) => AttributeValue::Float(v),
-            //             FieldValue::StringValue(v) => AttributeValue::Text(v),
-            //             _ => continue,
-            //         };
-            //         attributes.insert(fname.clone(), attr);
-            //     }
-            // }
             if let Some(geom_ref) = feature.geometry() {
                 if let Some(geo_types::Geometry::Point(p)) = gdal_geom_to_geo(geom_ref) {
                     batch.push([p.x(), p.y()]);
-                    if batch.len() >= batch.capacity() {
+                    for (i, col) in batch_cols.iter_mut().enumerate() {
+                        match feature.field(i) {
+                            Ok(Some(val)) => match (col, val) {
+                                (AttributeColumn::Float(v), FieldValue::RealValue(f)) => {
+                                    v.push(f)
+                                }
+                                (AttributeColumn::Integer(v), FieldValue::IntegerValue(i)) => {
+                                    v.push(i as i64)
+                                }
+                                (AttributeColumn::Integer(v), FieldValue::Integer64Value(i)) => {
+                                    v.push(i)
+                                }
+                                (AttributeColumn::Text(v), FieldValue::StringValue(s)) => {
+                                    v.push(s)
+                                }
+                                (col, _) => col.push_default(),
+                            },
+                            _ => col.push_default(),
+                        }
+                    }
+                    if batch.len() >= BATCH {
                         tx.send(BatchMessage::Points(
                             dest_idx,
-                            std::mem::replace(&mut batch, Vec::with_capacity(10000)),
+                            std::mem::replace(&mut batch, Vec::with_capacity(BATCH)),
+                            std::mem::replace(&mut batch_cols, make_cols(BATCH)),
                         ))
                         .ok();
                     }
@@ -681,7 +715,7 @@ impl GisLayer {
             }
         }
         if !batch.is_empty() {
-            tx.send(BatchMessage::Points(dest_idx, batch))?;
+            tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
         }
         Ok(())
     }

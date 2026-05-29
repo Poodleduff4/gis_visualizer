@@ -1,11 +1,47 @@
-use crate::{hilbert_r_tree::HilbertRTree, quadtree::Quadtree, spatial_index::SpatialIndex};
+use crate::{
+    hilbert_r_tree::HilbertRTree, quadtree::Quadtree, spatial_index::SpatialIndex,
+    uncertainty_quadtree::UncertaintyQuadtree,
+};
+
+pub enum AttributeColumn {
+    Text(Vec<String>),
+    Integer(Vec<i64>),
+    Float(Vec<f64>),
+}
+
+impl AttributeColumn {
+    pub fn get_display(&self, idx: usize) -> String {
+        match self {
+            AttributeColumn::Text(v) => v[idx].clone(),
+            AttributeColumn::Integer(v) => v[idx].to_string(),
+            AttributeColumn::Float(v) => format!("{:.6}", v[idx]),
+        }
+    }
+
+    pub fn push_default(&mut self) {
+        match self {
+            AttributeColumn::Text(v) => v.push(String::new()),
+            AttributeColumn::Integer(v) => v.push(0),
+            AttributeColumn::Float(v) => v.push(0.0),
+        }
+    }
+
+    pub fn extend_from(&mut self, other: AttributeColumn) {
+        match (self, other) {
+            (AttributeColumn::Float(a), AttributeColumn::Float(b)) => a.extend(b),
+            (AttributeColumn::Integer(a), AttributeColumn::Integer(b)) => a.extend(b),
+            (AttributeColumn::Text(a), AttributeColumn::Text(b)) => a.extend(b),
+            _ => {}
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct PointCloudLayer {
     pub points: Vec<[f64; 2]>,
-    // pub attributes: Vec<HashMap<String, AttributeValue>>,  // TODO: replace with columnar Vec<Vec<AttributeValue>>
+    pub attributes: Vec<AttributeColumn>,
     pub field_names: Vec<String>,
-    pub index: Option<Box<dyn SpatialIndex>>,
+    pub index: Option<SpatialIndex>,
     pub bbox: Option<[f64; 4]>,
 }
 impl PointCloudLayer {
@@ -29,7 +65,7 @@ impl PointCloudLayer {
     pub fn rebuild_quadtree(&mut self, capacity: usize) {
         self.ensure_bbox();
         if let Some(bbox) = self.bbox {
-            let mut qt: Box<dyn SpatialIndex> = Box::new(Quadtree::new(bbox, capacity));
+            let mut qt = SpatialIndex::Quadtree(Quadtree::new(bbox, capacity));
             for (i, p) in self.points.iter().enumerate() {
                 qt.insert(i, [p[0], p[1], p[0], p[1]]);
             }
@@ -40,7 +76,7 @@ impl PointCloudLayer {
     pub fn rebuild_hilbert_tree(&mut self, order: u32) {
         self.ensure_bbox();
         if let Some(bbox) = self.bbox {
-            let mut ht: Box<dyn SpatialIndex> = Box::new(HilbertRTree::new(bbox, order));
+            let mut ht = SpatialIndex::HilbertCurve(HilbertRTree::new(bbox, order));
             for (i, p) in self.points.iter().enumerate() {
                 ht.insert(i, [p[0], p[1], p[0], p[1]]);
             }
@@ -79,5 +115,24 @@ impl PointCloudLayer {
             }
             return b_idx;
         }
+    }
+
+    pub fn rebuild_uncertainty_quadtree(&mut self, attribute: String, threshold: f32) {
+        self.ensure_bbox();
+        let Some(bbox) = self.bbox else { return };
+        let field_idx = self.field_names.iter().position(|n| n == &attribute);
+        let mut uq = UncertaintyQuadtree::new(bbox, attribute, threshold);
+        for (i, p) in self.points.iter().enumerate() {
+            let value = field_idx
+                .and_then(|fi| self.attributes.get(fi))
+                .map(|col| match col {
+                    AttributeColumn::Float(v) => v.get(i).copied().unwrap_or(0.0),
+                    AttributeColumn::Integer(v) => v.get(i).copied().unwrap_or(0) as f64,
+                    AttributeColumn::Text(_) => 0.0,
+                })
+                .unwrap_or(0.0);
+            uq.insert(i, [p[0], p[1], p[0], p[1]], value);
+        }
+        self.index = Some(SpatialIndex::UncertaintyQuadtree(uq));
     }
 }
