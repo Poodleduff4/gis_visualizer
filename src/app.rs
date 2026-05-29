@@ -1,5 +1,12 @@
 use egui::{CentralPanel, Color32, UiKind};
-use std::sync::mpsc::{self, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, TryRecvError};
+
+#[derive(Default, PartialEq)]
+enum LoadMode {
+    #[default]
+    GeometryOnly,
+    WithAttributes,
+}
 use wgpu::naga::proc::vector_size_str;
 
 use crate::basemap::BasemapCache;
@@ -42,6 +49,8 @@ pub struct GisEditorApp {
     // Layer selector state (populated after file pick, before load)
     pending_file: Option<String>,
     pending_layers: Vec<(LayerDescriptor, bool)>,
+    pending_load_mode: LoadMode,
+    pending_field_selection: Vec<(String, bool)>,
     load_rx: Option<mpsc::Receiver<BatchMessage>>,
 
     // GPU point cloud state
@@ -82,6 +91,8 @@ impl GisEditorApp {
             layer_picker_window_open: false,
             pending_file: None,
             pending_layers: Vec::new(),
+            pending_load_mode: LoadMode::default(),
+            pending_field_selection: Vec::new(),
             viewport: Viewport::default(),
             selected_id: None,
             add_form: AddAttributeForm::default(),
@@ -123,6 +134,19 @@ impl GisEditorApp {
                 self.status = "No layers found in file.".to_string();
             }
             Ok(descriptors) => {
+                let mut seen = std::collections::HashSet::new();
+                let mut all_fields: Vec<String> = Vec::new();
+                for d in &descriptors {
+                    for f in &d.field_names {
+                        if seen.insert(f.clone()) {
+                            all_fields.push(f.clone());
+                        }
+                    }
+                }
+                all_fields.sort();
+                self.pending_field_selection =
+                    all_fields.into_iter().map(|f| (f, true)).collect();
+                self.pending_load_mode = LoadMode::GeometryOnly;
                 self.pending_layers = descriptors.into_iter().map(|d| (d, true)).collect();
                 self.pending_file = Some(path.to_string());
             }
@@ -310,13 +334,14 @@ impl eframe::App for GisEditorApp {
         if self.pending_file.is_some() {
             egui::Window::new("Select Layers")
                 .collapsible(false)
-                .resizable(false)
+                .resizable(true)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
                     ui.label("Choose which layers to load:");
                     ui.separator();
                     egui::ScrollArea::vertical()
-                        .max_height(300.0)
+                        .id_salt("layer_scroll")
+                        .max_height(200.0)
                         .show(ui, |ui| {
                             for (desc, selected) in &mut self.pending_layers {
                                 ui.checkbox(
@@ -325,6 +350,47 @@ impl eframe::App for GisEditorApp {
                                 );
                             }
                         });
+
+                    ui.separator();
+                    ui.label("Attributes:");
+                    ui.radio_value(
+                        &mut self.pending_load_mode,
+                        LoadMode::GeometryOnly,
+                        "Geometry only",
+                    );
+                    ui.radio_value(
+                        &mut self.pending_load_mode,
+                        LoadMode::WithAttributes,
+                        "With attributes",
+                    );
+
+                    if self.pending_load_mode == LoadMode::WithAttributes
+                        && !self.pending_field_selection.is_empty()
+                    {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Select attributes:");
+                            if ui.small_button("All").clicked() {
+                                for (_, s) in &mut self.pending_field_selection {
+                                    *s = true;
+                                }
+                            }
+                            if ui.small_button("None").clicked() {
+                                for (_, s) in &mut self.pending_field_selection {
+                                    *s = false;
+                                }
+                            }
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt("attr_scroll")
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for (name, selected) in &mut self.pending_field_selection {
+                                    ui.checkbox(selected, name.as_str());
+                                }
+                            });
+                    }
+
                     ui.separator();
                     ui.horizontal(|ui| {
                         let any_selected = self.pending_layers.iter().any(|(_, s)| *s);
@@ -351,7 +417,20 @@ impl eframe::App for GisEditorApp {
         if let Some(indices) = load_indices {
             let (tx, rx) = mpsc::sync_channel::<BatchMessage>(10);
             let path = self.pending_file.take().unwrap();
+
+            let attr_fields: Option<Vec<String>> = match self.pending_load_mode {
+                LoadMode::GeometryOnly => None,
+                LoadMode::WithAttributes => Some(
+                    self.pending_field_selection
+                        .iter()
+                        .filter(|(_, sel)| *sel)
+                        .map(|(name, _)| name.clone())
+                        .collect(),
+                ),
+            };
+
             self.pending_layers.clear();
+            self.pending_field_selection.clear();
             let layers = GisLayer::load_selected_without_features(&path, &indices)
                 .expect("Error loading featureless layers!");
             let first_new = self.layers.len();
@@ -374,7 +453,13 @@ impl eframe::App for GisEditorApp {
                             tx.clone(),
                         )
                     } else {
-                        GisLayer::load_layer_batched(path.as_str(), file_idx, dest, tx.clone())
+                        GisLayer::load_layer_batched(
+                            path.as_str(),
+                            file_idx,
+                            dest,
+                            tx.clone(),
+                            attr_fields.clone(),
+                        )
                     };
                     result.expect("Batch layer read failed");
                 }
@@ -383,6 +468,7 @@ impl eframe::App for GisEditorApp {
         } else if cancel_pending {
             self.pending_file = None;
             self.pending_layers.clear();
+            self.pending_field_selection.clear();
         }
 
         if let Some(rx) = &self.load_rx {
