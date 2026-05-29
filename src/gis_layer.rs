@@ -419,9 +419,11 @@ impl GisLayer {
         Ok((0..count)
             .map(|i| {
                 let layer = dataset.layer(i).unwrap();
+                let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
                 LayerDescriptor {
                     name: layer.name(),
                     num_features: layer.feature_count(),
+                    field_names,
                 }
             })
             .collect::<Vec<LayerDescriptor>>())
@@ -593,32 +595,39 @@ impl GisLayer {
         layer_idx: usize,
         dest_idx: usize,
         tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
     ) -> Result<()> {
         let dataset = Dataset::open(path)?;
         let mut layer = dataset.layer(layer_idx)?;
-        let name = layer.name();
 
         let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
 
-        // let mut features: Vec<GisFeature> = Vec::new();
+        let selected_set: Option<std::collections::HashSet<String>> =
+            selected_fields.map(|f| f.into_iter().collect());
 
         let mut batch: Vec<GisFeature> = Vec::with_capacity(10000);
         let mut count = 0;
         for feature in layer.features() {
-            let mut attributes: HashMap<String, AttributeValue> = HashMap::new();
-
-            for (i, fname) in field_names.iter().enumerate() {
-                if let Ok(Some(val)) = feature.field(i) {
-                    let attr = match val {
-                        FieldValue::IntegerValue(v) => AttributeValue::Integer(v as i64),
-                        FieldValue::Integer64Value(v) => AttributeValue::Integer(v),
-                        FieldValue::RealValue(v) => AttributeValue::Float(v),
-                        FieldValue::StringValue(v) => AttributeValue::Text(v),
-                        _ => continue,
-                    };
-                    attributes.insert(fname.clone(), attr);
+            let attributes = if let Some(ref set) = selected_set {
+                let mut attrs: HashMap<String, AttributeValue> = HashMap::new();
+                for (i, fname) in field_names.iter().enumerate() {
+                    if set.contains(fname) {
+                        if let Ok(Some(val)) = feature.field(i) {
+                            let attr = match val {
+                                FieldValue::IntegerValue(v) => AttributeValue::Integer(v as i64),
+                                FieldValue::Integer64Value(v) => AttributeValue::Integer(v),
+                                FieldValue::RealValue(v) => AttributeValue::Float(v),
+                                FieldValue::StringValue(v) => AttributeValue::Text(v),
+                                _ => continue,
+                            };
+                            attrs.insert(fname.clone(), attr);
+                        }
+                    }
                 }
-            }
+                attrs
+            } else {
+                HashMap::new()
+            };
 
             if let Some(geom_ref) = feature.geometry() {
                 if let Some(geo_geom) = gdal_geom_to_geo(geom_ref) {
@@ -986,4 +995,5 @@ fn infer_ogr_type(geom: &Geometry<f64>) -> OGRwkbGeometryType::Type {
 pub struct LayerDescriptor {
     pub name: String,
     pub num_features: u64,
+    pub field_names: Vec<String>,
 }
