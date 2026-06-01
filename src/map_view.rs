@@ -3,7 +3,7 @@ use crate::basemap::BasemapCache;
 use crate::gis_layer::{LayerEntry, LayerKind, TessellatedGeom};
 use crate::heatmap::HeatmapLayer;
 use crate::spatial_index::{IndexKind, LineSegment, SpatialIndex};
-use crate::uncertainty_quadtree::UncertaintyMeasurement;
+use crate::uncertainty_quadtree::{UncertaintyMeasure, UncertaintyMeasurement};
 use anyhow::bail;
 use egui::epaint::Mesh;
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Ui, Vec2};
@@ -90,7 +90,7 @@ pub fn show_map(
     basemap: Option<&BasemapCache>,
     render_points: bool,
     click_target: &ClickTarget,
-    selected_index_cell_data: &mut Option<UncertaintyMeasurement>,
+    selected_index_cell_data: &mut Option<UncertaintyMeasure>,
 ) {
     let ctx = ui.ctx().clone();
     let rect = response.rect;

@@ -1,3 +1,4 @@
+use kernel_density_estimation::prelude::*;
 use rand::{rng, rngs::ThreadRng, seq::IteratorRandom};
 
 use std::collections::HashMap;
@@ -25,10 +26,28 @@ impl Entry {
 }
 
 #[derive(Clone, Debug)]
+pub enum MeasurementType {
+    Variance,
+    KernalDensity,
+}
+
+#[derive(Clone, Debug)]
 pub struct UncertaintyMeasurement {
     pub std_dev: f64,
     pub variance: f64,
     pub mean: f64,
+}
+
+#[derive(Clone)]
+pub enum UncertaintyMeasure {
+    Variance {
+        variance: f64,
+        std_dev: f64,
+        mean: f64,
+    },
+    KernalDensity {
+        entropy: f64,
+    },
 }
 
 const MAX_DEPTH: usize = 24;
@@ -39,9 +58,10 @@ pub struct UncertaintyQuadtree {
     children: Vec<Box<UncertaintyQuadtree>>,
     divided: bool,
     attribute: String,
-    pub uncertainty: Option<UncertaintyMeasurement>,
+    pub uncertainty: Option<UncertaintyMeasure>,
     uncertainty_threshold: f32,
     depth: usize,
+    split_measure: MeasurementType,
 }
 
 impl UncertaintyQuadtree {
@@ -131,11 +151,26 @@ impl UncertaintyQuadtree {
 }
 
 impl UncertaintyQuadtree {
-    pub fn new(bbox: [f64; 4], attribute: String, threshold: f32) -> Self {
-        Self::new_at_depth(bbox, attribute, 0, threshold)
+    pub fn new(
+        bbox: [f64; 4],
+        attribute: String,
+        threshold: f32,
+        measurement_type: MeasurementType,
+    ) -> Self {
+        println!(
+            "New UncertaintyQuadtree with split type: {:?}",
+            measurement_type
+        );
+        Self::new_at_depth(bbox, attribute, 0, threshold, measurement_type)
     }
 
-    fn new_at_depth(bbox: [f64; 4], attribute: String, depth: usize, threshold: f32) -> Self {
+    fn new_at_depth(
+        bbox: [f64; 4],
+        attribute: String,
+        depth: usize,
+        threshold: f32,
+        measurement_type: MeasurementType,
+    ) -> Self {
         UncertaintyQuadtree {
             bbox,
             entries: Vec::new(),
@@ -145,6 +180,7 @@ impl UncertaintyQuadtree {
             uncertainty: None,
             uncertainty_threshold: threshold,
             depth,
+            split_measure: measurement_type,
         }
     }
 
@@ -163,9 +199,17 @@ impl UncertaintyQuadtree {
     }
 
     pub fn should_split(&self) -> bool {
-        self.uncertainty
-            .as_ref()
-            .map_or(false, |u| u.variance > self.uncertainty_threshold as f64)
+        self.depth < MAX_DEPTH
+            && self.uncertainty.as_ref().map_or(false, |u| match u {
+                UncertaintyMeasure::Variance {
+                    variance,
+                    std_dev,
+                    mean,
+                } => *variance > self.uncertainty_threshold as f64,
+                UncertaintyMeasure::KernalDensity { entropy } => {
+                    *entropy > self.uncertainty_threshold as f64
+                }
+            })
     }
 
     fn insert_raw(&mut self, entry: Entry) -> bool {
@@ -195,12 +239,8 @@ impl UncertaintyQuadtree {
         if self.entries.is_empty() {
             return;
         }
-        self.calculate_uncertainty();
-        let should_split = self.depth < MAX_DEPTH
-            && self
-                .uncertainty
-                .as_ref()
-                .map_or(false, |u| u.variance > self.uncertainty_threshold as f64);
+        self.calculate_uncertainty(self.split_measure.clone());
+        let should_split = self.should_split();
         if should_split {
             self.subdivide();
             for child in &mut self.children {
@@ -216,12 +256,8 @@ impl UncertaintyQuadtree {
 
         if !self.divided {
             self.entries.push(entry);
-            self.calculate_uncertainty();
-            let should_split = self.depth < MAX_DEPTH
-                && self
-                    .uncertainty
-                    .as_ref()
-                    .map_or(false, |u| u.variance > self.uncertainty_threshold as f64);
+            self.calculate_uncertainty(self.split_measure.clone());
+            let should_split = self.should_split();
             if should_split {
                 self.subdivide();
             }
@@ -261,7 +297,7 @@ impl UncertaintyQuadtree {
         results
     }
 
-    pub fn calculate_uncertainty(&mut self) {
+    pub fn calculate_uncertainty(&mut self, measurement_type: MeasurementType) {
         if self.entries.is_empty() {
             return;
         }
@@ -275,16 +311,47 @@ impl UncertaintyQuadtree {
             .into_iter()
             .map(|e| e.measurement_value)
             .collect();
+        if sample.len() > 0 {
+            let uncertainty = match measurement_type {
+                MeasurementType::Variance => self.variance(&sample),
+                MeasurementType::KernalDensity => self.kernal_density(sample.clone()),
+            };
+            self.uncertainty = Some(uncertainty);
+        } else {
+            self.uncertainty = None;
+        }
+    }
 
+    pub fn variance(&self, sample: &Vec<f64>) -> UncertaintyMeasure {
         let n = sample.len() as f64;
         let mean = sample.iter().sum::<f64>() / n;
         let variance = sample.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
 
-        self.uncertainty = Some(UncertaintyMeasurement {
+        UncertaintyMeasure::Variance {
             std_dev: variance.sqrt(),
             variance,
             mean,
-        });
+        }
+    }
+
+    pub fn kernal_density(&self, sample: Vec<f64>) -> UncertaintyMeasure {
+        let n = sample.len();
+        if n < 2 {
+            return UncertaintyMeasure::KernalDensity { entropy: 0.0 };
+        }
+        let silverman = Box::new(Silverman);
+        let bandwidth = Box::new(|data: &[f64]| silverman.bandwidth(data));
+        let estimator = KernelDensityEstimator::new(sample.clone(), &bandwidth, Normal);
+        let pdf = estimator.pdf(&sample);
+
+        let entropy = -pdf
+            .iter()
+            .filter(|&&p| p > 0.0) // guard against log(0)
+            .map(|&p| p.ln())
+            .sum::<f64>()
+            / n as f64;
+
+        UncertaintyMeasure::KernalDensity { entropy }
     }
 
     fn subdivide(&mut self) {
@@ -298,6 +365,7 @@ impl UncertaintyQuadtree {
                 self.attribute.clone(),
                 next_depth,
                 self.uncertainty_threshold,
+                self.split_measure.clone(),
             )));
         self.children
             .push(Box::new(UncertaintyQuadtree::new_at_depth(
@@ -305,6 +373,7 @@ impl UncertaintyQuadtree {
                 self.attribute.clone(),
                 next_depth,
                 self.uncertainty_threshold,
+                self.split_measure.clone(),
             )));
         self.children
             .push(Box::new(UncertaintyQuadtree::new_at_depth(
@@ -312,6 +381,7 @@ impl UncertaintyQuadtree {
                 self.attribute.clone(),
                 next_depth,
                 self.uncertainty_threshold,
+                self.split_measure.clone(),
             )));
         self.children
             .push(Box::new(UncertaintyQuadtree::new_at_depth(
@@ -319,6 +389,7 @@ impl UncertaintyQuadtree {
                 self.attribute.clone(),
                 next_depth,
                 self.uncertainty_threshold,
+                self.split_measure.clone(),
             )));
 
         self.divided = true;

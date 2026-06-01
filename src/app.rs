@@ -17,7 +17,7 @@ use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
 use crate::quadtree::Quadtree;
 use crate::sidebar::{show_sidebar, AddAttributeForm, SidebarAction};
 use crate::spatial_index::IndexKind;
-use crate::uncertainty_quadtree::UncertaintyMeasurement;
+use crate::uncertainty_quadtree::{MeasurementType, UncertaintyMeasure, UncertaintyMeasurement};
 
 const LAYER_PANEL_WIDTH: f32 = 180.0;
 
@@ -70,9 +70,10 @@ pub struct GisEditorApp {
     last_viewport_ppu: f64,
     last_canvas_rect: Option<egui::Rect>,
     selected_uncertainty_attribute: Option<String>,
-    selected_index_cell_data: Option<UncertaintyMeasurement>,
+    selected_index_cell_data: Option<UncertaintyMeasure>,
     uncertainty_split_threshold: f32,
     viewport_culling: bool,
+    selected_split_measurement_type: MeasurementType,
 }
 
 impl GisEditorApp {
@@ -125,6 +126,7 @@ impl GisEditorApp {
             selected_index_cell_data: None,
             uncertainty_split_threshold: 0.5,
             viewport_culling: true,
+            selected_split_measurement_type: MeasurementType::Variance,
         }
     }
 
@@ -269,6 +271,18 @@ impl eframe::App for GisEditorApp {
                             egui::Slider::new(&mut self.spatial_index_split_density, 100..=10000)
                                 .step_by(5.0),
                         );
+                    });
+                    ui.vertical(|ui| {
+                        ui.label("Uncertainty Quadtree Split Type:");
+                        ui.horizontal(|ui| {
+                            if ui.button("Variance").clicked() {
+                                self.selected_split_measurement_type = MeasurementType::Variance
+                            }
+                            if ui.button("Kernel-Density Entropy").clicked() {
+                                self.selected_split_measurement_type =
+                                    MeasurementType::KernalDensity
+                            }
+                        })
                     });
                     ui.horizontal(|ui| {
                         ui.label("Uncertainty Quadtree Threshold:");
@@ -632,6 +646,7 @@ impl eframe::App for GisEditorApp {
                                     pc.rebuild_uncertainty_quadtree(
                                         attr.clone(),
                                         self.uncertainty_split_threshold,
+                                        self.selected_split_measurement_type.clone(),
                                     );
                                 }
                             }

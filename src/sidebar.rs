@@ -2,7 +2,7 @@ use egui::{ComboBox, RichText, ScrollArea, Ui};
 
 use crate::{
     gis_layer::{AttributeType, AttributeValue, LayerEntry},
-    uncertainty_quadtree::UncertaintyMeasurement,
+    uncertainty_quadtree::{UncertaintyMeasure, UncertaintyMeasurement},
 };
 
 // ── Add-attribute form state ──────────────────────────────────────────────────
@@ -36,7 +36,7 @@ pub fn show_sidebar(
     selected_id: Option<usize>,
     form: &mut AddAttributeForm,
     save_path: &mut String,
-    selected_index_cell_data: Option<&UncertaintyMeasurement>,
+    selected_index_cell_data: Option<&UncertaintyMeasure>,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
 
@@ -56,11 +56,23 @@ pub fn show_sidebar(
     ui.label(format!("{} features", layer.data.feature_count()));
     ui.separator();
     if let Some(cell_data) = selected_index_cell_data {
-        ui.label(RichText::new("Selected index cell").strong());
-        ui.label(format!("Standard Deviation: {}", cell_data.std_dev));
-        ui.label(format!("Variance: {}", cell_data.variance));
-        ui.label(format!("Mean: {}", cell_data.mean));
-        ui.separator();
+        match cell_data {
+            UncertaintyMeasure::Variance {
+                variance,
+                std_dev,
+                mean,
+            } => {
+                ui.label(RichText::new("Selected index cell").strong());
+                ui.label(format!("Standard Deviation: {}", std_dev));
+                ui.label(format!("Variance: {}", variance));
+                ui.label(format!("Mean: {}", mean));
+                ui.separator();
+            }
+            UncertaintyMeasure::KernalDensity { entropy } => {
+                ui.label(format!("Kernel-Density Entropy: {}", entropy));
+                ui.separator();
+            }
+        }
     }
 
     // ── Selected feature attributes ───────────────────────────────────────────

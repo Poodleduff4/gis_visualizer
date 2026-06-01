@@ -1,6 +1,8 @@
 use crate::{
-    hilbert_r_tree::HilbertRTree, quadtree::Quadtree, spatial_index::SpatialIndex,
-    uncertainty_quadtree::UncertaintyQuadtree,
+    hilbert_r_tree::HilbertRTree,
+    quadtree::Quadtree,
+    spatial_index::SpatialIndex,
+    uncertainty_quadtree::{MeasurementType, UncertaintyQuadtree},
 };
 
 pub enum AttributeColumn {
@@ -126,11 +128,16 @@ impl PointCloudLayer {
             .collect()
     }
 
-    pub fn rebuild_uncertainty_quadtree(&mut self, attribute: String, threshold: f32) {
+    pub fn rebuild_uncertainty_quadtree(
+        &mut self,
+        attribute: String,
+        threshold: f32,
+        measurement_type: MeasurementType,
+    ) {
         self.ensure_bbox();
         let Some(bbox) = self.bbox else { return };
         let field_idx = self.field_names.iter().position(|n| n == &attribute);
-        let mut uq = UncertaintyQuadtree::new(bbox, attribute.clone(), threshold);
+        let mut uq = UncertaintyQuadtree::new(bbox, attribute.clone(), threshold, measurement_type);
         uq.insert_batch(self.points.iter().enumerate().map(|(i, p)| {
             let value = field_idx
                 .and_then(|fi| self.attributes.get(fi))
