@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Error;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -8,8 +10,7 @@ use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 use crate::quadtree::Quadtree;
 use crate::spatial_index::{IndexKind, SpatialIndex};
 use anyhow::{anyhow, Result};
-use gdal::vector::{FieldValue, LayerAccess, OGRFieldType, OGRwkbGeometryType};
-use gdal::Dataset;
+use flatgeobuf::FgbReader;
 use geo::BoundingRect;
 use geo_types::{
     Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
@@ -217,7 +218,7 @@ pub struct GisFeature {
 }
 
 impl GisFeature {
-    fn new(
+    pub fn new(
         id: usize,
         geometry: Geometry<f64>,
         attributes: HashMap<String, AttributeValue>,
@@ -336,38 +337,7 @@ pub struct LayerEntry {
     pub color: [u8; 3],
     pub opacity: u8,
 }
-impl LayerEntry {
-    pub fn load_point_layer_without_features(
-        dataset: &Dataset,
-        layer_idx: usize,
-        path: &str,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut layer = dataset.layer(layer_idx)?;
-        let name = layer.name();
-        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
-        let num_features = layer.feature_count() as usize;
-
-        let layer_kind = layer
-            .feature(0)
-            .and_then(|f| match gdal_geom_to_geo(f.geometry()?) {
-                Some(geo_types::Geometry::Point::<f64>(_)) => {
-                    Some(LayerKind::Points(PointCloudLayer::default()))
-                }
-                _ => Some(LayerKind::Vector(GisLayer::default())),
-            })
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                "Could not determine layer kind from first feature".into()
-            })?;
-
-        Ok(LayerEntry {
-            data: layer_kind,
-            visible: true,
-            name,
-            color: [0, 0, 255],
-            opacity: 255,
-        })
-    }
-}
+impl LayerEntry {}
 
 #[derive(Default)]
 pub struct GisLayer {
@@ -428,46 +398,22 @@ impl GisLayer {
 }
 
 impl GisLayer {
-    pub fn get_layers(path: &str) -> Result<Vec<LayerDescriptor>, Box<dyn std::error::Error>> {
-        let dataset = Dataset::open(Path::new(path)).expect("Invalid file path!");
-        let count = dataset.layer_count();
-        Ok((0..count)
-            .map(|i| {
-                let layer = dataset.layer(i).unwrap();
-                let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
-                LayerDescriptor {
-                    name: layer.name(),
-                    num_features: layer.feature_count(),
-                    field_names,
-                }
-            })
-            .collect::<Vec<LayerDescriptor>>())
-    }
-
-    pub fn load_selected_without_features(
-        path: &str,
-        indices: &[usize],
-        attr_fields: Option<Vec<String>>,
-    ) -> Result<Vec<LayerEntry>, Box<dyn std::error::Error>> {
-        let dataset = Dataset::open(Path::new(path))?;
-        let mut layers = Vec::new();
-        for &i in indices {
-            match GisLayer::load_layer_without_features(&dataset, i, &path, attr_fields.clone()) {
-                Ok(layer) => {
-                    let name = layer.name.clone();
-                    layers.push(LayerEntry {
-                        data: layer.data,
-                        visible: true,
-                        color: [0, 0, 255],
-                        opacity: 255,
-                        name,
-                    });
-                }
-
-                Err(_) => {}
-            }
-        }
-        Ok(layers)
+    pub fn get_layers(path: &str) -> Result<LayerDescriptor, Box<dyn std::error::Error>> {
+        let dataset = FgbReader::open(BufReader::new(File::open(path)?))?;
+        let header = dataset.header();
+        let mut layer = LayerDescriptor {
+            name: header.name().unwrap_or("N/A").to_string(),
+            num_features: header.features_count(),
+            field_names: header
+                .columns()
+                .map(|cols| {
+                    cols.iter()
+                        .map(|c| c.name().to_string())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or(Vec::new()),
+        };
+        Ok(layer)
     }
 
     // pub fn load_all(path: &str) -> Result<Vec<Self>> {
@@ -494,47 +440,6 @@ impl GisLayer {
     //     }
     //     Ok(layers)
     // }
-
-    pub fn load_layer_without_features(
-        dataset: &Dataset,
-        layer_idx: usize,
-        path: &str,
-        attr_fields: Option<Vec<String>>,
-    ) -> Result<LayerEntry> {
-        let mut layer = dataset.layer(layer_idx)?;
-        let name = layer.name();
-
-        println!(
-            "Loading empty layer idx: {} with attrs: {:?}",
-            layer_idx,
-            attr_fields.as_ref()
-        );
-        let field_names = attr_fields.unwrap_or(Vec::new());
-        let num_features = layer.feature_count() as usize;
-        if num_features == 0 {
-            return Err(anyhow!("No Features in Layer"));
-        }
-        let layer_kind = match gdal_geom_to_geo(
-            layer
-                .features()
-                .next()
-                .unwrap()
-                .geometry()
-                .expect("Feature missing geometry!"),
-        ) {
-            Some(geo_types::Geometry::Point::<f64>(_)) => {
-                LayerKind::Points(PointCloudLayer::default())
-            }
-            _ => LayerKind::Vector(GisLayer::default()),
-        };
-        Ok(LayerEntry {
-            data: layer_kind,
-            visible: true,
-            name,
-            color: [0, 0, 255],
-            opacity: 255,
-        })
-    }
 
     // fn load_layer(dataset: &Dataset, layer_idx: usize, path: &str) -> Result<Self> {
     //     let mut layer = dataset.layer(layer_idx)?;
@@ -611,158 +516,6 @@ impl GisLayer {
     //     })
     // }
 
-    pub fn load_layer_batched(
-        path: &str,
-        layer_idx: usize,
-        dest_idx: usize,
-        tx: mpsc::SyncSender<BatchMessage>,
-        selected_fields: Option<Vec<String>>,
-    ) -> Result<()> {
-        let dataset = Dataset::open(path)?;
-        let mut layer = dataset.layer(layer_idx)?;
-
-        let field_names: Vec<String> = layer.defn().fields().map(|f| f.name()).collect();
-
-        let selected_set: Option<std::collections::HashSet<String>> =
-            selected_fields.map(|f| f.into_iter().collect());
-
-        let mut batch: Vec<GisFeature> = Vec::with_capacity(10000);
-        let mut count = 0;
-        for feature in layer.features() {
-            let attributes = if let Some(ref set) = selected_set {
-                let mut attrs: HashMap<String, AttributeValue> = HashMap::new();
-                for (i, fname) in field_names.iter().enumerate() {
-                    if set.contains(fname) {
-                        if let Ok(Some(val)) = feature.field(i) {
-                            let attr = match val {
-                                FieldValue::IntegerValue(v) => AttributeValue::Integer(v as i64),
-                                FieldValue::Integer64Value(v) => AttributeValue::Integer(v),
-                                FieldValue::RealValue(v) => AttributeValue::Float(v),
-                                FieldValue::StringValue(v) => AttributeValue::Text(v),
-                                _ => continue,
-                            };
-                            attrs.insert(fname.clone(), attr);
-                        }
-                    }
-                }
-                attrs
-            } else {
-                HashMap::new()
-            };
-
-            if let Some(geom_ref) = feature.geometry() {
-                if let Some(geo_geom) = gdal_geom_to_geo(geom_ref) {
-                    let id = count;
-                    batch.push(GisFeature::new(id, geo_geom, attributes));
-                    count += 1;
-
-                    if batch.len() >= batch.capacity() {
-                        tx.send(BatchMessage::Vector(
-                            dest_idx,
-                            std::mem::replace(&mut batch, Vec::with_capacity(10000)),
-                        ))
-                        .ok();
-                    }
-                }
-            }
-        }
-        if !batch.is_empty() {
-            tx.send(BatchMessage::Vector(dest_idx, batch))?;
-        }
-
-        Ok(())
-    }
-
-    pub fn load_point_layer_batched(
-        path: &str,
-        layer_idx: usize,
-        dest_idx: usize,
-        tx: mpsc::SyncSender<BatchMessage>,
-        selected_fields: Option<Vec<String>>,
-    ) -> Result<()> {
-        let dataset = gdal::Dataset::open(path)?;
-        let mut layer = dataset.layer(layer_idx)?;
-
-        let field_defs: Vec<(String, OGRFieldType::Type)> = layer
-            .defn()
-            .fields()
-            .map(|f| (f.name(), f.field_type()))
-            .collect();
-
-        // (file_field_index, name, ogr_type) — empty when geometry-only
-        let load_fields: Vec<(usize, String, OGRFieldType::Type)> = match selected_fields {
-            None => Vec::new(),
-            Some(ref sel) => {
-                let sel_set: std::collections::HashSet<&str> =
-                    sel.iter().map(|s| s.as_str()).collect();
-                field_defs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (name, _))| sel_set.contains(name.as_str()))
-                    .map(|(i, (name, t))| (i, name.clone(), *t))
-                    .collect()
-            }
-        };
-
-        let empty_col = |t: OGRFieldType::Type, cap: usize| -> AttributeColumn {
-            match t {
-                OGRFieldType::OFTInteger | OGRFieldType::OFTInteger64 => {
-                    AttributeColumn::Integer(Vec::with_capacity(cap))
-                }
-                OGRFieldType::OFTReal => AttributeColumn::Float(Vec::with_capacity(cap)),
-                _ => AttributeColumn::Text(Vec::with_capacity(cap)),
-            }
-        };
-
-        let make_batch_cols = |cap: usize| -> Vec<(String, AttributeColumn)> {
-            load_fields
-                .iter()
-                .map(|(_, name, t)| (name.clone(), empty_col(*t, cap)))
-                .collect()
-        };
-
-        const BATCH: usize = 10_000;
-        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH);
-        let mut batch_cols: Vec<(String, AttributeColumn)> = make_batch_cols(BATCH);
-
-        for feature in layer.features() {
-            if let Some(geom_ref) = feature.geometry() {
-                if let Some(geo_types::Geometry::Point(p)) = gdal_geom_to_geo(geom_ref) {
-                    batch.push([p.x(), p.y()]);
-                    for (col_idx, (field_idx, _, _)) in load_fields.iter().enumerate() {
-                        let col = &mut batch_cols[col_idx].1;
-                        match feature.field(*field_idx) {
-                            Ok(Some(val)) => match (col, val) {
-                                (AttributeColumn::Float(v), FieldValue::RealValue(f)) => v.push(f),
-                                (AttributeColumn::Integer(v), FieldValue::IntegerValue(i)) => {
-                                    v.push(i as i64)
-                                }
-                                (AttributeColumn::Integer(v), FieldValue::Integer64Value(i)) => {
-                                    v.push(i)
-                                }
-                                (AttributeColumn::Text(v), FieldValue::StringValue(s)) => v.push(s),
-                                (col, _) => col.push_default(),
-                            },
-                            _ => col.push_default(),
-                        }
-                    }
-                    if batch.len() >= BATCH {
-                        tx.send(BatchMessage::Points(
-                            dest_idx,
-                            std::mem::replace(&mut batch, Vec::with_capacity(BATCH)),
-                            std::mem::replace(&mut batch_cols, make_batch_cols(BATCH)),
-                        ))
-                        .ok();
-                    }
-                }
-            }
-        }
-        if !batch.is_empty() {
-            tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
-        }
-        Ok(())
-    }
-
     /// Returns IDs of features whose center points fall within the viewport.
     pub fn features_in_bbox(&self, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Vec<usize> {
         self.quadtree
@@ -834,231 +587,231 @@ impl GisLayer {
             .collect()
     }
 
-    pub fn save(&self, path: &str) -> Result<()> {
-        let ext = Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("shp")
-            .to_lowercase();
+    // pub fn save(&self, path: &str) -> Result<()> {
+    //     let ext = Path::new(path)
+    //         .extension()
+    //         .and_then(|e| e.to_str())
+    //         .unwrap_or("shp")
+    //         .to_lowercase();
 
-        let driver_name = match ext.as_str() {
-            "shp" => "ESRI Shapefile",
-            "gpkg" => "GPKG",
-            "geojson" | "json" => "GeoJSON",
-            "kml" => "KML",
-            _ => "ESRI Shapefile",
-        };
+    //     let driver_name = match ext.as_str() {
+    //         "shp" => "ESRI Shapefile",
+    //         "gpkg" => "GPKG",
+    //         "geojson" | "json" => "GeoJSON",
+    //         "kml" => "KML",
+    //         _ => "ESRI Shapefile",
+    //     };
 
-        let geom_type = self
-            .features
-            .first()
-            .map(|f| infer_ogr_type(&f.geometry))
-            .unwrap_or(OGRwkbGeometryType::wkbUnknown);
+    //     let geom_type = self
+    //         .features
+    //         .first()
+    //         .map(|f| infer_ogr_type(&f.geometry))
+    //         .unwrap_or(OGRwkbGeometryType::wkbUnknown);
 
-        let driver = gdal::DriverManager::get_driver_by_name(driver_name)?;
-        let mut out_ds = driver.create_vector_only(path)?;
-        let layer = out_ds.create_layer(gdal::vector::LayerOptions {
-            name: &self.name,
-            ty: geom_type,
-            ..Default::default()
-        })?;
+    //     let driver = gdal::DriverManager::get_driver_by_name(driver_name)?;
+    //     let mut out_ds = driver.create_vector_only(path)?;
+    //     let layer = out_ds.create_layer(gdal::vector::LayerOptions {
+    //         name: &self.name,
+    //         ty: geom_type,
+    //         ..Default::default()
+    //     })?;
 
-        // Collect all attribute names and their types
-        let all_names = self.all_field_names();
-        let mut field_types: Vec<(&str, OGRFieldType::Type)> = Vec::new();
+    //     // Collect all attribute names and their types
+    //     let all_names = self.all_field_names();
+    //     let mut field_types: Vec<(&str, OGRFieldType::Type)> = Vec::new();
 
-        for name in &all_names {
-            let ogr_type = self
-                .features
-                .iter()
-                .find_map(|f| f.attributes.get(*name))
-                .map(|v| match v {
-                    AttributeValue::Integer(_) => OGRFieldType::OFTInteger64,
-                    AttributeValue::Float(_) => OGRFieldType::OFTReal,
-                    AttributeValue::Text(_) => OGRFieldType::OFTString,
-                })
-                .unwrap_or(OGRFieldType::OFTString);
-            field_types.push((name, ogr_type));
-        }
+    //     for name in &all_names {
+    //         let ogr_type = self
+    //             .features
+    //             .iter()
+    //             .find_map(|f| f.attributes.get(*name))
+    //             .map(|v| match v {
+    //                 AttributeValue::Integer(_) => OGRFieldType::OFTInteger64,
+    //                 AttributeValue::Float(_) => OGRFieldType::OFTReal,
+    //                 AttributeValue::Text(_) => OGRFieldType::OFTString,
+    //             })
+    //             .unwrap_or(OGRFieldType::OFTString);
+    //         field_types.push((name, ogr_type));
+    //     }
 
-        layer.create_defn_fields(&field_types)?;
+    //     layer.create_defn_fields(&field_types)?;
 
-        let defn = layer.defn();
+    //     let defn = layer.defn();
 
-        for feature in &self.features {
-            let gdal_geom = geo_to_gdal_geom(&feature.geometry)?;
-            let mut out_feature = gdal::vector::Feature::new(&defn)?;
-            out_feature.set_geometry(gdal_geom)?;
+    //     for feature in &self.features {
+    //         let gdal_geom = geo_to_gdal_geom(&feature.geometry)?;
+    //         let mut out_feature = gdal::vector::Feature::new(&defn)?;
+    //         out_feature.set_geometry(gdal_geom)?;
 
-            for (i, name) in all_names.iter().enumerate() {
-                if let Some(val) = feature.attributes.get(*name) {
-                    match val {
-                        AttributeValue::Text(s) => out_feature.set_field_string(i, s)?,
-                        AttributeValue::Integer(v) => out_feature.set_field_integer64(i, *v)?,
-                        AttributeValue::Float(v) => out_feature.set_field_double(i, *v)?,
-                    }
-                }
-            }
+    //         for (i, name) in all_names.iter().enumerate() {
+    //             if let Some(val) = feature.attributes.get(*name) {
+    //                 match val {
+    //                     AttributeValue::Text(s) => out_feature.set_field_string(i, s)?,
+    //                     AttributeValue::Integer(v) => out_feature.set_field_integer64(i, *v)?,
+    //                     AttributeValue::Float(v) => out_feature.set_field_double(i, *v)?,
+    //                 }
+    //             }
+    //         }
 
-            out_feature.create(&layer)?;
-        }
+    //         out_feature.create(&layer)?;
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }
 
-fn gdal_geom_to_geo(geom: &gdal::vector::Geometry) -> Option<geo_types::Geometry> {
-    use OGRwkbGeometryType as T;
+// fn gdal_geom_to_geo(geom: &gdal::vector::Geometry) -> Option<geo_types::Geometry> {
+//     use OGRwkbGeometryType as T;
 
-    let gt = geom.geometry_type();
-    if gt == T::wkbPoint || gt == T::wkbPoint25D || gt == T::wkbPointM || gt == T::wkbPointZM {
-        let (x, y, _) = geom.get_point(0);
-        return Some(Geometry::Point(Point::new(x, y)));
-    }
-    if gt == T::wkbLineString
-        || gt == T::wkbLineString25D
-        || gt == T::wkbLineStringM
-        || gt == T::wkbLineStringZM
-    {
-        return Some(Geometry::LineString(ring_to_linestring(geom)));
-    }
-    if gt == T::wkbPolygon
-        || gt == T::wkbPolygon25D
-        || gt == T::wkbPolygonM
-        || gt == T::wkbPolygonZM
-    {
-        return Some(Geometry::Polygon(gdal_poly_to_geo(geom)));
-    }
-    if gt == T::wkbMultiPoint
-        || gt == T::wkbMultiPoint25D
-        || gt == T::wkbMultiPointM
-        || gt == T::wkbMultiPointZM
-    {
-        let pts: Vec<Point<f64>> = (0..geom.geometry_count())
-            .map(|i| {
-                let sub = geom.get_geometry(i);
-                let (x, y, _) = sub.get_point(0);
-                Point::new(x, y)
-            })
-            .collect();
-        return Some(Geometry::MultiPoint(MultiPoint(pts)));
-    }
-    if gt == T::wkbMultiLineString
-        || gt == T::wkbMultiLineString25D
-        || gt == T::wkbMultiLineStringM
-        || gt == T::wkbMultiLineStringZM
-    {
-        let lines: Vec<LineString<f64>> = (0..geom.geometry_count())
-            .map(|i| ring_to_linestring(&geom.get_geometry(i)))
-            .collect();
-        return Some(Geometry::MultiLineString(MultiLineString(lines)));
-    }
-    if gt == T::wkbMultiPolygon
-        || gt == T::wkbMultiPolygon25D
-        || gt == T::wkbMultiPolygonM
-        || gt == T::wkbMultiPolygonZM
-    {
-        let polys: Vec<Polygon<f64>> = (0..geom.geometry_count())
-            .map(|i| gdal_poly_to_geo(&geom.get_geometry(i)))
-            .collect();
-        return Some(Geometry::MultiPolygon(MultiPolygon(polys)));
-    }
-    None
-}
+//     let gt = geom.geometry_type();
+//     if gt == T::wkbPoint || gt == T::wkbPoint25D || gt == T::wkbPointM || gt == T::wkbPointZM {
+//         let (x, y, _) = geom.get_point(0);
+//         return Some(Geometry::Point(Point::new(x, y)));
+//     }
+//     if gt == T::wkbLineString
+//         || gt == T::wkbLineString25D
+//         || gt == T::wkbLineStringM
+//         || gt == T::wkbLineStringZM
+//     {
+//         return Some(Geometry::LineString(ring_to_linestring(geom)));
+//     }
+//     if gt == T::wkbPolygon
+//         || gt == T::wkbPolygon25D
+//         || gt == T::wkbPolygonM
+//         || gt == T::wkbPolygonZM
+//     {
+//         return Some(Geometry::Polygon(gdal_poly_to_geo(geom)));
+//     }
+//     if gt == T::wkbMultiPoint
+//         || gt == T::wkbMultiPoint25D
+//         || gt == T::wkbMultiPointM
+//         || gt == T::wkbMultiPointZM
+//     {
+//         let pts: Vec<Point<f64>> = (0..geom.geometry_count())
+//             .map(|i| {
+//                 let sub = geom.get_geometry(i);
+//                 let (x, y, _) = sub.get_point(0);
+//                 Point::new(x, y)
+//             })
+//             .collect();
+//         return Some(Geometry::MultiPoint(MultiPoint(pts)));
+//     }
+//     if gt == T::wkbMultiLineString
+//         || gt == T::wkbMultiLineString25D
+//         || gt == T::wkbMultiLineStringM
+//         || gt == T::wkbMultiLineStringZM
+//     {
+//         let lines: Vec<LineString<f64>> = (0..geom.geometry_count())
+//             .map(|i| ring_to_linestring(&geom.get_geometry(i)))
+//             .collect();
+//         return Some(Geometry::MultiLineString(MultiLineString(lines)));
+//     }
+//     if gt == T::wkbMultiPolygon
+//         || gt == T::wkbMultiPolygon25D
+//         || gt == T::wkbMultiPolygonM
+//         || gt == T::wkbMultiPolygonZM
+//     {
+//         let polys: Vec<Polygon<f64>> = (0..geom.geometry_count())
+//             .map(|i| gdal_poly_to_geo(&geom.get_geometry(i)))
+//             .collect();
+//         return Some(Geometry::MultiPolygon(MultiPolygon(polys)));
+//     }
+//     None
+// }
 
-fn ring_to_linestring(geom: &gdal::vector::Geometry) -> LineString<f64> {
-    let coords: Vec<Coord<f64>> = (0..geom.point_count() as i32)
-        .map(|i| {
-            let (x, y, _) = geom.get_point(i);
-            Coord { x, y }
-        })
-        .collect();
-    LineString(coords)
-}
+// fn ring_to_linestring(geom: &gdal::vector::Geometry) -> LineString<f64> {
+//     let coords: Vec<Coord<f64>> = (0..geom.point_count() as i32)
+//         .map(|i| {
+//             let (x, y, _) = geom.get_point(i);
+//             Coord { x, y }
+//         })
+//         .collect();
+//     LineString(coords)
+// }
 
-fn gdal_poly_to_geo(geom: &gdal::vector::Geometry) -> Polygon<f64> {
-    let ring_count = geom.geometry_count();
-    if ring_count == 0 {
-        return Polygon::new(LineString(vec![]), vec![]);
-    }
-    let exterior = ring_to_linestring(&geom.get_geometry(0));
-    let interiors: Vec<LineString<f64>> = (1..ring_count)
-        .map(|i| ring_to_linestring(&geom.get_geometry(i)))
-        .collect();
-    Polygon::new(exterior, interiors)
-}
+// fn gdal_poly_to_geo(geom: &gdal::vector::Geometry) -> Polygon<f64> {
+//     let ring_count = geom.geometry_count();
+//     if ring_count == 0 {
+//         return Polygon::new(LineString(vec![]), vec![]);
+//     }
+//     let exterior = ring_to_linestring(&geom.get_geometry(0));
+//     let interiors: Vec<LineString<f64>> = (1..ring_count)
+//         .map(|i| ring_to_linestring(&geom.get_geometry(i)))
+//         .collect();
+//     Polygon::new(exterior, interiors)
+// }
 
-fn geo_to_gdal_geom(geom: &Geometry<f64>) -> Result<gdal::vector::Geometry> {
-    use gdal::vector::Geometry as GGeom;
+// fn geo_to_gdal_geom(geom: &Geometry<f64>) -> Result<gdal::vector::Geometry> {
+//     use gdal::vector::Geometry as GGeom;
 
-    match geom {
-        Geometry::Point(p) => {
-            let mut g = GGeom::empty(OGRwkbGeometryType::wkbPoint)?;
-            g.add_point_2d((p.x(), p.y()));
-            Ok(g)
-        }
-        Geometry::LineString(ls) => {
-            let mut g = GGeom::empty(OGRwkbGeometryType::wkbLineString)?;
-            for c in ls.coords() {
-                g.add_point_2d((c.x, c.y));
-            }
-            Ok(g)
-        }
-        Geometry::Polygon(poly) => {
-            let mut g = GGeom::empty(OGRwkbGeometryType::wkbPolygon)?;
-            let mut ext = GGeom::empty(OGRwkbGeometryType::wkbLinearRing)?;
-            for c in poly.exterior().coords() {
-                ext.add_point_2d((c.x, c.y));
-            }
-            g.add_geometry(ext)?;
-            for hole in poly.interiors() {
-                let mut ring = GGeom::empty(OGRwkbGeometryType::wkbLinearRing)?;
-                for c in hole.coords() {
-                    ring.add_point_2d((c.x, c.y));
-                }
-                g.add_geometry(ring)?;
-            }
-            Ok(g)
-        }
-        Geometry::MultiPolygon(mp) => {
-            let mut g = GGeom::empty(OGRwkbGeometryType::wkbMultiPolygon)?;
-            for poly in &mp.0 {
-                let sub = geo_to_gdal_geom(&Geometry::Polygon(poly.clone()))?;
-                g.add_geometry(sub)?;
-            }
-            Ok(g)
-        }
-        Geometry::MultiPoint(mp) => {
-            let mut g = GGeom::empty(OGRwkbGeometryType::wkbMultiPoint)?;
-            for pt in &mp.0 {
-                let sub = geo_to_gdal_geom(&Geometry::Point(*pt))?;
-                g.add_geometry(sub)?;
-            }
-            Ok(g)
-        }
-        Geometry::MultiLineString(mls) => {
-            let mut g = GGeom::empty(OGRwkbGeometryType::wkbMultiLineString)?;
-            for ls in &mls.0 {
-                let sub = geo_to_gdal_geom(&Geometry::LineString(ls.clone()))?;
-                g.add_geometry(sub)?;
-            }
-            Ok(g)
-        }
-        _ => Err(anyhow!("Unsupported geometry type for export")),
-    }
-}
+//     match geom {
+//         Geometry::Point(p) => {
+//             let mut g = GGeom::empty(OGRwkbGeometryType::wkbPoint)?;
+//             g.add_point_2d((p.x(), p.y()));
+//             Ok(g)
+//         }
+//         Geometry::LineString(ls) => {
+//             let mut g = GGeom::empty(OGRwkbGeometryType::wkbLineString)?;
+//             for c in ls.coords() {
+//                 g.add_point_2d((c.x, c.y));
+//             }
+//             Ok(g)
+//         }
+//         Geometry::Polygon(poly) => {
+//             let mut g = GGeom::empty(OGRwkbGeometryType::wkbPolygon)?;
+//             let mut ext = GGeom::empty(OGRwkbGeometryType::wkbLinearRing)?;
+//             for c in poly.exterior().coords() {
+//                 ext.add_point_2d((c.x, c.y));
+//             }
+//             g.add_geometry(ext)?;
+//             for hole in poly.interiors() {
+//                 let mut ring = GGeom::empty(OGRwkbGeometryType::wkbLinearRing)?;
+//                 for c in hole.coords() {
+//                     ring.add_point_2d((c.x, c.y));
+//                 }
+//                 g.add_geometry(ring)?;
+//             }
+//             Ok(g)
+//         }
+//         Geometry::MultiPolygon(mp) => {
+//             let mut g = GGeom::empty(OGRwkbGeometryType::wkbMultiPolygon)?;
+//             for poly in &mp.0 {
+//                 let sub = geo_to_gdal_geom(&Geometry::Polygon(poly.clone()))?;
+//                 g.add_geometry(sub)?;
+//             }
+//             Ok(g)
+//         }
+//         Geometry::MultiPoint(mp) => {
+//             let mut g = GGeom::empty(OGRwkbGeometryType::wkbMultiPoint)?;
+//             for pt in &mp.0 {
+//                 let sub = geo_to_gdal_geom(&Geometry::Point(*pt))?;
+//                 g.add_geometry(sub)?;
+//             }
+//             Ok(g)
+//         }
+//         Geometry::MultiLineString(mls) => {
+//             let mut g = GGeom::empty(OGRwkbGeometryType::wkbMultiLineString)?;
+//             for ls in &mls.0 {
+//                 let sub = geo_to_gdal_geom(&Geometry::LineString(ls.clone()))?;
+//                 g.add_geometry(sub)?;
+//             }
+//             Ok(g)
+//         }
+//         _ => Err(anyhow!("Unsupported geometry type for export")),
+//     }
+// }
 
-fn infer_ogr_type(geom: &Geometry<f64>) -> OGRwkbGeometryType::Type {
-    match geom {
-        Geometry::Point(_) => OGRwkbGeometryType::wkbPoint,
-        Geometry::MultiPoint(_) => OGRwkbGeometryType::wkbMultiPoint,
-        Geometry::LineString(_) => OGRwkbGeometryType::wkbLineString,
-        Geometry::MultiLineString(_) => OGRwkbGeometryType::wkbMultiLineString,
-        Geometry::Polygon(_) => OGRwkbGeometryType::wkbPolygon,
-        Geometry::MultiPolygon(_) => OGRwkbGeometryType::wkbMultiPolygon,
-        _ => OGRwkbGeometryType::wkbUnknown,
-    }
-}
+// fn infer_ogr_type(geom: &Geometry<f64>) -> OGRwkbGeometryType::Type {
+//     match geom {
+//         Geometry::Point(_) => OGRwkbGeometryType::wkbPoint,
+//         Geometry::MultiPoint(_) => OGRwkbGeometryType::wkbMultiPoint,
+//         Geometry::LineString(_) => OGRwkbGeometryType::wkbLineString,
+//         Geometry::MultiLineString(_) => OGRwkbGeometryType::wkbMultiLineString,
+//         Geometry::Polygon(_) => OGRwkbGeometryType::wkbPolygon,
+//         Geometry::MultiPolygon(_) => OGRwkbGeometryType::wkbMultiPolygon,
+//         _ => OGRwkbGeometryType::wkbUnknown,
+//     }
+// }
 
 pub struct LayerDescriptor {
     pub name: String,

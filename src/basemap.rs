@@ -25,7 +25,9 @@ pub struct BasemapCache {
 
 impl Default for BasemapCache {
     fn default() -> Self {
-        Self { tiles: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            tiles: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -86,8 +88,8 @@ impl BasemapCache {
 
                 let w_lon0 = tile_to_lon(tx, nf);
                 let w_lon1 = tile_to_lon(tx + 1, nf);
-                let w_lat_n = tile_to_lat(ty, nf);       // north edge (larger lat)
-                let w_lat_s = tile_to_lat(ty + 1, nf);   // south edge (smaller lat)
+                let w_lat_n = tile_to_lat(ty, nf); // north edge (larger lat)
+                let w_lat_s = tile_to_lat(ty + 1, nf); // south edge (smaller lat)
 
                 // north edge → smaller screen y (top); south edge → larger screen y (bottom)
                 let s_tl = viewport.world_to_screen(w_lon0, w_lat_n, rect);
@@ -109,10 +111,10 @@ impl BasemapCache {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_tile(url: &str, id: TileId, ctx: &Context) -> TileState {
-    let result = ureq::get(url)
-        .set("User-Agent", "gis_editor/0.1")
-        .call();
+    let result = ureq::get(url).set("User-Agent", "gis_editor/0.1").call();
+
     match result {
         Ok(resp) => {
             let mut bytes = Vec::new();
@@ -123,10 +125,37 @@ fn fetch_tile(url: &str, id: TileId, ctx: &Context) -> TileState {
                 Ok(img) => {
                     let rgba = img.to_rgba8();
                     let (w, h) = rgba.dimensions();
-                    let color_image = ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        rgba.as_raw(),
+                    let color_image =
+                        ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+                    let handle = ctx.load_texture(
+                        format!("{}/{}/{}", id.z, id.x, id.y),
+                        color_image,
+                        TextureOptions::LINEAR,
                     );
+                    TileState::Loaded(handle)
+                }
+                Err(_) => TileState::Failed,
+            }
+        }
+        Err(_) => TileState::Failed,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fetch_tile(url: &str, id: TileId, ctx: &Context) -> TileState {
+    let result = ureq::get(url).set("User-Agent", "gis_editor/0.1").call();
+    match result {
+        Ok(resp) => {
+            let mut bytes = Vec::new();
+            if resp.into_reader().read_to_end(&mut bytes).is_err() {
+                return TileState::Failed;
+            }
+            match image::load_from_memory(&bytes) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let color_image =
+                        ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
                     let handle = ctx.load_texture(
                         format!("{}/{}/{}", id.z, id.x, id.y),
                         color_image,

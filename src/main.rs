@@ -1,6 +1,7 @@
 mod app;
 mod basemap;
 mod gis_layer;
+mod gis_reader;
 mod heatmap;
 mod hilbert_curve;
 mod hilbert_r_tree;

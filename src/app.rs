@@ -11,6 +11,7 @@ use wgpu::naga::proc::vector_size_str;
 
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{BatchMessage, GisLayer, LayerDescriptor, LayerEntry, LayerKind};
+use crate::gis_reader::GisReader;
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
@@ -132,23 +133,18 @@ impl GisEditorApp {
 
     fn open_file(&mut self, path: &str) {
         match GisLayer::get_layers(path) {
-            Ok(descriptors) if descriptors.is_empty() => {
-                self.status = "No layers found in file.".to_string();
-            }
-            Ok(descriptors) => {
+            Ok(descriptor) => {
                 let mut seen = std::collections::HashSet::new();
                 let mut all_fields: Vec<String> = Vec::new();
-                for d in &descriptors {
-                    for f in &d.field_names {
-                        if seen.insert(f.clone()) {
-                            all_fields.push(f.clone());
-                        }
+                for f in &descriptor.field_names {
+                    if seen.insert(f.clone()) {
+                        all_fields.push(f.clone());
                     }
                 }
                 all_fields.sort();
                 self.pending_field_selection = all_fields.into_iter().map(|f| (f, true)).collect();
                 self.pending_load_mode = LoadMode::GeometryOnly;
-                self.pending_layers = descriptors.into_iter().map(|d| (d, true)).collect();
+                self.pending_layers = vec![descriptor].into_iter().map(|d| (d, true)).collect();
                 self.pending_file = Some(path.to_string());
             }
             Err(e) => {
@@ -323,7 +319,10 @@ impl eframe::App for GisEditorApp {
                     if ui.button("Open…").clicked() {
                         ui.close_kind(UiKind::Menu);
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("GIS files", &["shp", "gpkg", "geojson", "json", "kml"])
+                            .add_filter(
+                                "GIS files",
+                                &["shp", "gpkg", "geojson", "json", "kml", "fgb"],
+                            )
                             .add_filter("Shapefile", &["shp"])
                             .add_filter("GeoPackage", &["gpkg"])
                             .add_filter("GeoJSON", &["geojson", "json"])
@@ -444,9 +443,8 @@ impl eframe::App for GisEditorApp {
 
             self.pending_layers.clear();
             self.pending_field_selection.clear();
-            let layers =
-                GisLayer::load_selected_without_features(&path, &indices, attr_fields.clone())
-                    .expect("Error loading featureless layers!");
+            let layers = GisReader::load_selected_without_features(&path, &indices)
+                .expect("Error loading featureless layers!");
             let first_new = self.layers.len();
             // Record which dest indices are point layers before consuming layers
             let is_points: Vec<bool> = layers
@@ -460,7 +458,7 @@ impl eframe::App for GisEditorApp {
                 for (pos, file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
                     let result = if is_points[pos] {
-                        GisLayer::load_point_layer_batched(
+                        GisReader::load_point_layer_batched(
                             path.as_str(),
                             file_idx,
                             dest,
@@ -468,7 +466,7 @@ impl eframe::App for GisEditorApp {
                             attr_fields.clone(),
                         )
                     } else {
-                        GisLayer::load_layer_batched(
+                        GisReader::load_layer_batched(
                             path.as_str(),
                             file_idx,
                             dest,
