@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
+use wasm_bindgen_futures::spawn_local;
 
 use egui::{Color32, ColorImage, Context, Painter, Pos2, Rect, TextureHandle, TextureOptions};
 
@@ -32,6 +33,33 @@ impl Default for BasemapCache {
 }
 
 impl BasemapCache {
+    #[cfg(target_arch = "wasm32")]
+    fn get_or_fetch(&self, id: TileId, ctx: &Context) -> Option<TextureHandle> {
+        {
+            let map = self.tiles.lock().unwrap();
+            match map.get(&id) {
+                Some(TileState::Loaded(h)) => return Some(h.clone()),
+                Some(_) => return None,
+                None => {}
+            }
+        }
+        self.tiles.lock().unwrap().insert(id, TileState::Loading);
+        let tiles = Arc::clone(&self.tiles);
+        let ctx = ctx.clone();
+        spawn_local(async move {
+            let url = format!(
+                "https://tile.openstreetmap.org/{}/{}/{}.png",
+                id.z, id.x, id.y
+            );
+            let state = fetch_tile(&url, id, &ctx).await;
+            tiles.lock().unwrap().insert(id, state);
+            // Wake up once to display the newly arrived tile.
+            ctx.request_repaint();
+        });
+        None
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn get_or_fetch(&self, id: TileId, ctx: &Context) -> Option<TextureHandle> {
         {
             let map = self.tiles.lock().unwrap();
@@ -142,14 +170,22 @@ fn fetch_tile(url: &str, id: TileId, ctx: &Context) -> TileState {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fetch_tile(url: &str, id: TileId, ctx: &Context) -> TileState {
-    let result = ureq::get(url).set("User-Agent", "gis_editor/0.1").call();
+async fn fetch_tile(url: &str, id: TileId, ctx: &Context) -> TileState {
+    let client = reqwest::Client::new();
+    let result = client
+        .get(url)
+        .header("User-Agent", "gis_editor/0.1")
+        .send()
+        .await;
     match result {
         Ok(resp) => {
-            let mut bytes = Vec::new();
-            if resp.into_reader().read_to_end(&mut bytes).is_err() {
+            let mut bytes = resp.bytes().await;
+            if bytes.is_err() {
                 return TileState::Failed;
             }
+            let Ok(bytes) = bytes else {
+                return TileState::Failed;
+            };
             match image::load_from_memory(&bytes) {
                 Ok(img) => {
                     let rgba = img.to_rgba8();

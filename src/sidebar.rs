@@ -176,30 +176,30 @@ pub fn show_sidebar(
     ui.separator();
 
     // ── Save ──────────────────────────────────────────────────────────────────
-    ui.label(RichText::new("Save").strong());
-    ui.add_space(2.0);
-    ui.label("Output path:");
-    ui.text_edit_singleline(save_path);
+    // ui.label(RichText::new("Save").strong());
+    // ui.add_space(2.0);
+    // ui.label("Output path:");
+    // ui.text_edit_singleline(save_path);
 
-    ui.horizontal(|ui| {
-        if ui.button("Browse…").clicked() {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Shapefile", &["shp"])
-                .add_filter("GeoPackage", &["gpkg"])
-                .add_filter("GeoJSON", &["geojson"])
-                .save_file()
-            {
-                *save_path = path.to_string_lossy().to_string();
-            }
-        }
+    // ui.horizontal(|ui| {
+    //     if ui.button("Browse…").clicked() {
+    //         if let Some(path) = rfd::FileDialog::new()
+    //             .add_filter("Shapefile", &["shp"])
+    //             .add_filter("GeoPackage", &["gpkg"])
+    //             .add_filter("GeoJSON", &["geojson"])
+    //             .save_file()
+    //         {
+    //             *save_path = path.to_string_lossy().to_string();
+    //         }
+    //     }
 
-        if ui.button("Save").clicked() {
-            let path = save_path.trim().to_string();
-            if !path.is_empty() {
-                action = SidebarAction::SaveAs(path);
-            }
-        }
-    });
+    //     if ui.button("Save").clicked() {
+    //         let path = save_path.trim().to_string();
+    //         if !path.is_empty() {
+    //             action = SidebarAction::SaveAs(path);
+    //         }
+    //     }
+    // });
 
     action
 }

@@ -1,5 +1,13 @@
 use egui::{CentralPanel, Color32, UiKind};
+use rfd::FileHandle;
 use std::sync::mpsc::{self, TryRecvError};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
+
+#[cfg(not(target_arch = "wasm32"))]
+type PendingFile = String;
+#[cfg(target_arch = "wasm32")]
+type PendingFile = (Vec<u8>, String);
 
 #[derive(Default, PartialEq)]
 enum LoadMode {
@@ -10,8 +18,8 @@ enum LoadMode {
 use wgpu::naga::proc::vector_size_str;
 
 use crate::basemap::BasemapCache;
-use crate::gis_layer::{BatchMessage, GisLayer, LayerDescriptor, LayerEntry, LayerKind};
-use crate::gis_reader::GisReader;
+use crate::gis_layer::{BatchMessage, GisLayer, LayerEntry, LayerKind};
+use crate::gis_reader::{GisReader, LayerDescriptor};
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
@@ -36,6 +44,9 @@ pub struct GisEditorApp {
     layer_picker_window_open: bool,
     viewport: Viewport,
     selected_id: Option<usize>,
+    file_pick_rx: Option<mpsc::Receiver<PendingFile>>,
+    #[cfg(target_arch = "wasm32")]
+    pending_bytes: Option<Vec<u8>>,
     add_form: AddAttributeForm,
     save_path: String,
     status: String,
@@ -128,31 +139,45 @@ impl GisEditorApp {
             uncertainty_split_threshold: 0.5,
             viewport_culling: true,
             selected_split_measurement_type: MeasurementType::Variance,
+            file_pick_rx: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_bytes: None,
         }
     }
 
-    fn open_file(&mut self, path: &str) {
-        match GisLayer::get_layers(path) {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_file(&mut self, path: String) {
+        match GisReader::load_layer_descriptor(path.as_str()) {
+            Ok(descriptor) => self.apply_layer(descriptor, path),
+            Err(e) => self.status = format!("Error reading layers: {e}"),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn open_file(&mut self, bytes: Vec<u8>, file_name: String) {
+        match GisReader::load_layer_descriptor(&bytes) {
             Ok(descriptor) => {
-                let mut seen = std::collections::HashSet::new();
-                let mut all_fields: Vec<String> = Vec::new();
-                for f in &descriptor.field_names {
-                    if seen.insert(f.clone()) {
-                        all_fields.push(f.clone());
-                    }
-                }
-                all_fields.sort();
-                self.pending_field_selection = all_fields.into_iter().map(|f| (f, true)).collect();
-                self.pending_load_mode = LoadMode::GeometryOnly;
-                self.pending_layers = vec![descriptor].into_iter().map(|d| (d, true)).collect();
-                self.pending_file = Some(path.to_string());
+                self.pending_bytes = Some(bytes);
+                self.apply_layer(descriptor, file_name);
             }
-            Err(e) => {
-                self.status = format!("Error reading layers: {e}");
-            }
+            Err(e) => self.status = format!("Error reading layers: {e}"),
         }
     }
 
+    fn apply_layer(&mut self, descriptor: LayerDescriptor, path: String) {
+        let mut seen = std::collections::HashSet::new();
+        let mut all_fields: Vec<String> = Vec::new();
+        for f in &descriptor.field_names {
+            if seen.insert(f.clone()) {
+                all_fields.push(f.clone());
+            }
+        }
+        all_fields.sort();
+        self.pending_field_selection = all_fields.into_iter().map(|f| (f, true)).collect();
+        self.pending_load_mode = LoadMode::GeometryOnly;
+        self.pending_layers = vec![descriptor].into_iter().map(|d| (d, true)).collect();
+        self.pending_file = Some(path);
+    }
     // UNUSED
     // fn load_pending(&mut self, selected_layer_indices: Vec<usize>) {
     //     let Some(path) = self.pending_file.take() else {
@@ -318,20 +343,30 @@ impl eframe::App for GisEditorApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
                         ui.close_kind(UiKind::Menu);
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter(
-                                "GIS files",
-                                &["shp", "gpkg", "geojson", "json", "kml", "fgb"],
-                            )
-                            .add_filter("Shapefile", &["shp"])
-                            .add_filter("GeoPackage", &["gpkg"])
-                            .add_filter("GeoJSON", &["geojson", "json"])
-                            .pick_file()
-                        {
-                            let path_str = path.to_string_lossy().to_string();
-                            self.save_path = path_str.clone();
-                            self.open_file(&path_str);
-                        }
+                        let (tx, rx) = mpsc::channel::<PendingFile>();
+                        self.file_pick_rx = Some(rx);
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        std::thread::spawn(move || {
+                            if let Some(f) = pollster::block_on(
+                                rfd::AsyncFileDialog::new()
+                                    .add_filter("FlatGeobuf", &["fgb"])
+                                    .pick_file(),
+                            ) {
+                                let _ = tx.send(f.path().to_string_lossy().into_owned());
+                            }
+                        });
+
+                        #[cfg(target_arch = "wasm32")]
+                        spawn_local(async move {
+                            if let Some(f) = rfd::AsyncFileDialog::new()
+                                .add_filter("FlatGeobuf", &["fgb"])
+                                .pick_file()
+                                .await
+                            {
+                                let _ = tx.send((f.read().await, f.file_name()));
+                            }
+                        });
                     }
                     if ui.button("Quit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -339,6 +374,15 @@ impl eframe::App for GisEditorApp {
                 });
             });
         });
+
+        let pending_file = self.file_pick_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(file) = pending_file {
+            self.file_pick_rx = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            self.open_file(file);
+            #[cfg(target_arch = "wasm32")]
+            self.open_file(file.0, file.1);
+        }
 
         // ── Layer selector (shown after file pick) ────────────────────────────
         let mut load_indices: Option<Vec<usize>> = None;
@@ -443,10 +487,17 @@ impl eframe::App for GisEditorApp {
 
             self.pending_layers.clear();
             self.pending_field_selection.clear();
+
+            #[cfg(not(target_arch = "wasm32"))]
             let layers = GisReader::load_selected_without_features(&path, &indices)
                 .expect("Error loading featureless layers!");
+            #[cfg(target_arch = "wasm32")]
+            let bytes = self.pending_bytes.take().unwrap_or_default();
+            #[cfg(target_arch = "wasm32")]
+            let layers = GisReader::load_selected_without_features(&bytes, &indices)
+                .expect("Error loading featureless layers!");
+
             let first_new = self.layers.len();
-            // Record which dest indices are point layers before consuming layers
             let is_points: Vec<bool> = layers
                 .iter()
                 .map(|l| matches!(l.data, LayerKind::Points(_)))
@@ -454,6 +505,7 @@ impl eframe::App for GisEditorApp {
             self.layers.extend(layers.into_iter());
             self.active_layer_idx = Some(first_new);
             self.status = format!("Loading {} layer(s)…", indices.len());
+            #[cfg(not(target_arch = "wasm32"))]
             std::thread::spawn(move || {
                 for (pos, file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
@@ -468,6 +520,30 @@ impl eframe::App for GisEditorApp {
                     } else {
                         GisReader::load_layer_batched(
                             path.as_str(),
+                            file_idx,
+                            dest,
+                            tx.clone(),
+                            attr_fields.clone(),
+                        )
+                    };
+                    result.expect("Batch layer read failed");
+                }
+            });
+            #[cfg(target_arch = "wasm32")]
+            spawn_local(async move {
+                for (pos, file_idx) in indices.into_iter().enumerate() {
+                    let dest = first_new + pos;
+                    let result = if is_points[pos] {
+                        GisReader::load_point_layer_batched(
+                            bytes.clone(),
+                            file_idx,
+                            dest,
+                            tx.clone(),
+                            attr_fields.clone(),
+                        )
+                    } else {
+                        GisReader::load_layer_batched(
+                            bytes.clone(),
                             file_idx,
                             dest,
                             tx.clone(),

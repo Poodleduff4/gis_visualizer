@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Error;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -10,7 +10,7 @@ use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 use crate::quadtree::Quadtree;
 use crate::spatial_index::{IndexKind, SpatialIndex};
 use anyhow::{anyhow, Result};
-use flatgeobuf::FgbReader;
+use flatgeobuf::{FgbReader, GeometryType};
 use geo::BoundingRect;
 use geo_types::{
     Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
@@ -398,24 +398,6 @@ impl GisLayer {
 }
 
 impl GisLayer {
-    pub fn get_layers(path: &str) -> Result<LayerDescriptor, Box<dyn std::error::Error>> {
-        let dataset = FgbReader::open(BufReader::new(File::open(path)?))?;
-        let header = dataset.header();
-        let mut layer = LayerDescriptor {
-            name: header.name().unwrap_or("N/A").to_string(),
-            num_features: header.features_count(),
-            field_names: header
-                .columns()
-                .map(|cols| {
-                    cols.iter()
-                        .map(|c| c.name().to_string())
-                        .collect::<Vec<String>>()
-                })
-                .unwrap_or(Vec::new()),
-        };
-        Ok(layer)
-    }
-
     // pub fn load_all(path: &str) -> Result<Vec<Self>> {
     //     let dataset = Dataset::open(Path::new(path))?;
     //     let count = dataset.layer_count();
@@ -812,9 +794,3 @@ impl GisLayer {
 //         _ => OGRwkbGeometryType::wkbUnknown,
 //     }
 // }
-
-pub struct LayerDescriptor {
-    pub name: String,
-    pub num_features: u64,
-    pub field_names: Vec<String>,
-}

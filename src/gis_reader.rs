@@ -3,14 +3,30 @@ use flatgeobuf::{
 };
 use geo_types::Geometry;
 use geozero::{error::GeozeroError, ColumnValue, PropertyProcessor, ToGeo};
-use std::{collections::HashMap, fs::File, io::BufReader, sync::mpsc};
+use std::{
+    collections::HashMap,
+    io::{BufReader, Read, Seek},
+    sync::mpsc,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs::File;
+
+#[cfg(target_arch = "wasm32")]
+use std::io::Cursor;
 
 use crate::{
     gis_layer::{AttributeValue, BatchMessage, GisFeature, GisLayer, LayerEntry, LayerKind},
     point_cloud_layer::{AttributeColumn, PointCloudLayer},
 };
 
-// Collects (name, value) pairs for selected fields — used by load_layer_batched
+pub struct LayerDescriptor {
+    pub name: String,
+    pub num_features: u64,
+    pub field_names: Vec<String>,
+    pub geometry_type: GeometryType,
+}
+
 struct PairCollector<'a> {
     selected: &'a std::collections::HashSet<String>,
     pairs: Vec<(String, AttributeValue)>,
@@ -40,7 +56,6 @@ impl PropertyProcessor for PairCollector<'_> {
     }
 }
 
-// Pushes values into columnar storage by name — used by load_point_layer_batched
 struct ColumnPusher<'a> {
     cols: &'a mut Vec<(String, AttributeColumn)>,
 }
@@ -69,6 +84,34 @@ impl PropertyProcessor for ColumnPusher<'_> {
 pub struct GisReader {}
 
 impl GisReader {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_layer_descriptor(path: &str) -> anyhow::Result<LayerDescriptor> {
+        let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
+        Self::make_layer_descriptor(reader)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_layer_descriptor(bytes: &[u8]) -> anyhow::Result<LayerDescriptor> {
+        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
+        Self::make_layer_descriptor(reader)
+    }
+
+    fn make_layer_descriptor<R: Read + Seek>(
+        dataset: FgbReader<R>,
+    ) -> anyhow::Result<LayerDescriptor> {
+        let header = dataset.header();
+        Ok(LayerDescriptor {
+            name: header.name().unwrap_or("N/A").to_string(),
+            num_features: header.features_count(),
+            field_names: header
+                .columns()
+                .map(|cols| cols.iter().map(|c| c.name().to_string()).collect())
+                .unwrap_or_default(),
+            geometry_type: header.geometry_type(),
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_layer_batched(
         path: &str,
         _layer_idx: usize,
@@ -76,7 +119,29 @@ impl GisReader {
         tx: mpsc::SyncSender<BatchMessage>,
         selected_fields: Option<Vec<String>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut iter = FgbReader::open(BufReader::new(File::open(path)?))?.select_all()?;
+        let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
+        Self::load_layer_batched_impl(reader, dest_idx, tx, selected_fields)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_layer_batched(
+        bytes: Vec<u8>,
+        _layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
+        Self::load_layer_batched_impl(reader, dest_idx, tx, selected_fields)
+    }
+
+    fn load_layer_batched_impl<R: Read + Seek>(
+        reader: FgbReader<R>,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut iter = reader.select_all()?;
 
         let selected_set: std::collections::HashSet<String> = selected_fields
             .map(|f| f.into_iter().collect())
@@ -121,6 +186,7 @@ impl GisReader {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_point_layer_batched(
         path: &str,
         _layer_idx: usize,
@@ -129,10 +195,29 @@ impl GisReader {
         selected_fields: Option<Vec<String>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
+        Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
+    }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_point_layer_batched(
+        bytes: Vec<u8>,
+        _layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
+        Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
+    }
+
+    fn load_point_layer_batched_impl<R: Read + Seek>(
+        reader: FgbReader<R>,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         const BATCH_SIZE: usize = 50_000;
 
-        // Read column schema from header before consuming reader into FeatureIter
         let col_schema: Vec<(String, ColumnType)> = {
             let header = reader.header();
             header
@@ -210,45 +295,36 @@ impl GisReader {
         Ok(())
     }
 
-    pub fn load_layer_without_features(
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_selected_without_features(
         path: &str,
-        _layer_idx: usize,
-    ) -> Result<LayerEntry, Box<dyn std::error::Error>> {
-        println!("Reading header of file: {}", path);
+        _indices: &[usize],
+    ) -> Result<Vec<LayerEntry>, Box<dyn std::error::Error>> {
         let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
-        let header = reader.header();
-        let name = header.name().unwrap_or("").to_string();
-        let layer_kind = match header.geometry_type() {
+        Ok(vec![Self::layer_entry_from_reader(reader)?])
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_selected_without_features(
+        bytes: &[u8],
+        _indices: &[usize],
+    ) -> Result<Vec<LayerEntry>, Box<dyn std::error::Error>> {
+        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
+        Ok(vec![Self::layer_entry_from_reader(reader)?])
+    }
+
+    fn layer_entry_from_reader<R: Read + Seek>(
+        reader: FgbReader<R>,
+    ) -> Result<LayerEntry, Box<dyn std::error::Error>> {
+        let descriptor = Self::make_layer_descriptor(reader)?;
+        let layer_kind = match descriptor.geometry_type {
             GeometryType::Point => LayerKind::Points(PointCloudLayer::default()),
             _ => LayerKind::Vector(GisLayer::default()),
         };
         Ok(LayerEntry {
             data: layer_kind,
             visible: true,
-            name,
-            color: [0, 0, 255],
-            opacity: 255,
-        })
-    }
-
-    pub fn load_selected_without_features(
-        path: &str,
-        _indices: &[usize],
-    ) -> Result<Vec<LayerEntry>, Box<dyn std::error::Error>> {
-        let entry = Self::load_layer_without_features(path, 0)?;
-        Ok(vec![entry])
-    }
-
-    pub fn load_point_layer_without_features(
-        path: &str,
-        _layer_idx: usize,
-    ) -> Result<LayerEntry, Box<dyn std::error::Error>> {
-        let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
-        let name = reader.header().name().unwrap_or("").to_string();
-        Ok(LayerEntry {
-            data: LayerKind::Points(PointCloudLayer::default()),
-            visible: true,
-            name,
+            name: descriptor.name,
             color: [0, 0, 255],
             opacity: 255,
         })
