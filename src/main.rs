@@ -31,10 +31,16 @@ fn main() -> Result<(), eframe::Error> {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 async fn start() {
+    use std::sync::Arc;
+
+    use egui_wgpu::WgpuSetupCreateNew;
     use wasm_bindgen::JsCast;
     use web_sys::HtmlCanvasElement;
+    use wgpu::InstanceFlags;
 
     use crate::app::GisEditorApp;
+    use console_error_panic_hook;
+    console_error_panic_hook::set_once();
 
     let canvas = web_sys::window()
         .unwrap()
@@ -47,6 +53,25 @@ async fn start() {
 
     let options = eframe::WebOptions {
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(egui_wgpu::WgpuSetupCreateNew {
+                instance_descriptor: wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+                    flags: wgpu::InstanceFlags::default(),
+                    memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                    backend_options: wgpu::BackendOptions::default(),
+                    display: None,
+                },
+                display_handle: None,
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                native_adapter_selector: None,
+                device_descriptor: Arc::new(|adapter| wgpu::DeviceDescriptor {
+                    required_limits: adapter.limits(), // use what the adapter actually supports
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::WebRunner::new()
@@ -59,4 +84,5 @@ async fn start() {
         .unwrap();
 }
 
+#[cfg(target_arch = "wasm32")]
 fn main() {}

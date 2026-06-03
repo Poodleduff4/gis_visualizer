@@ -277,6 +277,15 @@ impl CallbackTrait for PointCloudCallback {
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        let info = _device.adapter_info();
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Backend: {:?} | Device: {} | Driver: {}",
+                info.backend, info.name, info.driver_info
+            )
+            .into(),
+        );
         let ppp = screen_descriptor.pixels_per_point;
         let uniform = ViewportUniform {
             world_min: self.world_min,

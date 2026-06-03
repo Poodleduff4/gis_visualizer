@@ -111,6 +111,8 @@ impl GisReader {
         })
     }
 
+    // ── load_layer_batched ────────────────────────────────────────────────────
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_layer_batched(
         path: &str,
@@ -123,18 +125,7 @@ impl GisReader {
         Self::load_layer_batched_impl(reader, dest_idx, tx, selected_fields)
     }
 
-    #[cfg(target_arch = "wasm32")]
-    pub fn load_layer_batched(
-        bytes: Vec<u8>,
-        _layer_idx: usize,
-        dest_idx: usize,
-        tx: mpsc::SyncSender<BatchMessage>,
-        selected_fields: Option<Vec<String>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
-        Self::load_layer_batched_impl(reader, dest_idx, tx, selected_fields)
-    }
-
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_layer_batched_impl<R: Read + Seek>(
         reader: FgbReader<R>,
         dest_idx: usize,
@@ -142,21 +133,17 @@ impl GisReader {
         selected_fields: Option<Vec<String>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut iter = reader.select_all()?;
-
         let selected_set: std::collections::HashSet<String> = selected_fields
             .map(|f| f.into_iter().collect())
             .unwrap_or_default();
-
         const BATCH_SIZE: usize = 10_000;
         let mut batch: Vec<GisFeature> = Vec::with_capacity(BATCH_SIZE);
         let mut count = 0usize;
-
         while let Some(feature) = iter.next()? {
             let geo = match feature.to_geo() {
                 Ok(g) => g,
                 Err(_) => continue,
             };
-
             let attributes: HashMap<String, AttributeValue> = if !selected_set.is_empty() {
                 let mut collector = PairCollector {
                     selected: &selected_set,
@@ -167,10 +154,8 @@ impl GisReader {
             } else {
                 HashMap::new()
             };
-
             batch.push(GisFeature::new(count, geo, attributes));
             count += 1;
-
             if batch.len() >= BATCH_SIZE {
                 tx.send(BatchMessage::Vector(
                     dest_idx,
@@ -179,12 +164,62 @@ impl GisReader {
                 .ok();
             }
         }
-
         if !batch.is_empty() {
             tx.send(BatchMessage::Vector(dest_idx, batch))?;
         }
         Ok(())
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn load_layer_batched(
+        bytes: std::sync::Arc<[u8]>,
+        _layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
+        let mut iter = reader.select_all()?;
+        let selected_set: std::collections::HashSet<String> = selected_fields
+            .map(|f| f.into_iter().collect())
+            .unwrap_or_default();
+        const BATCH_SIZE: usize = 10_000;
+        let mut batch: Vec<GisFeature> = Vec::with_capacity(BATCH_SIZE);
+        let mut count = 0usize;
+        while let Some(feature) = iter.next()? {
+            let geo = match feature.to_geo() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            let attributes: HashMap<String, AttributeValue> = if !selected_set.is_empty() {
+                let mut collector = PairCollector {
+                    selected: &selected_set,
+                    pairs: Vec::new(),
+                };
+                feature.process_properties(&mut collector).ok();
+                collector.pairs.into_iter().collect()
+            } else {
+                HashMap::new()
+            };
+            batch.push(GisFeature::new(count, geo, attributes));
+            count += 1;
+            if batch.len() >= BATCH_SIZE {
+                tx.send(BatchMessage::Vector(
+                    dest_idx,
+                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                ))
+                .ok();
+                // Yield to browser event loop so rAF can fire between batches.
+                gloo_timers::future::sleep(std::time::Duration::ZERO).await;
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Vector(dest_idx, batch))?;
+        }
+        Ok(())
+    }
+
+    // ── load_point_layer_batched ──────────────────────────────────────────────
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_point_layer_batched(
@@ -198,18 +233,7 @@ impl GisReader {
         Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
     }
 
-    #[cfg(target_arch = "wasm32")]
-    pub fn load_point_layer_batched(
-        bytes: Vec<u8>,
-        _layer_idx: usize,
-        dest_idx: usize,
-        tx: mpsc::SyncSender<BatchMessage>,
-        selected_fields: Option<Vec<String>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
-        Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
-    }
-
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_point_layer_batched_impl<R: Read + Seek>(
         reader: FgbReader<R>,
         dest_idx: usize,
@@ -217,7 +241,6 @@ impl GisReader {
         selected_fields: Option<Vec<String>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         const BATCH_SIZE: usize = 50_000;
-
         let col_schema: Vec<(String, ColumnType)> = {
             let header = reader.header();
             header
@@ -234,7 +257,6 @@ impl GisReader {
                 })
                 .unwrap_or_default()
         };
-
         let make_batch_cols = || -> Vec<(String, AttributeColumn)> {
             col_schema
                 .iter()
@@ -259,26 +281,21 @@ impl GisReader {
                 })
                 .collect()
         };
-
         let mut iter = reader.select_all()?;
         let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
         let mut batch_cols = make_batch_cols();
-
         while let Some(feature) = iter.next()? {
             let [x, y] = match feature.to_geo() {
                 Ok(Geometry::Point(p)) => [p.x(), p.y()],
                 _ => continue,
             };
-
             batch.push([x, y]);
-
             if !col_schema.is_empty() {
                 let mut pusher = ColumnPusher {
                     cols: &mut batch_cols,
                 };
                 feature.process_properties(&mut pusher).ok();
             }
-
             if batch.len() >= BATCH_SIZE {
                 tx.send(BatchMessage::Points(
                     dest_idx,
@@ -288,12 +305,95 @@ impl GisReader {
                 .ok();
             }
         }
-
         if !batch.is_empty() {
             tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
         }
         Ok(())
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn load_point_layer_batched(
+        bytes: std::sync::Arc<[u8]>,
+        _layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
+        const BATCH_SIZE: usize = 50_000;
+        let col_schema: Vec<(String, ColumnType)> = {
+            let header = reader.header();
+            header
+                .columns()
+                .map(|cols| {
+                    cols.iter()
+                        .filter(|c| {
+                            selected_fields
+                                .as_ref()
+                                .map_or(false, |sel| sel.iter().any(|s| s.as_str() == c.name()))
+                        })
+                        .map(|c| (c.name().to_string(), c.type_()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let make_batch_cols = || -> Vec<(String, AttributeColumn)> {
+            col_schema
+                .iter()
+                .map(|(name, col_type)| {
+                    let col = match *col_type {
+                        ColumnType::Byte
+                        | ColumnType::UByte
+                        | ColumnType::Short
+                        | ColumnType::UShort
+                        | ColumnType::Int
+                        | ColumnType::UInt
+                        | ColumnType::Long
+                        | ColumnType::ULong => {
+                            AttributeColumn::Integer(Vec::with_capacity(BATCH_SIZE))
+                        }
+                        ColumnType::Float | ColumnType::Double => {
+                            AttributeColumn::Float(Vec::with_capacity(BATCH_SIZE))
+                        }
+                        _ => AttributeColumn::Text(Vec::with_capacity(BATCH_SIZE)),
+                    };
+                    (name.clone(), col)
+                })
+                .collect()
+        };
+        let mut iter = reader.select_all()?;
+        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_cols = make_batch_cols();
+        while let Some(feature) = iter.next()? {
+            let [x, y] = match feature.to_geo() {
+                Ok(Geometry::Point(p)) => [p.x(), p.y()],
+                _ => continue,
+            };
+            batch.push([x, y]);
+            if !col_schema.is_empty() {
+                let mut pusher = ColumnPusher {
+                    cols: &mut batch_cols,
+                };
+                feature.process_properties(&mut pusher).ok();
+            }
+            if batch.len() >= BATCH_SIZE {
+                tx.send(BatchMessage::Points(
+                    dest_idx,
+                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                    std::mem::replace(&mut batch_cols, make_batch_cols()),
+                ))
+                .ok();
+                // Yield to browser event loop so rAF can fire between batches.
+                gloo_timers::future::sleep(std::time::Duration::ZERO).await;
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
+        }
+        Ok(())
+    }
+
+    // ── load_selected_without_features ───────────────────────────────────────
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_selected_without_features(

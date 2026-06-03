@@ -47,6 +47,8 @@ pub struct GisEditorApp {
     file_pick_rx: Option<mpsc::Receiver<PendingFile>>,
     #[cfg(target_arch = "wasm32")]
     pending_bytes: Option<Vec<u8>>,
+    #[cfg(target_arch = "wasm32")]
+    file_handle_slot: std::rc::Rc<std::cell::RefCell<Option<web_sys::File>>>,
     add_form: AddAttributeForm,
     save_path: String,
     status: String,
@@ -142,6 +144,8 @@ impl GisEditorApp {
             file_pick_rx: None,
             #[cfg(target_arch = "wasm32")]
             pending_bytes: None,
+            #[cfg(target_arch = "wasm32")]
+            file_handle_slot: std::rc::Rc::new(std::cell::RefCell::new(None)),
         }
     }
 
@@ -358,15 +362,27 @@ impl eframe::App for GisEditorApp {
                         });
 
                         #[cfg(target_arch = "wasm32")]
-                        spawn_local(async move {
-                            if let Some(f) = rfd::AsyncFileDialog::new()
-                                .add_filter("FlatGeobuf", &["fgb"])
-                                .pick_file()
-                                .await
-                            {
-                                let _ = tx.send((f.read().await, f.file_name()));
-                            }
-                        });
+                        {
+                            let file_handle_slot = self.file_handle_slot.clone();
+                            spawn_local(async move {
+                                if let Some(f) = rfd::AsyncFileDialog::new()
+                                    .add_filter("FlatGeobuf", &["fgb"])
+                                    .pick_file()
+                                    .await
+                                {
+                                    let raw = f.inner().clone();
+                                    // Read only first 64 KiB — enough for any FGB header.
+                                    let blob = raw.slice_with_i32_and_i32(0, 65536).unwrap();
+                                    let ab =
+                                        wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+                                            .await
+                                            .unwrap();
+                                    let header = js_sys::Uint8Array::new(&ab).to_vec();
+                                    *file_handle_slot.borrow_mut() = Some(raw);
+                                    let _ = tx.send((header, f.file_name()));
+                                }
+                            });
+                        }
                     }
                     if ui.button("Quit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -492,9 +508,11 @@ impl eframe::App for GisEditorApp {
             let layers = GisReader::load_selected_without_features(&path, &indices)
                 .expect("Error loading featureless layers!");
             #[cfg(target_arch = "wasm32")]
-            let bytes = self.pending_bytes.take().unwrap_or_default();
+            let header_bytes = self.pending_bytes.take().unwrap_or_default();
             #[cfg(target_arch = "wasm32")]
-            let layers = GisReader::load_selected_without_features(&bytes, &indices)
+            let wasm_file = self.file_handle_slot.borrow_mut().take();
+            #[cfg(target_arch = "wasm32")]
+            let layers = GisReader::load_selected_without_features(&header_bytes, &indices)
                 .expect("Error loading featureless layers!");
 
             let first_new = self.layers.len();
@@ -531,6 +549,12 @@ impl eframe::App for GisEditorApp {
             });
             #[cfg(target_arch = "wasm32")]
             spawn_local(async move {
+                let file = wasm_file.expect("no file handle for batch load");
+                let ab = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+                    .await
+                    .expect("failed to read file bytes");
+                let bytes: std::sync::Arc<[u8]> =
+                    std::sync::Arc::from(js_sys::Uint8Array::new(&ab).to_vec());
                 for (pos, file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
                     let result = if is_points[pos] {
@@ -541,6 +565,7 @@ impl eframe::App for GisEditorApp {
                             tx.clone(),
                             attr_fields.clone(),
                         )
+                        .await
                     } else {
                         GisReader::load_layer_batched(
                             bytes.clone(),
@@ -549,6 +574,7 @@ impl eframe::App for GisEditorApp {
                             tx.clone(),
                             attr_fields.clone(),
                         )
+                        .await
                     };
                     result.expect("Batch layer read failed");
                 }
@@ -591,6 +617,7 @@ impl eframe::App for GisEditorApp {
                     }
                 }
             }
+            ui.request_repaint();
             if let Err(TryRecvError::Disconnected) = rx.try_recv() {
                 self.load_rx = None;
                 self.status = "Ready".to_string();

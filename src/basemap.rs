@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
-use wasm_bindgen_futures::spawn_local;
 
 use egui::{Color32, ColorImage, Context, Painter, Pos2, Rect, TextureHandle, TextureOptions};
 
@@ -35,6 +34,7 @@ impl Default for BasemapCache {
 impl BasemapCache {
     #[cfg(target_arch = "wasm32")]
     fn get_or_fetch(&self, id: TileId, ctx: &Context) -> Option<TextureHandle> {
+        use wasm_bindgen_futures::spawn_local;
         {
             let map = self.tiles.lock().unwrap();
             match map.get(&id) {
@@ -141,12 +141,12 @@ impl BasemapCache {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn fetch_tile(url: &str, id: TileId, ctx: &Context) -> TileState {
-    let result = ureq::get(url).set("User-Agent", "gis_editor/0.1").call();
+    let result = ureq::get(url).header("User-Agent", "gis_editor/0.1").call();
 
     match result {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let mut bytes = Vec::new();
-            if resp.into_reader().read_to_end(&mut bytes).is_err() {
+            if resp.body_mut().as_reader().read_to_end(&mut bytes).is_err() {
                 return TileState::Failed;
             }
             match image::load_from_memory(&bytes) {

@@ -1,6 +1,7 @@
 [build]
 target = "index.html"
 dist = "dist"
+release = true
 
 [serve]
 port = 8080
