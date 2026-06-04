@@ -5,6 +5,7 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::mpsc;
 
+use crate::gis_reader::LayerDescriptor;
 use crate::hilbert_r_tree::HilbertRTree;
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 use crate::quadtree::Quadtree;
@@ -270,6 +271,17 @@ pub enum LayerKind {
     Vector(GisLayer),
 }
 impl LayerKind {
+    pub fn clear_layer(&mut self) {
+        match self {
+            LayerKind::Points(point_cloud_layer) => {
+                point_cloud_layer.points.clear();
+                point_cloud_layer.attributes.clear();
+            }
+            LayerKind::Vector(gis_layer) => {
+                gis_layer.features.clear();
+            }
+        }
+    }
     pub fn features_in_bbox(&self, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Vec<usize> {
         self.index(IndexKind::Quadtree)
             .map(|i| i.search(&[xmin, ymin, xmax, ymax]))
@@ -336,6 +348,7 @@ pub struct LayerEntry {
     pub name: String,
     pub color: [u8; 3],
     pub opacity: u8,
+    pub descriptor: LayerDescriptor,
 }
 impl LayerEntry {}
 
