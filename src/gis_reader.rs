@@ -543,6 +543,16 @@ impl GisReader {
         if !batch.is_empty() {
             tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
         }
+        // Pre-open next reader while caller renders current batch.
+        // With Cache-Control headers on the server, this is served from
+        // browser cache and is nearly instant after the first load.
+        if !cancel_stream.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(next_reader) = HttpFgbReader::open(url).await {
+                reader_cache
+                    .borrow_mut()
+                    .insert(url.to_string(), next_reader);
+            }
+        }
         Ok(())
     }
 

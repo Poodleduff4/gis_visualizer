@@ -30,6 +30,8 @@ use wgpu::naga::proc::vector_size_str;
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{BatchMessage, GisLayer, LayerEntry, LayerKind};
 use crate::gis_reader::{GisFilePath, GisReader, LayerDescriptor};
+#[cfg(target_arch = "wasm32")]
+use crate::gis_reader::FgbReaderCache;
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
@@ -107,6 +109,8 @@ pub struct GisEditorApp {
     fgb_file_url: String,
     cancel_stream: Arc<AtomicBool>,
     streaming_features: bool,
+    #[cfg(target_arch = "wasm32")]
+    fgb_reader_cache: FgbReaderCache,
 }
 
 impl GisEditorApp {
@@ -176,6 +180,10 @@ impl GisEditorApp {
             pending_file_descriptor: None,
             time_since_viewport_change: 0.0,
             viewport_load_pending: false,
+            #[cfg(target_arch = "wasm32")]
+            fgb_reader_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -610,6 +618,8 @@ impl eframe::App for GisEditorApp {
             self.load_rx = Some(load_rx);
             let cancel_clone = self.cancel_stream.clone();
             let path_clone = path.clone();
+            #[cfg(target_arch = "wasm32")]
+            let reader_cache_for_load = self.fgb_reader_cache.clone();
             #[cfg(not(target_arch = "wasm32"))]
             std::thread::spawn(move || {
                 for (pos, file_idx) in indices.into_iter().enumerate() {
@@ -653,6 +663,7 @@ impl eframe::App for GisEditorApp {
                             load_tx.clone(),
                             attr_fields.clone(),
                             cancel_clone.clone(),
+                            reader_cache_for_load.clone(),
                         )
                         .await
                     } else {
@@ -995,7 +1006,6 @@ impl eframe::App for GisEditorApp {
                 let (tx, rx) = mpsc::sync_channel(10);
                 self.load_rx = Some(rx);
                 for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
-                    let fgb_file_clone = self.fgb_file_url.clone();
                     let rect_clone = self
                         .viewport
                         .viewport_bbox(self.last_canvas_rect.clone().unwrap());
@@ -1003,6 +1013,7 @@ impl eframe::App for GisEditorApp {
                     let load_tx_clone = tx.clone();
                     let field_names = layer.data.field_names();
                     let layer_path = layer.descriptor.location.clone();
+                    let reader_cache_clone = self.fgb_reader_cache.clone();
                     layer.data.clear_layer();
                     spawn_local(async move {
                         GisReader::stream_fgb_bbox(
@@ -1013,6 +1024,7 @@ impl eframe::App for GisEditorApp {
                             load_tx_clone,
                             Some(field_names),
                             cancel_clone,
+                            reader_cache_clone,
                         )
                         .await;
                     });
