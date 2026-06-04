@@ -1,4 +1,3 @@
-use eframe::web::now_sec;
 use egui::{CentralPanel, Color32, UiKind};
 use rfd::FileHandle;
 use std::cell::Cell;
@@ -29,9 +28,9 @@ use wgpu::naga::proc::vector_size_str;
 
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{BatchMessage, GisLayer, LayerEntry, LayerKind};
-use crate::gis_reader::{GisFilePath, GisReader, LayerDescriptor};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::FgbReaderCache;
+use crate::gis_reader::{GisFilePath, GisReader, LayerDescriptor};
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
@@ -48,6 +47,21 @@ const FILL_SELECTED: Color32 = Color32::from_rgb(255, 165, 0);
 pub enum ClickTarget {
     Feature,
     GridCell,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> f64 {
+    web_sys::window().unwrap().performance().unwrap().now() // returns f64 milliseconds
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        * 1000.0
 }
 
 pub struct GisEditorApp {
@@ -603,7 +617,7 @@ impl eframe::App for GisEditorApp {
             self.active_layer_idx = Some(first_new);
             self.status = format!("Loading {} layer(s)…", indices.len());
             let fgb_file_clone = self.fgb_file_url.clone();
-                
+
             let rect_clone = self
                 .viewport
                 .viewport_bbox(self.last_canvas_rect.clone().unwrap());
@@ -952,7 +966,7 @@ impl eframe::App for GisEditorApp {
             let viewport_changed = self.viewport.center != self.last_viewport_center
                 || self.last_viewport_ppu != self.viewport.pixels_per_unit;
             if viewport_changed {
-                self.time_since_viewport_change = now_sec();
+                self.time_since_viewport_change = now_ms();
                 self.viewport_load_pending = true;
             }
 
@@ -994,7 +1008,7 @@ impl eframe::App for GisEditorApp {
             }
 
             #[cfg(target_arch = "wasm32")]
-            if self.viewport_load_pending && now_sec() - self.time_since_viewport_change > 0.5 {
+            if self.viewport_load_pending && now_ms() - self.time_since_viewport_change > 0.5 {
                 self.viewport_load_pending = false;
                 let (tx, rx) = mpsc::sync_channel(10);
                 self.load_rx = Some(rx);
