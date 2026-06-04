@@ -1013,31 +1013,44 @@ impl eframe::App for GisEditorApp {
             #[cfg(target_arch = "wasm32")]
             if self.viewport_load_pending && now_ms() - self.time_since_viewport_change > 0.5 {
                 self.viewport_load_pending = false;
-                let (tx, rx) = mpsc::sync_channel(10);
+                let (tx, rx) = mpsc::sync_channel(40);
                 self.load_rx = Some(rx);
+                let full_bbox = self
+                    .viewport
+                    .viewport_bbox(self.last_canvas_rect.clone().unwrap());
+                let [min_x, min_y, max_x, max_y] = full_bbox;
+                let mid_x = (min_x + max_x) / 2.0;
+                let mid_y = (min_y + max_y) / 2.0;
+                let quads: [[f64; 4]; 4] = [
+                    [min_x, min_y, mid_x, mid_y],
+                    [mid_x, min_y, max_x, mid_y],
+                    [min_x, mid_y, mid_x, max_y],
+                    [mid_x, mid_y, max_x, max_y],
+                ];
                 for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
-                    let rect_clone = self
-                        .viewport
-                        .viewport_bbox(self.last_canvas_rect.clone().unwrap());
-                    let cancel_clone = self.cancel_stream.clone();
-                    let load_tx_clone = tx.clone();
                     let field_names = layer.data.field_names();
                     let layer_path = layer.descriptor.location.clone();
-                    let reader_cache_clone = self.fgb_reader_cache.clone();
                     layer.data.clear_layer();
-                    spawn_local(async move {
-                        GisReader::stream_fgb_bbox(
-                            &layer_path,
-                            rect_clone,
-                            i,
-                            i,
-                            load_tx_clone,
-                            Some(field_names),
-                            cancel_clone,
-                            reader_cache_clone,
-                        )
-                        .await;
-                    });
+                    for quad_bbox in quads {
+                        let cancel_clone = self.cancel_stream.clone();
+                        let load_tx_clone = tx.clone();
+                        let reader_cache_clone = self.fgb_reader_cache.clone();
+                        let field_names_clone = field_names.clone();
+                        let layer_path_clone = layer_path.clone();
+                        spawn_local(async move {
+                            GisReader::stream_fgb_bbox(
+                                &layer_path_clone,
+                                quad_bbox,
+                                i,
+                                i,
+                                load_tx_clone,
+                                Some(field_names_clone),
+                                cancel_clone,
+                                reader_cache_clone,
+                            )
+                            .await;
+                        });
+                    }
                 }
             }
         }

@@ -21,7 +21,7 @@ use std::{
 
 #[cfg(target_arch = "wasm32")]
 pub type FgbReaderCache = std::rc::Rc<
-    std::cell::RefCell<std::collections::HashMap<String, flatgeobuf::HttpFgbReader>>,
+    std::cell::RefCell<std::collections::HashMap<String, Vec<flatgeobuf::HttpFgbReader>>>,
 >;
 
 use crate::{
@@ -220,7 +220,7 @@ impl GisReader {
         let selected_set: std::collections::HashSet<String> = selected_fields
             .map(|f| f.into_iter().collect())
             .unwrap_or_default();
-        const BATCH_SIZE: usize = 10_000;
+        const BATCH_SIZE: usize = 30_000;
         let mut batch: Vec<GisFeature> = Vec::with_capacity(BATCH_SIZE);
         let mut count = 0usize;
         while let Some(feature) = iter.next()? {
@@ -458,7 +458,7 @@ impl GisReader {
             bail!("Wrong GisFilePath type!");
         };
         // Extract before the match so RefMut is dropped before any await point.
-        let cached_reader = reader_cache.borrow_mut().remove(url);
+        let cached_reader = reader_cache.borrow_mut().get_mut(url).and_then(|v| v.pop());
         let reader = match cached_reader {
             Some(r) => {
                 web_sys::console::log_1(&JsValue::from_str("stream_fgb_bbox: using cached reader"));
@@ -558,7 +558,9 @@ impl GisReader {
             if let Ok(next_reader) = HttpFgbReader::open(url).await {
                 reader_cache
                     .borrow_mut()
-                    .insert(url.to_string(), next_reader);
+                    .entry(url.to_string())
+                    .or_default()
+                    .push(next_reader);
             }
         }
         Ok(())
