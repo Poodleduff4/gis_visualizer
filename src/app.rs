@@ -557,10 +557,6 @@ impl eframe::App for GisEditorApp {
         }
         if let Some(indices) = load_indices {
             let path = self.pending_file.take().unwrap();
-            web_sys::console::log_1(&JsValue::from_str(&format!(
-                "load_indices: {}",
-                path.to_string()
-            )));
             let attr_fields: Option<Vec<String>> = match self.pending_load_mode {
                 LoadMode::GeometryOnly => None,
                 LoadMode::WithAttributes => Some(
@@ -607,10 +603,7 @@ impl eframe::App for GisEditorApp {
             self.active_layer_idx = Some(first_new);
             self.status = format!("Loading {} layer(s)…", indices.len());
             let fgb_file_clone = self.fgb_file_url.clone();
-            web_sys::console::log_1(&JsValue::from_str(&format!(
-                "Before thread spawn: {}",
-                fgb_file_clone
-            )));
+                
             let rect_clone = self
                 .viewport
                 .viewport_bbox(self.last_canvas_rect.clone().unwrap());

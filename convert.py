@@ -1,7 +1,7 @@
 import pandas as pd
 import geopandas as gpd
 
-taxi_data = pd.read_csv("./yellow_tripdata_2015-01.csv")
+taxi_data = pd.read_csv("./assets//yellow_tripdata_2015-01.csv")
 
 # Vectorized bbox filter — no Python loop
 mask = (
@@ -28,7 +28,8 @@ gdf = gpd.GeoDataFrame(filtered, geometry="end_point", crs="EPSG:4326")
 
 gdf.drop(columns=["start_point"]).set_geometry("end_point").set_crs(
     "EPSG:4326"
-).to_file("./taxi_data.gpkg", layer="dropoff_points", driver="GPKG")
+).to_file("assets/taxi_data.gpkg", layer="dropoff_points", driver="GPKG")
 gdf.drop(columns=["end_point"]).set_geometry("start_point").set_crs(
     "EPSG:4326"
-).to_file("./taxi_data.gpkg", layer="pickup_points", driver="GPKG")
+).to_file("assets/taxi_data.gpkg", layer="pickup_points", driver="GPKG")
+    
