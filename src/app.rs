@@ -723,8 +723,11 @@ impl eframe::App for GisEditorApp {
                         self.points_dirty = true;
                     }
                 }
-                ui.request_repaint();
             }
+            // Keep egui polling so the channel is drained every frame.
+            // Without this, egui sleeps when there's no input and the
+            // bounded channel fills up, blocking the stream future.
+            ui.ctx().request_repaint();
             if let Err(TryRecvError::Disconnected) = load_rx.try_recv() {
                 self.status = "Ready".to_string();
                 self.load_rx = None;

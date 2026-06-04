@@ -457,7 +457,9 @@ impl GisReader {
         let GisFilePath::HttpLocation(url) = path else {
             bail!("Wrong GisFilePath type!");
         };
-        let reader = match reader_cache.borrow_mut().remove(url) {
+        // Extract before the match so RefMut is dropped before any await point.
+        let cached_reader = reader_cache.borrow_mut().remove(url);
+        let reader = match cached_reader {
             Some(r) => {
                 web_sys::console::log_1(&JsValue::from_str("stream_fgb_bbox: using cached reader"));
                 r
@@ -516,7 +518,8 @@ impl GisReader {
         let mut features = reader
             .select_bbox(bbox[0], bbox[1], bbox[2], bbox[3])
             .await?;
-        web_sys::console::log_1(&JsValue::from_str(&format!("After Feature BBOX query")));
+        web_sys::console::log_1(&JsValue::from_str("After Feature BBOX query"));
+        let mut last_yield_ms = js_sys::Date::now();
         while let Some(feature) = features.next().await? {
             let [x, y] = match feature.to_geo() {
                 Ok(Geometry::Point(p)) => [p.x(), p.y()],
@@ -529,15 +532,20 @@ impl GisReader {
                 };
                 feature.process_properties(&mut pusher).ok();
             }
-            if batch.len() >= BATCH_SIZE {
-                tx.send(BatchMessage::Points(
-                    dest_idx,
-                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
-                    std::mem::replace(&mut batch_cols, make_batch_cols()),
-                ))
-                .ok();
-                // Yield to browser event loop so rAF can fire between batches.
+            // Flush and yield to browser every ~16ms regardless of batch size,
+            // avoiding setTimeout throttling that caps throughput at 1 batch/sec.
+            let now_ms = js_sys::Date::now();
+            if now_ms - last_yield_ms >= 16.0 {
+                if !batch.is_empty() {
+                    tx.send(BatchMessage::Points(
+                        dest_idx,
+                        std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                        std::mem::replace(&mut batch_cols, make_batch_cols()),
+                    ))
+                    .ok();
+                }
                 gloo_timers::future::sleep(std::time::Duration::ZERO).await;
+                last_yield_ms = js_sys::Date::now();
             }
         }
         if !batch.is_empty() {
