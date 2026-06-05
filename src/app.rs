@@ -1,6 +1,15 @@
 use egui::{CentralPanel, Color32, UiKind};
 use rfd::FileHandle;
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::Arc;
+#[cfg(target_arch = "wasm32")]
+use std::time::Duration;
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
 
@@ -19,7 +28,9 @@ use wgpu::naga::proc::vector_size_str;
 
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{BatchMessage, GisLayer, LayerEntry, LayerKind};
-use crate::gis_reader::{GisReader, LayerDescriptor};
+#[cfg(target_arch = "wasm32")]
+use crate::gis_reader::FgbReaderCache;
+use crate::gis_reader::{GisFilePath, GisReader, LayerDescriptor};
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
@@ -38,13 +49,28 @@ pub enum ClickTarget {
     GridCell,
 }
 
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> f64 {
+    web_sys::window().unwrap().performance().unwrap().now() // returns f64 milliseconds
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        * 1000.0
+}
+
 pub struct GisEditorApp {
     layers: Vec<LayerEntry>,
     active_layer_idx: Option<usize>,
     layer_picker_window_open: bool,
     viewport: Viewport,
     selected_id: Option<usize>,
-    file_pick_rx: Option<mpsc::Receiver<PendingFile>>,
+    file_pick_rx: Option<mpsc::Receiver<GisFilePath>>,
     #[cfg(target_arch = "wasm32")]
     pending_bytes: Option<Vec<u8>>,
     #[cfg(target_arch = "wasm32")]
@@ -61,11 +87,17 @@ pub struct GisEditorApp {
     click_target: ClickTarget,
 
     // Layer selector state (populated after file pick, before load)
-    pending_file: Option<String>,
+    pending_file: Option<GisFilePath>,
+    pending_file_descriptor: Option<LayerDescriptor>,
     pending_layers: Vec<(LayerDescriptor, bool)>,
     pending_load_mode: LoadMode,
     pending_field_selection: Vec<(String, bool)>,
     load_rx: Option<mpsc::Receiver<BatchMessage>>,
+    // load_tx: Option<mpsc::SyncSender<BatchMessage>>,
+    load_layer_descriptor_rx: mpsc::Receiver<LayerDescriptor>,
+    load_layer_descriptor_tx: mpsc::SyncSender<LayerDescriptor>,
+    time_since_viewport_change: f64,
+    viewport_load_pending: bool,
 
     // GPU point cloud state
     has_gpu: bool,
@@ -88,6 +120,11 @@ pub struct GisEditorApp {
     uncertainty_split_threshold: f32,
     viewport_culling: bool,
     selected_split_measurement_type: MeasurementType,
+    fgb_file_url: String,
+    cancel_stream: Arc<AtomicBool>,
+    streaming_features: bool,
+    #[cfg(target_arch = "wasm32")]
+    fgb_reader_cache: FgbReaderCache,
 }
 
 impl GisEditorApp {
@@ -99,6 +136,8 @@ impl GisEditorApp {
         } else {
             false
         };
+        // let (tx, rx) = mpsc::sync_channel::<BatchMessage>(10);
+        let (ld_tx, ld_rx) = mpsc::sync_channel::<LayerDescriptor>(1);
 
         GisEditorApp {
             layers: Vec::new(),
@@ -133,6 +172,9 @@ impl GisEditorApp {
             hilbert_order: 6,
             last_hilbert_order: 6,
             load_rx: None,
+            // load_tx: tx,
+            load_layer_descriptor_rx: ld_rx,
+            load_layer_descriptor_tx: ld_tx,
             last_viewport_center: Default::default(),
             last_viewport_ppu: Default::default(),
             last_canvas_rect: None,
@@ -146,29 +188,52 @@ impl GisEditorApp {
             pending_bytes: None,
             #[cfg(target_arch = "wasm32")]
             file_handle_slot: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            fgb_file_url: "http://localhost:8001/".to_string(),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            streaming_features: false,
+            pending_file_descriptor: None,
+            time_since_viewport_change: 0.0,
+            viewport_load_pending: false,
+            #[cfg(target_arch = "wasm32")]
+            fgb_reader_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn open_file(&mut self, path: String) {
-        match GisReader::load_layer_descriptor(path.as_str()) {
+    fn open_file(&mut self, path: GisFilePath) {
+        match GisReader::load_layer_descriptor(&path.to_string()) {
             Ok(descriptor) => self.apply_layer(descriptor, path),
             Err(e) => self.status = format!("Error reading layers: {e}"),
         }
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn open_file(&mut self, bytes: Vec<u8>, file_name: String) {
-        match GisReader::load_layer_descriptor(&bytes) {
-            Ok(descriptor) => {
-                self.pending_bytes = Some(bytes);
-                self.apply_layer(descriptor, file_name);
+    fn open_file(
+        &mut self,
+        file_url: GisFilePath,
+        tx: mpsc::SyncSender<LayerDescriptor>,
+    ) -> Result<(), anyhow::Error> {
+        let GisFilePath::HttpLocation(url) = file_url else {
+            use anyhow::bail;
+
+            bail!("Wrong GisFilePath type!");
+        };
+        spawn_local(async move {
+            match GisReader::load_layer_descriptor(&url).await {
+                Ok(descriptor) => {
+                    // self.pending_bytes = Some(bytes);
+                    web_sys::console::log_1(&JsValue::from_str(&format!("{}", url)));
+                    tx.send(descriptor);
+                }
+                Err(e) => {} // self.status = format!("Error reading layers: {e}"),            }
             }
-            Err(e) => self.status = format!("Error reading layers: {e}"),
-        }
+        });
+        Ok(())
     }
 
-    fn apply_layer(&mut self, descriptor: LayerDescriptor, path: String) {
+    fn apply_layer(&mut self, descriptor: LayerDescriptor, file_path: GisFilePath) {
         let mut seen = std::collections::HashSet::new();
         let mut all_fields: Vec<String> = Vec::new();
         for f in &descriptor.field_names {
@@ -179,8 +244,12 @@ impl GisEditorApp {
         all_fields.sort();
         self.pending_field_selection = all_fields.into_iter().map(|f| (f, true)).collect();
         self.pending_load_mode = LoadMode::GeometryOnly;
-        self.pending_layers = vec![descriptor].into_iter().map(|d| (d, true)).collect();
-        self.pending_file = Some(path);
+        self.pending_layers = vec![descriptor.clone()]
+            .into_iter()
+            .map(|d| (d, true))
+            .collect();
+        self.pending_file = Some(file_path);
+        self.pending_file_descriptor = Some(descriptor.clone());
     }
     // UNUSED
     // fn load_pending(&mut self, selected_layer_indices: Vec<usize>) {
@@ -347,8 +416,8 @@ impl eframe::App for GisEditorApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
                         ui.close_kind(UiKind::Menu);
-                        let (tx, rx) = mpsc::channel::<PendingFile>();
-                        self.file_pick_rx = Some(rx);
+                        let (f_tx, f_rx) = mpsc::channel::<GisFilePath>();
+                        self.file_pick_rx = Some(f_rx);
 
                         #[cfg(not(target_arch = "wasm32"))]
                         std::thread::spawn(move || {
@@ -357,29 +426,37 @@ impl eframe::App for GisEditorApp {
                                     .add_filter("FlatGeobuf", &["fgb"])
                                     .pick_file(),
                             ) {
-                                let _ = tx.send(f.path().to_string_lossy().into_owned());
+                                let path =
+                                    GisFilePath::LocalFile(f.path().to_string_lossy().into_owned());
+                                let _ = f_tx.send(path);
                             }
                         });
 
                         #[cfg(target_arch = "wasm32")]
                         {
-                            let file_handle_slot = self.file_handle_slot.clone();
+                            // let file_handle_slot = self.file_handle_slot.clone();
+                            let mut url = self.fgb_file_url.clone();
                             spawn_local(async move {
                                 if let Some(f) = rfd::AsyncFileDialog::new()
                                     .add_filter("FlatGeobuf", &["fgb"])
                                     .pick_file()
                                     .await
                                 {
-                                    let raw = f.inner().clone();
-                                    // Read only first 64 KiB — enough for any FGB header.
-                                    let blob = raw.slice_with_i32_and_i32(0, 65536).unwrap();
-                                    let ab =
-                                        wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
-                                            .await
-                                            .unwrap();
-                                    let header = js_sys::Uint8Array::new(&ab).to_vec();
-                                    *file_handle_slot.borrow_mut() = Some(raw);
-                                    let _ = tx.send((header, f.file_name()));
+                                    // let raw = f.inner().clone();
+                                    // // Read only first 64 KiB — enough for any FGB header.
+                                    // let blob = raw.slice_with_i32_and_i32(0, 65536).unwrap();
+                                    // let ab =
+                                    //     wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+                                    //         .await
+                                    //         .unwrap();
+                                    // let header = js_sys::Uint8Array::new(&ab).to_vec();
+                                    // *file_handle_slot.borrow_mut() = Some(raw);
+                                    url.push_str(f.file_name().as_str());
+                                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                                        "chosen_file_name: {}",
+                                        url
+                                    )));
+                                    let _ = f_tx.send(GisFilePath::HttpLocation(url));
                                 }
                             });
                         }
@@ -397,7 +474,7 @@ impl eframe::App for GisEditorApp {
             #[cfg(not(target_arch = "wasm32"))]
             self.open_file(file);
             #[cfg(target_arch = "wasm32")]
-            self.open_file(file.0, file.1);
+            self.open_file(file, self.load_layer_descriptor_tx.clone());
         }
 
         // ── Layer selector (shown after file pick) ────────────────────────────
@@ -479,6 +556,7 @@ impl eframe::App for GisEditorApp {
                                     .collect(),
                             );
                             self.layer_picker_window_open = false;
+                            self.streaming_features = true;
                         }
                         if ui.button("Cancel").clicked() {
                             cancel_pending = true;
@@ -486,10 +564,13 @@ impl eframe::App for GisEditorApp {
                     });
                 });
         }
+        if let Ok(new_layer_descriptor) = self.load_layer_descriptor_rx.try_recv() {
+            let path = new_layer_descriptor.location.clone();
+            self.apply_layer(new_layer_descriptor, path);
+        } else {
+        }
         if let Some(indices) = load_indices {
-            let (tx, rx) = mpsc::sync_channel::<BatchMessage>(10);
             let path = self.pending_file.take().unwrap();
-
             let attr_fields: Option<Vec<String>> = match self.pending_load_mode {
                 LoadMode::GeometryOnly => None,
                 LoadMode::WithAttributes => Some(
@@ -505,16 +586,28 @@ impl eframe::App for GisEditorApp {
             self.pending_field_selection.clear();
 
             #[cfg(not(target_arch = "wasm32"))]
-            let layers = GisReader::load_selected_without_features(&path, &indices)
-                .expect("Error loading featureless layers!");
+            let layers = GisReader::load_selected_without_features(
+                path.clone(),
+                &indices,
+                attr_fields.clone(),
+            )
+            .expect("Error loading featureless layers!");
             #[cfg(target_arch = "wasm32")]
-            let header_bytes = self.pending_bytes.take().unwrap_or_default();
+            // let header_bytes = self.pending_bytes.take().unwrap_or_default();
             #[cfg(target_arch = "wasm32")]
-            let wasm_file = self.file_handle_slot.borrow_mut().take();
+            // let wasm_file = self.file_handle_slot.borrow_mut().take();
             #[cfg(target_arch = "wasm32")]
-            let layers = GisReader::load_selected_without_features(&header_bytes, &indices)
-                .expect("Error loading featureless layers!");
-
+            web_sys::console::log_1(&JsValue::from_str(&format!(
+                "Before load layers: {}",
+                path.to_string()
+            )));
+            #[cfg(target_arch = "wasm32")]
+            let layers = GisReader::load_selected_without_features(
+                path.clone(),
+                self.pending_file_descriptor.clone().unwrap(),
+                attr_fields.clone(),
+            )
+            .expect("Error loading featureless layers!");
             let first_new = self.layers.len();
             let is_points: Vec<bool> = layers
                 .iter()
@@ -523,71 +616,85 @@ impl eframe::App for GisEditorApp {
             self.layers.extend(layers.into_iter());
             self.active_layer_idx = Some(first_new);
             self.status = format!("Loading {} layer(s)…", indices.len());
+            let fgb_file_clone = self.fgb_file_url.clone();
+
+            let rect_clone = self
+                .viewport
+                .viewport_bbox(self.last_canvas_rect.clone().unwrap());
+            let (load_tx, load_rx) = mpsc::sync_channel::<BatchMessage>(10);
+            self.load_rx = Some(load_rx);
+            let cancel_clone = self.cancel_stream.clone();
+            let path_clone = path.clone();
+            #[cfg(target_arch = "wasm32")]
+            let reader_cache_for_load = self.fgb_reader_cache.clone();
             #[cfg(not(target_arch = "wasm32"))]
             std::thread::spawn(move || {
                 for (pos, file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
                     let result = if is_points[pos] {
                         GisReader::load_point_layer_batched(
-                            path.as_str(),
+                            path_clone.clone(),
                             file_idx,
                             dest,
-                            tx.clone(),
+                            load_tx.clone(),
                             attr_fields.clone(),
                         )
                     } else {
                         GisReader::load_layer_batched(
-                            path.as_str(),
+                            path_clone.clone(),
                             file_idx,
                             dest,
-                            tx.clone(),
+                            load_tx.clone(),
                             attr_fields.clone(),
                         )
                     };
-                    result.expect("Batch layer read failed");
+                    let _ = result; // SendError just means receiver was dropped (new load started)
                 }
             });
             #[cfg(target_arch = "wasm32")]
             spawn_local(async move {
-                let file = wasm_file.expect("no file handle for batch load");
-                let ab = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
-                    .await
-                    .expect("failed to read file bytes");
-                let bytes: std::sync::Arc<[u8]> =
-                    std::sync::Arc::from(js_sys::Uint8Array::new(&ab).to_vec());
+                // let file = wasm_file.expect("no file handle for batch load");
+                // let ab = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+                //     .await
+                //     .expect("failed to read file bytes");
+                // let bytes: std::sync::Arc<[u8]> =
+                //     std::sync::Arc::from(js_sys::Uint8Array::new(&ab).to_vec());
                 for (pos, file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
                     let result = if is_points[pos] {
-                        GisReader::load_point_layer_batched(
-                            bytes.clone(),
+                        GisReader::stream_fgb_bbox(
+                            &path_clone,
+                            rect_clone,
                             file_idx,
                             dest,
-                            tx.clone(),
+                            load_tx.clone(),
                             attr_fields.clone(),
+                            cancel_clone.clone(),
+                            reader_cache_for_load.clone(),
                         )
                         .await
                     } else {
-                        GisReader::load_layer_batched(
-                            bytes.clone(),
-                            file_idx,
-                            dest,
-                            tx.clone(),
-                            attr_fields.clone(),
-                        )
-                        .await
+                        // GisReader::load_layer_batched(
+                        //     bytes.clone(),
+                        //     file_idx,
+                        //     dest,
+                        //     load_tx.clone(),
+                        //     attr_fields.clone(),
+                        // )
+                        // .await
+                        Ok(())
                     };
-                    result.expect("Batch layer read failed");
+                    let _ = result;
                 }
             });
-            self.load_rx = Some(rx);
+            // self.load_rx = Some(rx);
         } else if cancel_pending {
             self.pending_file = None;
             self.pending_layers.clear();
             self.pending_field_selection.clear();
         }
-
-        if let Some(rx) = &self.load_rx {
-            for msg in rx.try_iter() {
+        if let Some(load_rx) = &self.load_rx {
+            for msg in load_rx.try_iter() {
                 match msg {
                     BatchMessage::Points(layer_idx, pts, named_cols) => {
                         if let Some(LayerKind::Points(pc)) =
@@ -596,7 +703,7 @@ impl eframe::App for GisEditorApp {
                             pc.points.extend(pts);
                             if pc.attributes.is_empty() && !named_cols.is_empty() {
                                 for (name, col) in named_cols {
-                                    pc.field_names.push(name);
+                                    // pc.field_names.push(name);
                                     pc.attributes.push(col);
                                 }
                             } else {
@@ -617,10 +724,14 @@ impl eframe::App for GisEditorApp {
                     }
                 }
             }
-            ui.request_repaint();
-            if let Err(TryRecvError::Disconnected) = rx.try_recv() {
-                self.load_rx = None;
+            // Keep egui polling so the channel is drained every frame.
+            // Without this, egui sleeps when there's no input and the
+            // bounded channel fills up, blocking the stream future.
+            ui.ctx().request_repaint();
+            if let Err(TryRecvError::Disconnected) = load_rx.try_recv() {
                 self.status = "Ready".to_string();
+                self.load_rx = None;
+                self.streaming_features = false;
             }
         }
 
@@ -739,6 +850,7 @@ impl eframe::App for GisEditorApp {
                             LayerKind::Points(pc) => pc.rebuild_quadtree(capacity),
                             LayerKind::Vector(gl) => gl.rebuild_quadtree(capacity),
                         }
+                        self.fitted = true; // don't auto-fit viewport; would clear_layer() and invalidate the new index
                     }
                     if let Some(idx) = rebuild_uncertainty_quadtree_idx {
                         match &mut self.layers[idx].data {
@@ -760,6 +872,7 @@ impl eframe::App for GisEditorApp {
                             LayerKind::Points(pc) => pc.rebuild_hilbert_tree(order),
                             LayerKind::Vector(gl) => gl.rebuild_hilbert_tree(order),
                         }
+                        self.fitted = true;
                     }
                     if visibility_changed {
                         self.points_dirty = true;
@@ -850,8 +963,6 @@ impl eframe::App for GisEditorApp {
             self.points_dirty = true;
         }
 
-        let active_layer = self.active_layer_idx.and_then(|i| self.layers.get(i));
-
         // ── Re-upload GPU points when data or style changes ───────────────────
         if self.has_gpu {
             let layer_changed = self.layers.len() != self.last_layer_count;
@@ -859,6 +970,10 @@ impl eframe::App for GisEditorApp {
             let size_changed = self.point_size != self.last_point_size;
             let viewport_changed = self.viewport.center != self.last_viewport_center
                 || self.last_viewport_ppu != self.viewport.pixels_per_unit;
+            if viewport_changed {
+                self.time_since_viewport_change = now_ms();
+                self.viewport_load_pending = true;
+            }
 
             if self.points_dirty
                 || layer_changed
@@ -896,8 +1011,98 @@ impl eframe::App for GisEditorApp {
                 self.last_viewport_center = self.viewport.center;
                 self.last_viewport_ppu = self.viewport.pixels_per_unit;
             }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.viewport_load_pending && now_ms() - self.time_since_viewport_change > 0.5 {
+                self.viewport_load_pending = false;
+                // Cancel previous quad threads before starting new ones.
+                self.cancel_stream
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel_stream = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (tx, rx) = mpsc::sync_channel(40);
+                self.load_rx = Some(rx);
+                let full_bbox = self
+                    .viewport
+                    .viewport_bbox(self.last_canvas_rect.clone().unwrap());
+                let [min_x, min_y, max_x, max_y] = full_bbox;
+                let mid_x = (min_x + max_x) / 2.0;
+                let mid_y = (min_y + max_y) / 2.0;
+                let quads: [[f64; 4]; 4] = [
+                    [min_x, min_y, mid_x, mid_y],
+                    [mid_x, min_y, max_x, mid_y],
+                    [min_x, mid_y, mid_x, max_y],
+                    [mid_x, mid_y, max_x, max_y],
+                ];
+                for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
+                    let field_names = layer.data.field_names();
+                    let layer_path = layer.descriptor.location.clone();
+                    layer.data.clear_layer();
+                    for quad_bbox in quads {
+                        let cancel_clone = self.cancel_stream.clone();
+                        let load_tx_clone = tx.clone();
+                        let field_names_clone = field_names.clone();
+                        let layer_path_clone = layer_path.clone();
+                        std::thread::spawn(move || {
+                            let _ = GisReader::stream_fgb_bbox(
+                                &layer_path_clone,
+                                quad_bbox,
+                                i,
+                                i,
+                                load_tx_clone,
+                                Some(field_names_clone),
+                                cancel_clone,
+                            );
+                        });
+                    }
+                }
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            if self.viewport_load_pending && now_ms() - self.time_since_viewport_change > 0.5 {
+                self.viewport_load_pending = false;
+                let (tx, rx) = mpsc::sync_channel(40);
+                self.load_rx = Some(rx);
+                let full_bbox = self
+                    .viewport
+                    .viewport_bbox(self.last_canvas_rect.clone().unwrap());
+                let [min_x, min_y, max_x, max_y] = full_bbox;
+                let mid_x = (min_x + max_x) / 2.0;
+                let mid_y = (min_y + max_y) / 2.0;
+                let quads: [[f64; 4]; 4] = [
+                    [min_x, min_y, mid_x, mid_y],
+                    [mid_x, min_y, max_x, mid_y],
+                    [min_x, mid_y, mid_x, max_y],
+                    [mid_x, mid_y, max_x, max_y],
+                ];
+                for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
+                    let field_names = layer.data.field_names();
+                    let layer_path = layer.descriptor.location.clone();
+                    layer.data.clear_layer();
+                    for quad_bbox in quads {
+                        let cancel_clone = self.cancel_stream.clone();
+                        let load_tx_clone = tx.clone();
+                        let reader_cache_clone = self.fgb_reader_cache.clone();
+                        let field_names_clone = field_names.clone();
+                        let layer_path_clone = layer_path.clone();
+                        spawn_local(async move {
+                            GisReader::stream_fgb_bbox(
+                                &layer_path_clone,
+                                quad_bbox,
+                                i,
+                                i,
+                                load_tx_clone,
+                                Some(field_names_clone),
+                                cancel_clone,
+                                reader_cache_clone,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
         }
 
+        let active_layer = self.active_layer_idx.and_then(|i| self.layers.get(i));
         // ── Map (central panel) ───────────────────────────────────────────────
         CentralPanel::default().show_inside(ui, |ui| {
             if !self.fitted {

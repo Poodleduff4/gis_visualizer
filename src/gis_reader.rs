@@ -1,5 +1,6 @@
+use anyhow::bail;
 use flatgeobuf::{
-    ColumnType, FallibleStreamingIterator, FeatureProperties, FgbReader, GeometryType,
+    ColumnType, FallibleStreamingIterator, FeatureProperties, FgbReader, GeometryType, Header,
 };
 use geo_types::Geometry;
 use geozero::{error::GeozeroError, ColumnValue, PropertyProcessor, ToGeo};
@@ -13,18 +14,42 @@ use std::{
 use std::fs::File;
 
 #[cfg(target_arch = "wasm32")]
-use std::io::Cursor;
+use std::{
+    io::Cursor,
+    sync::{atomic::AtomicBool, Arc},
+};
+
+#[cfg(target_arch = "wasm32")]
+pub type FgbReaderCache = std::rc::Rc<
+    std::cell::RefCell<std::collections::HashMap<String, Vec<flatgeobuf::HttpFgbReader>>>,
+>;
 
 use crate::{
     gis_layer::{AttributeValue, BatchMessage, GisFeature, GisLayer, LayerEntry, LayerKind},
     point_cloud_layer::{AttributeColumn, PointCloudLayer},
 };
 
+#[derive(Clone)]
+pub enum GisFilePath {
+    LocalFile(String),
+    HttpLocation(String),
+}
+impl GisFilePath {
+    pub fn to_string(&self) -> String {
+        match self {
+            GisFilePath::LocalFile(p) => p.clone(),
+            GisFilePath::HttpLocation(p) => p.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct LayerDescriptor {
     pub name: String,
     pub num_features: u64,
     pub field_names: Vec<String>,
     pub geometry_type: GeometryType,
+    pub location: GisFilePath,
 }
 
 struct PairCollector<'a> {
@@ -87,19 +112,27 @@ impl GisReader {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_layer_descriptor(path: &str) -> anyhow::Result<LayerDescriptor> {
         let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
-        Self::make_layer_descriptor(reader)
+
+        Self::make_layer_descriptor(reader.header(), GisFilePath::LocalFile(path.to_string()))
     }
 
     #[cfg(target_arch = "wasm32")]
-    pub fn load_layer_descriptor(bytes: &[u8]) -> anyhow::Result<LayerDescriptor> {
-        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
-        Self::make_layer_descriptor(reader)
+    pub async fn load_layer_descriptor(url: &str) -> anyhow::Result<LayerDescriptor> {
+        use flatgeobuf::HttpFgbReader;
+        use wasm_bindgen::JsValue;
+
+        web_sys::console::log_1(&JsValue::from_str(&format!(
+            "load_layer_descriptor: {}",
+            url
+        )));
+        let reader = HttpFgbReader::open(url).await?;
+        Self::make_layer_descriptor(reader.header(), GisFilePath::HttpLocation(url.to_string()))
     }
 
-    fn make_layer_descriptor<R: Read + Seek>(
-        dataset: FgbReader<R>,
+    fn make_layer_descriptor<'a>(
+        header: Header<'a>,
+        path: GisFilePath,
     ) -> anyhow::Result<LayerDescriptor> {
-        let header = dataset.header();
         Ok(LayerDescriptor {
             name: header.name().unwrap_or("N/A").to_string(),
             num_features: header.features_count(),
@@ -108,6 +141,7 @@ impl GisReader {
                 .map(|cols| cols.iter().map(|c| c.name().to_string()).collect())
                 .unwrap_or_default(),
             geometry_type: header.geometry_type(),
+            location: path,
         })
     }
 
@@ -115,13 +149,16 @@ impl GisReader {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_layer_batched(
-        path: &str,
+        path: GisFilePath,
         _layer_idx: usize,
         dest_idx: usize,
         tx: mpsc::SyncSender<BatchMessage>,
         selected_fields: Option<Vec<String>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
+    ) -> Result<(), anyhow::Error> {
+        let GisFilePath::LocalFile(str_path) = path else {
+            bail!("Wrong GisFilePath type!");
+        };
+        let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
         Self::load_layer_batched_impl(reader, dest_idx, tx, selected_fields)
     }
 
@@ -131,7 +168,7 @@ impl GisReader {
         dest_idx: usize,
         tx: mpsc::SyncSender<BatchMessage>,
         selected_fields: Option<Vec<String>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), anyhow::Error> {
         let mut iter = reader.select_all()?;
         let selected_set: std::collections::HashSet<String> = selected_fields
             .map(|f| f.into_iter().collect())
@@ -183,7 +220,7 @@ impl GisReader {
         let selected_set: std::collections::HashSet<String> = selected_fields
             .map(|f| f.into_iter().collect())
             .unwrap_or_default();
-        const BATCH_SIZE: usize = 10_000;
+        const BATCH_SIZE: usize = 30_000;
         let mut batch: Vec<GisFeature> = Vec::with_capacity(BATCH_SIZE);
         let mut count = 0usize;
         while let Some(feature) = iter.next()? {
@@ -223,13 +260,16 @@ impl GisReader {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_point_layer_batched(
-        path: &str,
+        path: GisFilePath,
         _layer_idx: usize,
         dest_idx: usize,
         tx: mpsc::SyncSender<BatchMessage>,
         selected_fields: Option<Vec<String>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
+    ) -> Result<(), anyhow::Error> {
+        let GisFilePath::LocalFile(str_path) = path else {
+            bail!("Wrong GisFilePath type!");
+        };
+        let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
         Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
     }
 
@@ -239,8 +279,8 @@ impl GisReader {
         dest_idx: usize,
         tx: mpsc::SyncSender<BatchMessage>,
         selected_fields: Option<Vec<String>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        const BATCH_SIZE: usize = 50_000;
+    ) -> Result<(), anyhow::Error> {
+        const BATCH_SIZE: usize = 10_000;
         let col_schema: Vec<(String, ColumnType)> = {
             let header = reader.header();
             header
@@ -308,6 +348,8 @@ impl GisReader {
         if !batch.is_empty() {
             tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
         }
+        println!("Layer Empty, returning from feature streamer!");
+
         Ok(())
     }
 
@@ -393,40 +435,320 @@ impl GisReader {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn stream_fgb_bbox(
+        path: &GisFilePath,
+        bbox: [f64; 4],
+        _layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+        cancel_stream: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), anyhow::Error> {
+        use std::sync::atomic::Ordering;
+
+        if cancel_stream.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let GisFilePath::LocalFile(str_path) = path else {
+            bail!("Wrong GisFilePath type!");
+        };
+        let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
+        const BATCH_SIZE: usize = 50_000;
+        let col_schema: Vec<(String, ColumnType)> = {
+            let header = reader.header();
+            header
+                .columns()
+                .map(|cols| {
+                    cols.iter()
+                        .filter(|c| {
+                            selected_fields
+                                .as_ref()
+                                .map_or(false, |sel| sel.iter().any(|s| s.as_str() == c.name()))
+                        })
+                        .map(|c| (c.name().to_string(), c.type_()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let make_batch_cols = || -> Vec<(String, AttributeColumn)> {
+            col_schema
+                .iter()
+                .map(|(name, col_type)| {
+                    let col = match *col_type {
+                        ColumnType::Byte
+                        | ColumnType::UByte
+                        | ColumnType::Short
+                        | ColumnType::UShort
+                        | ColumnType::Int
+                        | ColumnType::UInt
+                        | ColumnType::Long
+                        | ColumnType::ULong => {
+                            AttributeColumn::Integer(Vec::with_capacity(BATCH_SIZE))
+                        }
+                        ColumnType::Float | ColumnType::Double => {
+                            AttributeColumn::Float(Vec::with_capacity(BATCH_SIZE))
+                        }
+                        _ => AttributeColumn::Text(Vec::with_capacity(BATCH_SIZE)),
+                    };
+                    (name.clone(), col)
+                })
+                .collect()
+        };
+        let mut iter = reader.select_bbox(bbox[0], bbox[1], bbox[2], bbox[3])?;
+        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_cols = make_batch_cols();
+        while let Some(feature) = iter.next()? {
+            if cancel_stream.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let [x, y] = match feature.to_geo() {
+                Ok(Geometry::Point(p)) => [p.x(), p.y()],
+                _ => continue,
+            };
+            batch.push([x, y]);
+            if !col_schema.is_empty() {
+                let mut pusher = ColumnPusher {
+                    cols: &mut batch_cols,
+                };
+                feature.process_properties(&mut pusher).ok();
+            }
+            if batch.len() >= BATCH_SIZE {
+                tx.send(BatchMessage::Points(
+                    dest_idx,
+                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                    std::mem::replace(&mut batch_cols, make_batch_cols()),
+                ))
+                .ok();
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn stream_fgb_bbox(
+        path: &GisFilePath,
+        bbox: [f64; 4],
+        _layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+        cancel_stream: Arc<AtomicBool>,
+        reader_cache: FgbReaderCache,
+    ) -> Result<(), anyhow::Error> {
+        use std::sync::atomic::Ordering;
+
+        use flatgeobuf::HttpFgbReader;
+        use wasm_bindgen::JsValue;
+
+        if cancel_stream.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let GisFilePath::HttpLocation(url) = path else {
+            bail!("Wrong GisFilePath type!");
+        };
+        // Extract before the match so RefMut is dropped before any await point.
+        let cached_reader = reader_cache.borrow_mut().get_mut(url).and_then(|v| v.pop());
+        let reader = match cached_reader {
+            Some(r) => {
+                web_sys::console::log_1(&JsValue::from_str("stream_fgb_bbox: using cached reader"));
+                r
+            }
+            None => {
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "stream_fgb_bbox: opening reader {}",
+                    url
+                )));
+                HttpFgbReader::open(url).await?
+            }
+        };
+        let header = reader.header().clone();
+        const BATCH_SIZE: usize = 50_000;
+        let col_schema: Vec<(String, ColumnType)> = {
+            header
+                .columns()
+                .map(|cols| {
+                    cols.iter()
+                        .filter(|c| {
+                            selected_fields
+                                .as_ref()
+                                .map_or(false, |sel| sel.iter().any(|s| s.as_str() == c.name()))
+                        })
+                        .map(|c| (c.name().to_string(), c.type_()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let make_batch_cols = || -> Vec<(String, AttributeColumn)> {
+            col_schema
+                .iter()
+                .map(|(name, col_type)| {
+                    let col = match *col_type {
+                        ColumnType::Byte
+                        | ColumnType::UByte
+                        | ColumnType::Short
+                        | ColumnType::UShort
+                        | ColumnType::Int
+                        | ColumnType::UInt
+                        | ColumnType::Long
+                        | ColumnType::ULong => {
+                            AttributeColumn::Integer(Vec::with_capacity(BATCH_SIZE))
+                        }
+                        ColumnType::Float | ColumnType::Double => {
+                            AttributeColumn::Float(Vec::with_capacity(BATCH_SIZE))
+                        }
+                        _ => AttributeColumn::Text(Vec::with_capacity(BATCH_SIZE)),
+                    };
+                    (name.clone(), col)
+                })
+                .collect()
+        };
+        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_cols = make_batch_cols();
+        let mut features = reader
+            .select_bbox(bbox[0], bbox[1], bbox[2], bbox[3])
+            .await?;
+        web_sys::console::log_1(&JsValue::from_str("After Feature BBOX query"));
+        let mut last_yield_ms = js_sys::Date::now();
+        while let Some(feature) = features.next().await? {
+            let [x, y] = match feature.to_geo() {
+                Ok(Geometry::Point(p)) => [p.x(), p.y()],
+                _ => continue,
+            };
+            batch.push([x, y]);
+            if !col_schema.is_empty() {
+                let mut pusher = ColumnPusher {
+                    cols: &mut batch_cols,
+                };
+                feature.process_properties(&mut pusher).ok();
+            }
+            // Flush and yield to browser every ~16ms regardless of batch size,
+            // avoiding setTimeout throttling that caps throughput at 1 batch/sec.
+            let now_ms = js_sys::Date::now();
+            if now_ms - last_yield_ms >= 16.0 {
+                if !batch.is_empty() {
+                    tx.send(BatchMessage::Points(
+                        dest_idx,
+                        std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                        std::mem::replace(&mut batch_cols, make_batch_cols()),
+                    ))
+                    .ok();
+                }
+                gloo_timers::future::sleep(std::time::Duration::ZERO).await;
+                last_yield_ms = js_sys::Date::now();
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
+        }
+        // Pre-open next reader while caller renders current batch.
+        // With Cache-Control headers on the server, this is served from
+        // browser cache and is nearly instant after the first load.
+        if !cancel_stream.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(next_reader) = HttpFgbReader::open(url).await {
+                reader_cache
+                    .borrow_mut()
+                    .entry(url.to_string())
+                    .or_default()
+                    .push(next_reader);
+            }
+        }
+        Ok(())
+    }
+
     // ── load_selected_without_features ───────────────────────────────────────
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_selected_without_features(
-        path: &str,
+        path: GisFilePath,
         _indices: &[usize],
-    ) -> Result<Vec<LayerEntry>, Box<dyn std::error::Error>> {
-        let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
-        Ok(vec![Self::layer_entry_from_reader(reader)?])
+        field_names: Option<Vec<String>>,
+    ) -> Result<Vec<LayerEntry>, anyhow::Error> {
+        let GisFilePath::LocalFile(str_path) = &path else {
+            use anyhow::bail;
+            bail!("Wrong GisFilePath type!");
+        };
+        let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
+        let descriptor = Self::make_layer_descriptor(reader.header(), path)?;
+        Ok(vec![Self::layer_entry_from_descriptor(
+            descriptor,
+            field_names,
+        )])
     }
 
     #[cfg(target_arch = "wasm32")]
     pub fn load_selected_without_features(
-        bytes: &[u8],
-        _indices: &[usize],
-    ) -> Result<Vec<LayerEntry>, Box<dyn std::error::Error>> {
-        let reader = FgbReader::open(BufReader::new(Cursor::new(bytes)))?;
-        Ok(vec![Self::layer_entry_from_reader(reader)?])
+        path: GisFilePath,
+        descriptor: LayerDescriptor,
+        field_names: Option<Vec<String>>,
+    ) -> Result<Vec<LayerEntry>, anyhow::Error> {
+        // use flatgeobuf::HttpFgbReader;
+
+        // let GisFilePath::HttpLocation(url) = path.clone() else {
+        //     use anyhow::bail;
+        //     use std::fmt::Error;
+        //     bail!("brogen");
+        // };
+        // let reader = HttpFgbReader::open(&url).await?;
+        let field_names = descriptor.field_names.clone();
+        Ok(vec![Self::layer_entry_from_descriptor(
+            descriptor,
+            Some(field_names),
+        )])
     }
 
-    fn layer_entry_from_reader<R: Read + Seek>(
-        reader: FgbReader<R>,
-    ) -> Result<LayerEntry, Box<dyn std::error::Error>> {
-        let descriptor = Self::make_layer_descriptor(reader)?;
-        let layer_kind = match descriptor.geometry_type {
-            GeometryType::Point => LayerKind::Points(PointCloudLayer::default()),
-            _ => LayerKind::Vector(GisLayer::default()),
+    fn layer_entry_from_descriptor(
+        descriptor: LayerDescriptor,
+        field_names: Option<Vec<String>>,
+    ) -> LayerEntry {
+        println!("{:?}", field_names);
+        let layer_kind = match descriptor.geometry_type.0 {
+            1 => LayerKind::Points(PointCloudLayer {
+                points: Vec::new(),
+                attributes: Vec::new(),
+                field_names: field_names.unwrap_or(Vec::new()),
+                index: None,
+                bbox: None,
+            }),
+            _ => LayerKind::Vector(GisLayer {
+                name: descriptor.name.clone(),
+                file_path: descriptor.location.to_string(),
+                features: Vec::new(),
+                field_names: field_names.unwrap_or(Vec::new()),
+                extra_field_names: Vec::new(),
+                quadtree: None,
+                hilbert: None,
+                point_only: true,
+                world_bbox: [0., 0., 0., 0.],
+            }),
         };
-        Ok(LayerEntry {
+        LayerEntry {
             data: layer_kind,
             visible: true,
-            name: descriptor.name,
+            name: descriptor.name.clone(),
             color: [0, 0, 255],
             opacity: 255,
-        })
+            descriptor: descriptor.clone(),
+        }
     }
+
+    // fn layer_entry_from_reader<R: Read + Seek>(
+    //     reader: FgbReader<R>,
+    // ) -> Result<LayerEntry, Box<dyn std::error::Error>> {
+    //     let descriptor = Self::make_layer_descriptor(reader.header())?;
+    //     let layer_kind = match descriptor.geometry_type {
+    //         GeometryType::Point => LayerKind::Points(PointCloudLayer::default()),
+    //         _ => LayerKind::Vector(GisLayer::default()),
+    //     };
+    //     Ok(LayerEntry {
+    //         data: layer_kind,
+    //         visible: true,
+    //         name: descriptor.name,
+    //         color: [0, 0, 255],
+    //         opacity: 255,
+    //     })
+    // }
 }

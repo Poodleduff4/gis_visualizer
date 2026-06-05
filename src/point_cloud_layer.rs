@@ -48,20 +48,19 @@ pub struct PointCloudLayer {
 }
 impl PointCloudLayer {
     fn ensure_bbox(&mut self) {
-        if self.bbox.is_some() || self.points.is_empty() {
-            return;
+        if self.points.is_empty() || self.bbox.is_none() {
+            let mut xmin = f64::MAX;
+            let mut ymin = f64::MAX;
+            let mut xmax = f64::MIN;
+            let mut ymax = f64::MIN;
+            for p in &self.points {
+                xmin = xmin.min(p[0]);
+                ymin = ymin.min(p[1]);
+                xmax = xmax.max(p[0]);
+                ymax = ymax.max(p[1]);
+            }
+            self.bbox = Some([xmin, ymin, xmax, ymax]);
         }
-        let mut xmin = f64::MAX;
-        let mut ymin = f64::MAX;
-        let mut xmax = f64::MIN;
-        let mut ymax = f64::MIN;
-        for p in &self.points {
-            xmin = xmin.min(p[0]);
-            ymin = ymin.min(p[1]);
-            xmax = xmax.max(p[0]);
-            ymax = ymax.max(p[1]);
-        }
-        self.bbox = Some([xmin, ymin, xmax, ymax]);
     }
 
     pub fn rebuild_quadtree(&mut self, capacity: usize) {
