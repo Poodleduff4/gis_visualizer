@@ -435,6 +435,99 @@ impl GisReader {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn stream_fgb_bbox(
+        path: &GisFilePath,
+        bbox: [f64; 4],
+        _layer_idx: usize,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+        cancel_stream: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), anyhow::Error> {
+        use std::sync::atomic::Ordering;
+
+        if cancel_stream.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let GisFilePath::LocalFile(str_path) = path else {
+            bail!("Wrong GisFilePath type!");
+        };
+        let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
+        const BATCH_SIZE: usize = 50_000;
+        let col_schema: Vec<(String, ColumnType)> = {
+            let header = reader.header();
+            header
+                .columns()
+                .map(|cols| {
+                    cols.iter()
+                        .filter(|c| {
+                            selected_fields
+                                .as_ref()
+                                .map_or(false, |sel| sel.iter().any(|s| s.as_str() == c.name()))
+                        })
+                        .map(|c| (c.name().to_string(), c.type_()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let make_batch_cols = || -> Vec<(String, AttributeColumn)> {
+            col_schema
+                .iter()
+                .map(|(name, col_type)| {
+                    let col = match *col_type {
+                        ColumnType::Byte
+                        | ColumnType::UByte
+                        | ColumnType::Short
+                        | ColumnType::UShort
+                        | ColumnType::Int
+                        | ColumnType::UInt
+                        | ColumnType::Long
+                        | ColumnType::ULong => {
+                            AttributeColumn::Integer(Vec::with_capacity(BATCH_SIZE))
+                        }
+                        ColumnType::Float | ColumnType::Double => {
+                            AttributeColumn::Float(Vec::with_capacity(BATCH_SIZE))
+                        }
+                        _ => AttributeColumn::Text(Vec::with_capacity(BATCH_SIZE)),
+                    };
+                    (name.clone(), col)
+                })
+                .collect()
+        };
+        let mut iter = reader.select_bbox(bbox[0], bbox[1], bbox[2], bbox[3])?;
+        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_cols = make_batch_cols();
+        while let Some(feature) = iter.next()? {
+            if cancel_stream.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let [x, y] = match feature.to_geo() {
+                Ok(Geometry::Point(p)) => [p.x(), p.y()],
+                _ => continue,
+            };
+            batch.push([x, y]);
+            if !col_schema.is_empty() {
+                let mut pusher = ColumnPusher {
+                    cols: &mut batch_cols,
+                };
+                feature.process_properties(&mut pusher).ok();
+            }
+            if batch.len() >= BATCH_SIZE {
+                tx.send(BatchMessage::Points(
+                    dest_idx,
+                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                    std::mem::replace(&mut batch_cols, make_batch_cols()),
+                ))
+                .ok();
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
+        }
+        Ok(())
+    }
+
     #[cfg(target_arch = "wasm32")]
     pub async fn stream_fgb_bbox(
         path: &GisFilePath,

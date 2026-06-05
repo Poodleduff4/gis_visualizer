@@ -276,6 +276,7 @@ impl LayerKind {
             LayerKind::Points(point_cloud_layer) => {
                 point_cloud_layer.points.clear();
                 point_cloud_layer.attributes.clear();
+                point_cloud_layer.bbox = None;
             }
             LayerKind::Vector(gis_layer) => {
                 gis_layer.features.clear();

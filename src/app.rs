@@ -648,7 +648,7 @@ impl eframe::App for GisEditorApp {
                             attr_fields.clone(),
                         )
                     };
-                    result.expect("Batch layer read failed");
+                    let _ = result; // SendError just means receiver was dropped (new load started)
                 }
             });
             #[cfg(target_arch = "wasm32")]
@@ -684,7 +684,7 @@ impl eframe::App for GisEditorApp {
                         // .await
                         Ok(())
                     };
-                    result.expect("Batch layer read failed");
+                    let _ = result;
                 }
             });
             // self.load_rx = Some(rx);
@@ -850,6 +850,7 @@ impl eframe::App for GisEditorApp {
                             LayerKind::Points(pc) => pc.rebuild_quadtree(capacity),
                             LayerKind::Vector(gl) => gl.rebuild_quadtree(capacity),
                         }
+                        self.fitted = true; // don't auto-fit viewport; would clear_layer() and invalidate the new index
                     }
                     if let Some(idx) = rebuild_uncertainty_quadtree_idx {
                         match &mut self.layers[idx].data {
@@ -871,6 +872,7 @@ impl eframe::App for GisEditorApp {
                             LayerKind::Points(pc) => pc.rebuild_hilbert_tree(order),
                             LayerKind::Vector(gl) => gl.rebuild_hilbert_tree(order),
                         }
+                        self.fitted = true;
                     }
                     if visibility_changed {
                         self.points_dirty = true;
@@ -1008,6 +1010,51 @@ impl eframe::App for GisEditorApp {
                 self.last_layer_count = self.layers.len();
                 self.last_viewport_center = self.viewport.center;
                 self.last_viewport_ppu = self.viewport.pixels_per_unit;
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.viewport_load_pending && now_ms() - self.time_since_viewport_change > 0.5 {
+                self.viewport_load_pending = false;
+                // Cancel previous quad threads before starting new ones.
+                self.cancel_stream
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancel_stream = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (tx, rx) = mpsc::sync_channel(40);
+                self.load_rx = Some(rx);
+                let full_bbox = self
+                    .viewport
+                    .viewport_bbox(self.last_canvas_rect.clone().unwrap());
+                let [min_x, min_y, max_x, max_y] = full_bbox;
+                let mid_x = (min_x + max_x) / 2.0;
+                let mid_y = (min_y + max_y) / 2.0;
+                let quads: [[f64; 4]; 4] = [
+                    [min_x, min_y, mid_x, mid_y],
+                    [mid_x, min_y, max_x, mid_y],
+                    [min_x, mid_y, mid_x, max_y],
+                    [mid_x, mid_y, max_x, max_y],
+                ];
+                for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
+                    let field_names = layer.data.field_names();
+                    let layer_path = layer.descriptor.location.clone();
+                    layer.data.clear_layer();
+                    for quad_bbox in quads {
+                        let cancel_clone = self.cancel_stream.clone();
+                        let load_tx_clone = tx.clone();
+                        let field_names_clone = field_names.clone();
+                        let layer_path_clone = layer_path.clone();
+                        std::thread::spawn(move || {
+                            let _ = GisReader::stream_fgb_bbox(
+                                &layer_path_clone,
+                                quad_bbox,
+                                i,
+                                i,
+                                load_tx_clone,
+                                Some(field_names_clone),
+                                cancel_clone,
+                            );
+                        });
+                    }
+                }
             }
 
             #[cfg(target_arch = "wasm32")]
