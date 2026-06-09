@@ -712,6 +712,7 @@ impl GisReader {
                 field_names: field_names.unwrap_or(Vec::new()),
                 index: None,
                 bbox: None,
+                viewport_points: Vec::new(),
             }),
             _ => LayerKind::Vector(GisLayer {
                 name: descriptor.name.clone(),

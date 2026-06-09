@@ -1,5 +1,6 @@
 use crate::{
-    hilbert_r_tree::HilbertRTree, quadtree::Quadtree, uncertainty_quadtree::UncertaintyQuadtree,
+    hilbert_r_tree::HilbertRTree, quadtree::Quadtree, rtree_index::SpatialTree,
+    uncertainty_quadtree::UncertaintyQuadtree,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +13,7 @@ pub enum SpatialIndex {
     Quadtree(Quadtree),
     HilbertCurve(HilbertRTree),
     UncertaintyQuadtree(UncertaintyQuadtree),
+    RTree(SpatialTree),
 }
 
 impl SpatialIndex {
@@ -19,7 +21,8 @@ impl SpatialIndex {
         match self {
             SpatialIndex::Quadtree(qt) => qt.get_capacity(),
             SpatialIndex::HilbertCurve(ht) => ht.get_capacity(),
-            SpatialIndex::UncertaintyQuadtree(uncertainty_quadtree) => None,
+            SpatialIndex::UncertaintyQuadtree(_) => None,
+            SpatialIndex::RTree(rt) => Some(rt.size()),
         }
     }
 
@@ -28,6 +31,7 @@ impl SpatialIndex {
             SpatialIndex::Quadtree(qt) => qt.insert(id, rect),
             SpatialIndex::HilbertCurve(ht) => ht.insert(id, rect),
             SpatialIndex::UncertaintyQuadtree(uq) => uq.insert(id, rect, 0.0),
+            SpatialIndex::RTree(_) => {} // built via bulk_load, not incremental insert
         }
     }
 
@@ -36,6 +40,7 @@ impl SpatialIndex {
             SpatialIndex::Quadtree(qt) => qt.search(rect),
             SpatialIndex::HilbertCurve(ht) => ht.search(rect),
             SpatialIndex::UncertaintyQuadtree(uq) => uq.search(rect),
+            SpatialIndex::RTree(rt) => crate::rtree_index::query_bbox(rt, *rect).collect(),
         }
     }
 
@@ -44,6 +49,7 @@ impl SpatialIndex {
             SpatialIndex::Quadtree(qt) => qt.delete(id),
             SpatialIndex::HilbertCurve(ht) => ht.delete(id),
             SpatialIndex::UncertaintyQuadtree(uq) => uq.delete(id),
+            SpatialIndex::RTree(_) => {}
         }
     }
 
@@ -52,6 +58,7 @@ impl SpatialIndex {
             SpatialIndex::Quadtree(qt) => qt.len(),
             SpatialIndex::HilbertCurve(ht) => ht.len(),
             SpatialIndex::UncertaintyQuadtree(uq) => uq.len(),
+            SpatialIndex::RTree(rt) => rt.size(),
         }
     }
 
@@ -60,6 +67,7 @@ impl SpatialIndex {
             SpatialIndex::Quadtree(qt) => qt.is_empty(),
             SpatialIndex::HilbertCurve(ht) => ht.is_empty(),
             SpatialIndex::UncertaintyQuadtree(uq) => uq.is_empty(),
+            SpatialIndex::RTree(rt) => rt.size() == 0,
         }
     }
 
@@ -68,6 +76,7 @@ impl SpatialIndex {
             SpatialIndex::Quadtree(qt) => qt.clear(),
             SpatialIndex::HilbertCurve(ht) => ht.clear(),
             SpatialIndex::UncertaintyQuadtree(uq) => uq.clear(),
+            SpatialIndex::RTree(_) => {}
         }
     }
 
@@ -76,7 +85,12 @@ impl SpatialIndex {
             SpatialIndex::Quadtree(qt) => qt.shapes(),
             SpatialIndex::HilbertCurve(ht) => ht.shapes(),
             SpatialIndex::UncertaintyQuadtree(uq) => uq.shapes(),
+            SpatialIndex::RTree(_) => vec![],
         }
+    }
+
+    pub fn points_in_bbox(&self, points: &[[f64; 2]], bbox: [f64; 4]) -> Vec<[f64; 2]> {
+        self.search(&bbox).into_iter().map(|i| points[i]).collect()
     }
 
     pub fn heatmap_cells(&self) -> Vec<HeatmapCell> {
@@ -84,6 +98,7 @@ impl SpatialIndex {
             SpatialIndex::Quadtree(qt) => qt.heatmap_cells(),
             SpatialIndex::HilbertCurve(_) => vec![],
             SpatialIndex::UncertaintyQuadtree(uq) => uq.heatmap_cells(),
+            SpatialIndex::RTree(_) => vec![],
         }
     }
 }

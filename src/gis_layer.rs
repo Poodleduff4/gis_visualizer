@@ -263,6 +263,7 @@ fn bounding_box(geom: &Geometry<f64>) -> [f64; 4] {
 
 pub enum BatchMessage {
     Points(usize, Vec<[f64; 2]>, Vec<(String, AttributeColumn)>),
+    ViewportPoints(usize, Vec<[f64; 2]>),
     Vector(usize, Vec<GisFeature>),
 }
 
@@ -314,7 +315,7 @@ impl LayerKind {
     }
     pub fn index(&self, kind: IndexKind) -> Option<&SpatialIndex> {
         match self {
-            LayerKind::Points(point_cloud_layer) => point_cloud_layer.index.as_ref(),
+            LayerKind::Points(point_cloud_layer) => point_cloud_layer.index.as_deref(),
             LayerKind::Vector(gis_layer) => gis_layer.index(kind),
         }
     }

@@ -6,11 +6,13 @@ mod heatmap;
 mod hilbert_curve;
 mod hilbert_r_tree;
 mod map_view;
+mod parquet;
 mod point_cloud;
 mod point_cloud_layer;
 mod quadtree;
 mod sidebar;
 mod spatial_index;
+mod rtree_index;
 mod uncertainty_quadtree;
 
 #[cfg(not(target_arch = "wasm32"))]

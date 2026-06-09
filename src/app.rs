@@ -1,5 +1,6 @@
 use egui::{CentralPanel, Color32, UiKind};
 use rfd::FileHandle;
+use rstar::primitives::GeomWithData;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -36,7 +37,7 @@ use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, 
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
 use crate::quadtree::Quadtree;
 use crate::sidebar::{show_sidebar, AddAttributeForm, SidebarAction};
-use crate::spatial_index::IndexKind;
+use crate::spatial_index::{IndexKind, SpatialIndex};
 use crate::uncertainty_quadtree::{MeasurementType, UncertaintyMeasure, UncertaintyMeasurement};
 
 const LAYER_PANEL_WIDTH: f32 = 180.0;
@@ -96,7 +97,7 @@ pub struct GisEditorApp {
     // load_tx: Option<mpsc::SyncSender<BatchMessage>>,
     load_layer_descriptor_rx: mpsc::Receiver<LayerDescriptor>,
     load_layer_descriptor_tx: mpsc::SyncSender<LayerDescriptor>,
-    time_since_viewport_change: f64,
+    viewport_stable_frames: u32,
     viewport_load_pending: bool,
 
     // GPU point cloud state
@@ -181,7 +182,7 @@ impl GisEditorApp {
             selected_uncertainty_attribute: None,
             selected_index_cell_data: None,
             uncertainty_split_threshold: 0.5,
-            viewport_culling: true,
+            viewport_culling: false,
             selected_split_measurement_type: MeasurementType::Variance,
             file_pick_rx: None,
             #[cfg(target_arch = "wasm32")]
@@ -192,7 +193,7 @@ impl GisEditorApp {
             cancel_stream: Arc::new(AtomicBool::new(false)),
             streaming_features: false,
             pending_file_descriptor: None,
-            time_since_viewport_change: 0.0,
+            viewport_stable_frames: 0,
             viewport_load_pending: false,
             #[cfg(target_arch = "wasm32")]
             fgb_reader_cache: std::rc::Rc::new(std::cell::RefCell::new(
@@ -317,14 +318,12 @@ fn collect_gpu_points(
             LayerKind::Points(pc) => pc,
             LayerKind::Vector(gis_layer) => panic!("Unexpected layer kind in collect_gpu_points!"),
         };
-        let indices: Box<dyn Iterator<Item = usize>> =
-            if let (Some(bbox), Some(index)) = (viewport_bbox, &point_cloud_layer.index) {
-                Box::new(index.search(&bbox).into_iter())
-            } else {
-                Box::new(0..point_cloud_layer.points.len())
-            };
-        for idx in indices {
-            let point = point_cloud_layer.points[idx];
+        let render_pts: &[[f64; 2]] = if !point_cloud_layer.viewport_points.is_empty() {
+            &point_cloud_layer.viewport_points
+        } else {
+            &point_cloud_layer.points
+        };
+        for (idx, &point) in render_pts.iter().enumerate() {
             let fill = if is_active && selected_id == Some(idx) {
                 FILL_SELECTED
             } else {
@@ -714,6 +713,14 @@ impl eframe::App for GisEditorApp {
                         }
                         self.points_dirty = true;
                     }
+                    BatchMessage::ViewportPoints(layer_idx, pts) => {
+                        if let Some(LayerKind::Points(pc)) =
+                            &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
+                        {
+                            pc.viewport_points.extend(pts);
+                        }
+                        self.points_dirty = true;
+                    }
                     BatchMessage::Vector(layer_idx, features) => {
                         if let Some(LayerKind::Vector(gl)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
@@ -753,6 +760,7 @@ impl eframe::App for GisEditorApp {
                 } else {
                     let mut remove_idx: Option<usize> = None;
                     let mut rebuild_quadtree_idx: Option<usize> = None;
+                    let mut rebuild_rtree_idx: Option<usize> = None;
                     let mut rebuild_uncertainty_quadtree_idx: Option<usize> = None;
                     let mut rebuild_hilbert_idx: Option<usize> = None;
                     let mut visibility_changed = false;
@@ -807,6 +815,10 @@ impl eframe::App for GisEditorApp {
                                             }
                                         });
                                     }
+                                    if ui.button("Build R-Tree").clicked() {
+                                        rebuild_rtree_idx = Some(i);
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
                                     if ui.button("Build Uncertainty Quadtree").clicked() {
                                         rebuild_uncertainty_quadtree_idx = Some(i);
                                         ui.close_kind(egui::UiKind::Menu);
@@ -843,6 +855,13 @@ impl eframe::App for GisEditorApp {
                         };
                         self.selected_id = None;
                         self.points_dirty = true;
+                    }
+                    if let Some(idx) = rebuild_rtree_idx {
+                        match &mut self.layers[idx].data {
+                            LayerKind::Points(pc) => pc.rebuild_rtree(),
+                            LayerKind::Vector(gl) => {}
+                        }
+                        self.fitted = true; // don't auto-fit viewport; would clear_layer() and invalidate the new index
                     }
                     if let Some(idx) = rebuild_quadtree_idx {
                         let capacity = self.spatial_index_split_density;
@@ -971,8 +990,13 @@ impl eframe::App for GisEditorApp {
             let viewport_changed = self.viewport.center != self.last_viewport_center
                 || self.last_viewport_ppu != self.viewport.pixels_per_unit;
             if viewport_changed {
-                self.time_since_viewport_change = now_ms();
+                self.viewport_stable_frames = 0;
                 self.viewport_load_pending = true;
+            } else if self.viewport_load_pending {
+                self.viewport_stable_frames += 1;
+            }
+            if self.viewport_load_pending {
+                ui.ctx().request_repaint();
             }
 
             if self.points_dirty
@@ -1013,7 +1037,8 @@ impl eframe::App for GisEditorApp {
             }
 
             #[cfg(not(target_arch = "wasm32"))]
-            if self.viewport_load_pending && now_ms() - self.time_since_viewport_change > 0.5 {
+            if self.viewport_load_pending && self.viewport_stable_frames >= 3 {
+                // println!("Reloading From Index!");
                 self.viewport_load_pending = false;
                 // Cancel previous quad threads before starting new ones.
                 self.cancel_stream
@@ -1024,32 +1049,20 @@ impl eframe::App for GisEditorApp {
                 let full_bbox = self
                     .viewport
                     .viewport_bbox(self.last_canvas_rect.clone().unwrap());
-                let [min_x, min_y, max_x, max_y] = full_bbox;
-                let mid_x = (min_x + max_x) / 2.0;
-                let mid_y = (min_y + max_y) / 2.0;
-                let quads: [[f64; 4]; 4] = [
-                    [min_x, min_y, mid_x, mid_y],
-                    [mid_x, min_y, max_x, mid_y],
-                    [min_x, mid_y, mid_x, max_y],
-                    [mid_x, mid_y, max_x, max_y],
-                ];
                 for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
-                    let field_names = layer.data.field_names();
-                    let layer_path = layer.descriptor.location.clone();
-                    layer.data.clear_layer();
-                    for quad_bbox in quads {
+                    if let LayerKind::Points(pc) = &mut layer.data {
+                        pc.viewport_points.clear();
+                        let pts_clone = pc.points.clone();
+                        let idx_clone = pc.index.clone();
                         let cancel_clone = self.cancel_stream.clone();
-                        let load_tx_clone = tx.clone();
-                        let field_names_clone = field_names.clone();
-                        let layer_path_clone = layer_path.clone();
+                        let tx_clone = tx.clone();
                         std::thread::spawn(move || {
-                            let _ = GisReader::stream_fgb_bbox(
-                                &layer_path_clone,
-                                quad_bbox,
+                            crate::point_cloud_layer::query_and_stream_viewport(
                                 i,
-                                i,
-                                load_tx_clone,
-                                Some(field_names_clone),
+                                pts_clone,
+                                idx_clone,
+                                full_bbox,
+                                tx_clone,
                                 cancel_clone,
                             );
                         });
@@ -1058,44 +1071,29 @@ impl eframe::App for GisEditorApp {
             }
 
             #[cfg(target_arch = "wasm32")]
-            if self.viewport_load_pending && now_ms() - self.time_since_viewport_change > 0.5 {
+            if self.viewport_load_pending && self.viewport_stable_frames >= 3 {
                 self.viewport_load_pending = false;
                 let (tx, rx) = mpsc::sync_channel(40);
                 self.load_rx = Some(rx);
                 let full_bbox = self
                     .viewport
                     .viewport_bbox(self.last_canvas_rect.clone().unwrap());
-                let [min_x, min_y, max_x, max_y] = full_bbox;
-                let mid_x = (min_x + max_x) / 2.0;
-                let mid_y = (min_y + max_y) / 2.0;
-                let quads: [[f64; 4]; 4] = [
-                    [min_x, min_y, mid_x, mid_y],
-                    [mid_x, min_y, max_x, mid_y],
-                    [min_x, mid_y, mid_x, max_y],
-                    [mid_x, mid_y, max_x, max_y],
-                ];
                 for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
-                    let field_names = layer.data.field_names();
-                    let layer_path = layer.descriptor.location.clone();
-                    layer.data.clear_layer();
-                    for quad_bbox in quads {
+                    if let LayerKind::Points(pc) = &mut layer.data {
+                        pc.viewport_points.clear();
+                        let pts_clone = pc.points.clone();
+                        let idx_clone = pc.index.clone();
+                        let tx_clone = tx.clone();
                         let cancel_clone = self.cancel_stream.clone();
-                        let load_tx_clone = tx.clone();
-                        let reader_cache_clone = self.fgb_reader_cache.clone();
-                        let field_names_clone = field_names.clone();
-                        let layer_path_clone = layer_path.clone();
                         spawn_local(async move {
-                            GisReader::stream_fgb_bbox(
-                                &layer_path_clone,
-                                quad_bbox,
+                            crate::point_cloud_layer::query_and_stream_viewport(
                                 i,
-                                i,
-                                load_tx_clone,
-                                Some(field_names_clone),
+                                pts_clone,
+                                idx_clone,
+                                full_bbox,
+                                tx_clone,
                                 cancel_clone,
-                                reader_cache_clone,
-                            )
-                            .await;
+                            );
                         });
                     }
                 }

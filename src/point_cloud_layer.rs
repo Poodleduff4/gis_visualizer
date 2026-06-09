@@ -1,8 +1,13 @@
 use crate::{
+    gis_layer::BatchMessage,
     hilbert_r_tree::HilbertRTree,
     quadtree::Quadtree,
     spatial_index::SpatialIndex,
     uncertainty_quadtree::{MeasurementType, UncertaintyQuadtree},
+};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
 };
 
 pub enum AttributeColumn {
@@ -43,8 +48,9 @@ pub struct PointCloudLayer {
     pub points: Vec<[f64; 2]>,
     pub attributes: Vec<AttributeColumn>,
     pub field_names: Vec<String>,
-    pub index: Option<SpatialIndex>,
+    pub index: Option<Arc<SpatialIndex>>,
     pub bbox: Option<[f64; 4]>,
+    pub viewport_points: Vec<[f64; 2]>,
 }
 impl PointCloudLayer {
     fn ensure_bbox(&mut self) {
@@ -70,8 +76,18 @@ impl PointCloudLayer {
             for (i, p) in self.points.iter().enumerate() {
                 qt.insert(i, [p[0], p[1], p[0], p[1]]);
             }
-            self.index = Some(qt);
+            self.index = Some(Arc::new(qt));
         }
+    }
+
+    pub fn rebuild_rtree(&mut self) {
+        self.index = Some(Arc::new(SpatialIndex::RTree(crate::rtree_index::build(
+            &self.points,
+        ))));
+    }
+
+    pub fn has_rtree(&self) -> bool {
+        matches!(self.index.as_deref(), Some(SpatialIndex::RTree(_)))
     }
 
     pub fn rebuild_hilbert_tree(&mut self, order: u32) {
@@ -81,7 +97,7 @@ impl PointCloudLayer {
             for (i, p) in self.points.iter().enumerate() {
                 ht.insert(i, [p[0], p[1], p[0], p[1]]);
             }
-            self.index = Some(ht);
+            self.index = Some(Arc::new(ht));
         }
     }
 
@@ -151,6 +167,121 @@ impl PointCloudLayer {
                 });
             (i, [p[0], p[1], p[0], p[1]], value)
         }));
-        self.index = Some(SpatialIndex::UncertaintyQuadtree(uq));
+        self.index = Some(Arc::new(SpatialIndex::UncertaintyQuadtree(uq)));
     }
+
+    // Returns matching points + attribute columns for a bbox query against the spatial index.
+    // Caller should invoke this BEFORE clear_layer() since it reads self.points.
+    pub fn extract_bbox(&self, bbox: [f64; 4]) -> (Vec<[f64; 2]>, Vec<(String, AttributeColumn)>) {
+        let indices = match &self.index {
+            Some(idx) => idx.search(&bbox),
+            None => self
+                .points
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    p[0] >= bbox[0] && p[0] <= bbox[2] && p[1] >= bbox[1] && p[1] <= bbox[3]
+                })
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        let pts = indices.iter().map(|&i| self.points[i]).collect();
+        let cols = self
+            .field_names
+            .iter()
+            .zip(self.attributes.iter())
+            .map(|(name, col)| {
+                let sub = match col {
+                    AttributeColumn::Float(v) => {
+                        AttributeColumn::Float(indices.iter().map(|&i| v[i]).collect())
+                    }
+                    AttributeColumn::Integer(v) => {
+                        AttributeColumn::Integer(indices.iter().map(|&i| v[i]).collect())
+                    }
+                    AttributeColumn::Text(v) => {
+                        AttributeColumn::Text(indices.iter().map(|&i| v[i].clone()).collect())
+                    }
+                };
+                (name.clone(), sub)
+            })
+            .collect();
+        (pts, cols)
+    }
+}
+
+pub fn stream_index_bbox(
+    dest_idx: usize,
+    pts: Vec<[f64; 2]>,
+    cols: Vec<(String, AttributeColumn)>,
+    tx: mpsc::SyncSender<BatchMessage>,
+    cancel: Arc<AtomicBool>,
+) {
+    const BATCH: usize = 50_000;
+    let n = pts.len();
+    let mut start = 0;
+    while start < n {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let end = (start + BATCH).min(n);
+        let batch_pts = pts[start..end].to_vec();
+        let batch_cols = cols
+            .iter()
+            .map(|(name, col)| {
+                let sub = match col {
+                    AttributeColumn::Float(v) => AttributeColumn::Float(v[start..end].to_vec()),
+                    AttributeColumn::Integer(v) => AttributeColumn::Integer(v[start..end].to_vec()),
+                    AttributeColumn::Text(v) => AttributeColumn::Text(v[start..end].to_vec()),
+                };
+                (name.clone(), sub)
+            })
+            .collect();
+        tx.send(BatchMessage::Points(dest_idx, batch_pts, batch_cols))
+            .ok();
+        start = end;
+    }
+}
+
+pub fn query_and_stream_viewport(
+    dest_idx: usize,
+    points: Vec<[f64; 2]>,
+    index: Option<Arc<SpatialIndex>>,
+    bbox: [f64; 4],
+    tx: mpsc::SyncSender<BatchMessage>,
+    cancel: Arc<AtomicBool>,
+) {
+    let t0 = std::time::Instant::now();
+    let viewport_pts: Vec<[f64; 2]> = match &index {
+        Some(idx) => idx.points_in_bbox(&points, bbox),
+        None => points
+            .iter()
+            .copied()
+            .filter(|p| p[0] >= bbox[0] && p[0] <= bbox[2] && p[1] >= bbox[1] && p[1] <= bbox[3])
+            .collect(),
+    };
+    let filter_time = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    const BATCH: usize = 50_000;
+    let mut start = 0;
+    while start < viewport_pts.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let end = (start + BATCH).min(viewport_pts.len());
+        tx.send(BatchMessage::ViewportPoints(
+            dest_idx,
+            viewport_pts[start..end].to_vec(),
+        ))
+        .ok();
+        start = end;
+    }
+    let send_time = t1.elapsed();
+
+    println!(
+        "filter: {:.2?} ({} pts) | send: {:.2?}",
+        filter_time,
+        viewport_pts.len(),
+        send_time,
+    );
 }
