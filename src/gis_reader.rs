@@ -1,4 +1,5 @@
 use anyhow::bail;
+use bitvec::{bitarr, bitvec, vec::BitVec, BitArr};
 use flatgeobuf::{
     ColumnType, FallibleStreamingIterator, FeatureProperties, FgbReader, GeometryType, Header,
 };
@@ -81,17 +82,27 @@ impl PropertyProcessor for PairCollector<'_> {
     }
 }
 
-struct ColumnPusher<'a> {
+struct PropertyExtractor<'a> {
     cols: &'a mut Vec<(String, AttributeColumn)>,
+    idx: Option<u32>,
 }
 
-impl PropertyProcessor for ColumnPusher<'_> {
+impl PropertyProcessor for PropertyExtractor<'_> {
     fn property(
         &mut self,
-        _idx: usize,
+        _i: usize,
         name: &str,
         value: &ColumnValue,
     ) -> std::result::Result<bool, GeozeroError> {
+        if name == "idx" {
+            self.idx = match value {
+                ColumnValue::UInt(v) => Some(*v),
+                ColumnValue::Int(v) => Some(*v as u32),
+                ColumnValue::Long(v) => Some(*v as u32),
+                ColumnValue::ULong(v) => Some(*v as u32),
+                _ => None,
+            };
+        }
         if let Some((_, col)) = self.cols.iter_mut().find(|(n, _)| n == name) {
             match (col, value) {
                 (AttributeColumn::Integer(v), ColumnValue::Int(i)) => v.push(*i as i64),
@@ -322,20 +333,22 @@ impl GisReader {
                 .collect()
         };
         let mut iter = reader.select_all()?;
-        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<(u32, [f64; 2])> = Vec::with_capacity(BATCH_SIZE);
         let mut batch_cols = make_batch_cols();
+        let mut id_counter = 0_u32;
         while let Some(feature) = iter.next()? {
             let [x, y] = match feature.to_geo() {
                 Ok(Geometry::Point(p)) => [p.x(), p.y()],
                 _ => continue,
             };
-            batch.push([x, y]);
-            if !col_schema.is_empty() {
-                let mut pusher = ColumnPusher {
-                    cols: &mut batch_cols,
-                };
-                feature.process_properties(&mut pusher).ok();
-            }
+            let mut extractor = PropertyExtractor {
+                cols: &mut batch_cols,
+                idx: None,
+            };
+            feature.process_properties(&mut extractor).ok();
+            let id = extractor.idx.unwrap_or(id_counter);
+            id_counter += 1;
+            batch.push((id, [x, y]));
             if batch.len() >= BATCH_SIZE {
                 tx.send(BatchMessage::Points(
                     dest_idx,
@@ -404,20 +417,22 @@ impl GisReader {
                 .collect()
         };
         let mut iter = reader.select_all()?;
-        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<(u32, [f64; 2])> = Vec::with_capacity(BATCH_SIZE);
         let mut batch_cols = make_batch_cols();
+        let mut id_counter = 0_u32;
         while let Some(feature) = iter.next()? {
             let [x, y] = match feature.to_geo() {
                 Ok(Geometry::Point(p)) => [p.x(), p.y()],
                 _ => continue,
             };
-            batch.push([x, y]);
-            if !col_schema.is_empty() {
-                let mut pusher = ColumnPusher {
-                    cols: &mut batch_cols,
-                };
-                feature.process_properties(&mut pusher).ok();
-            }
+            let mut extractor = PropertyExtractor {
+                cols: &mut batch_cols,
+                idx: None,
+            };
+            feature.process_properties(&mut extractor).ok();
+            let id = extractor.idx.unwrap_or(id_counter);
+            id_counter += 1;
+            batch.push((id, [x, y]));
             if batch.len() >= BATCH_SIZE {
                 tx.send(BatchMessage::Points(
                     dest_idx,
@@ -496,8 +511,9 @@ impl GisReader {
                 .collect()
         };
         let mut iter = reader.select_bbox(bbox[0], bbox[1], bbox[2], bbox[3])?;
-        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<(u32, [f64; 2])> = Vec::with_capacity(BATCH_SIZE);
         let mut batch_cols = make_batch_cols();
+        let mut id_counter = 0_u32;
         while let Some(feature) = iter.next()? {
             if cancel_stream.load(Ordering::Relaxed) {
                 return Ok(());
@@ -506,13 +522,14 @@ impl GisReader {
                 Ok(Geometry::Point(p)) => [p.x(), p.y()],
                 _ => continue,
             };
-            batch.push([x, y]);
-            if !col_schema.is_empty() {
-                let mut pusher = ColumnPusher {
-                    cols: &mut batch_cols,
-                };
-                feature.process_properties(&mut pusher).ok();
-            }
+            let mut extractor = PropertyExtractor {
+                cols: &mut batch_cols,
+                idx: None,
+            };
+            feature.process_properties(&mut extractor).ok();
+            let id = extractor.idx.unwrap_or(id_counter);
+            id_counter += 1;
+            batch.push((id, [x, y]));
             if batch.len() >= BATCH_SIZE {
                 tx.send(BatchMessage::Points(
                     dest_idx,
@@ -606,8 +623,9 @@ impl GisReader {
                 })
                 .collect()
         };
-        let mut batch: Vec<[f64; 2]> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<(u32, [f64; 2])> = Vec::with_capacity(BATCH_SIZE);
         let mut batch_cols = make_batch_cols();
+        let mut id_counter = 0_u32;
         let mut features = reader
             .select_bbox(bbox[0], bbox[1], bbox[2], bbox[3])
             .await?;
@@ -618,13 +636,14 @@ impl GisReader {
                 Ok(Geometry::Point(p)) => [p.x(), p.y()],
                 _ => continue,
             };
-            batch.push([x, y]);
-            if !col_schema.is_empty() {
-                let mut pusher = ColumnPusher {
-                    cols: &mut batch_cols,
-                };
-                feature.process_properties(&mut pusher).ok();
-            }
+            let mut extractor = PropertyExtractor {
+                cols: &mut batch_cols,
+                idx: None,
+            };
+            feature.process_properties(&mut extractor).ok();
+            let id = extractor.idx.unwrap_or(id_counter);
+            id_counter += 1;
+            batch.push((id, [x, y]));
             // Flush and yield to browser every ~16ms regardless of batch size,
             // avoiding setTimeout throttling that caps throughput at 1 batch/sec.
             let now_ms = js_sys::Date::now();
@@ -707,12 +726,13 @@ impl GisReader {
         println!("{:?}", field_names);
         let layer_kind = match descriptor.geometry_type.0 {
             1 => LayerKind::Points(PointCloudLayer {
-                points: Vec::new(),
+                points: std::sync::Arc::new(Vec::new()),
                 attributes: Vec::new(),
                 field_names: field_names.unwrap_or(Vec::new()),
                 index: None,
                 bbox: None,
-                viewport_points: Vec::new(),
+                viewport_mask: bitvec![0;descriptor.num_features as usize],
+                filter_mask: bitvec![1;descriptor.num_features as usize],
             }),
             _ => LayerKind::Vector(GisLayer {
                 name: descriptor.name.clone(),
@@ -733,6 +753,7 @@ impl GisReader {
             color: [0, 0, 255],
             opacity: 255,
             descriptor: descriptor.clone(),
+            filters: Vec::new(),
         }
     }
 

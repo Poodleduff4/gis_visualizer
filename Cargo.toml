@@ -31,6 +31,9 @@ datafusion = { version = "43", default-features = true,
   ] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 rstar = "0.12"
+bitvec = "1.0.1"
+futures-channel = "0.3"
+
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ureq = "3.3.0"

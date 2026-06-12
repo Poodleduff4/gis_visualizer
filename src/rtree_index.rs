@@ -2,11 +2,10 @@ use rstar::{primitives::GeomWithData, RTree, AABB};
 
 pub type SpatialTree = RTree<GeomWithData<[f64; 2], usize>>;
 
-pub fn build(coords: &[[f64; 2]]) -> SpatialTree {
+pub fn build(coords: &[(u32, [f64; 2])]) -> SpatialTree {
     let entries = coords
         .iter()
-        .enumerate()
-        .map(|(id, &pt)| GeomWithData::new(pt, id))
+        .map(|(id, pt)| GeomWithData::new(*pt, *id as usize))
         .collect();
     RTree::bulk_load(entries)
 }

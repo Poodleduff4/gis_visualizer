@@ -1,3 +1,5 @@
+use bitvec::{array::BitArray, vec::BitVec};
+
 use crate::{
     gis_layer::BatchMessage,
     hilbert_r_tree::HilbertRTree,
@@ -45,12 +47,13 @@ impl AttributeColumn {
 
 #[derive(Default)]
 pub struct PointCloudLayer {
-    pub points: Vec<[f64; 2]>,
+    pub points: Arc<Vec<(u32, [f64; 2])>>,
     pub attributes: Vec<AttributeColumn>,
     pub field_names: Vec<String>,
     pub index: Option<Arc<SpatialIndex>>,
     pub bbox: Option<[f64; 4]>,
-    pub viewport_points: Vec<[f64; 2]>,
+    pub viewport_mask: BitVec,
+    pub filter_mask: BitVec,
 }
 impl PointCloudLayer {
     fn ensure_bbox(&mut self) {
@@ -59,7 +62,7 @@ impl PointCloudLayer {
             let mut ymin = f64::MAX;
             let mut xmax = f64::MIN;
             let mut ymax = f64::MIN;
-            for p in &self.points {
+            for (idx, p) in self.points.iter() {
                 xmin = xmin.min(p[0]);
                 ymin = ymin.min(p[1]);
                 xmax = xmax.max(p[0]);
@@ -73,8 +76,15 @@ impl PointCloudLayer {
         self.ensure_bbox();
         if let Some(bbox) = self.bbox {
             let mut qt = SpatialIndex::Quadtree(Quadtree::new(bbox, capacity));
-            for (i, p) in self.points.iter().enumerate() {
-                qt.insert(i, [p[0], p[1], p[0], p[1]]);
+            let filtered_points = self
+                .points
+                .iter()
+                .filter(|(i, p)| self.filter_mask[*i as usize])
+                .map(|(i, p)| (*i, *p))
+                .collect::<Vec<(u32, [f64; 2])>>();
+
+            for (i, p) in filtered_points.iter() {
+                qt.insert(*i as usize, [p[0], p[1], p[0], p[1]]);
             }
             self.index = Some(Arc::new(qt));
         }
@@ -94,8 +104,8 @@ impl PointCloudLayer {
         self.ensure_bbox();
         if let Some(bbox) = self.bbox {
             let mut ht = SpatialIndex::HilbertCurve(HilbertRTree::new(bbox, order));
-            for (i, p) in self.points.iter().enumerate() {
-                ht.insert(i, [p[0], p[1], p[0], p[1]]);
+            for (i, p) in self.points.iter() {
+                ht.insert(*i as usize, [p[0], p[1], p[0], p[1]]);
             }
             self.index = Some(Arc::new(ht));
         }
@@ -109,7 +119,7 @@ impl PointCloudLayer {
                 let mut b_dist = f64::MAX;
                 let mut b_idx: Option<usize> = None;
                 for idx in results.iter() {
-                    let p = self.points[*idx];
+                    let p = &self.points[*idx].1;
                     let dist = ((x - p[0]).powf(2.) + (y - p[1]).powf(2.)).sqrt();
                     if dist < b_dist {
                         b_idx = Some(*idx);
@@ -123,10 +133,10 @@ impl PointCloudLayer {
         } else {
             let mut b_dist = f64::MAX;
             let mut b_idx: Option<usize> = None;
-            for (idx, p) in self.points.iter().enumerate() {
+            for (idx, p) in self.points.iter() {
                 let dist = ((x - p[0]).powf(2.) + (y - p[1]).powf(2.)).sqrt();
                 if dist < b_dist {
-                    b_idx = Some(idx);
+                    b_idx = Some(*idx as usize);
                     b_dist = dist;
                 }
             }
@@ -153,65 +163,65 @@ impl PointCloudLayer {
         let Some(bbox) = self.bbox else { return };
         let field_idx = self.field_names.iter().position(|n| n == &attribute);
         let mut uq = UncertaintyQuadtree::new(bbox, attribute.clone(), threshold, measurement_type);
-        uq.insert_batch(self.points.iter().enumerate().map(|(i, p)| {
+        uq.insert_batch(self.points.iter().map(|(i, p)| {
             let value = field_idx
                 .and_then(|fi| self.attributes.get(fi))
                 .map(|col| match col {
-                    AttributeColumn::Float(v) => v.get(i).copied().unwrap_or(0.0),
-                    AttributeColumn::Integer(v) => v.get(i).copied().unwrap_or(0) as f64,
+                    AttributeColumn::Float(v) => v.get(*i as usize).copied().unwrap_or(0.0),
+                    AttributeColumn::Integer(v) => v.get(*i as usize).copied().unwrap_or(0) as f64,
                     AttributeColumn::Text(_) => 0.0,
                 })
                 .unwrap_or_else(|| {
                     eprintln!("attribute '{}' not found", attribute);
                     0.0
                 });
-            (i, [p[0], p[1], p[0], p[1]], value)
+            (*i as usize, [p[0], p[1], p[0], p[1]], value)
         }));
         self.index = Some(Arc::new(SpatialIndex::UncertaintyQuadtree(uq)));
     }
 
     // Returns matching points + attribute columns for a bbox query against the spatial index.
     // Caller should invoke this BEFORE clear_layer() since it reads self.points.
-    pub fn extract_bbox(&self, bbox: [f64; 4]) -> (Vec<[f64; 2]>, Vec<(String, AttributeColumn)>) {
-        let indices = match &self.index {
-            Some(idx) => idx.search(&bbox),
-            None => self
-                .points
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    p[0] >= bbox[0] && p[0] <= bbox[2] && p[1] >= bbox[1] && p[1] <= bbox[3]
-                })
-                .map(|(i, _)| i)
-                .collect(),
-        };
-        let pts = indices.iter().map(|&i| self.points[i]).collect();
-        let cols = self
-            .field_names
-            .iter()
-            .zip(self.attributes.iter())
-            .map(|(name, col)| {
-                let sub = match col {
-                    AttributeColumn::Float(v) => {
-                        AttributeColumn::Float(indices.iter().map(|&i| v[i]).collect())
-                    }
-                    AttributeColumn::Integer(v) => {
-                        AttributeColumn::Integer(indices.iter().map(|&i| v[i]).collect())
-                    }
-                    AttributeColumn::Text(v) => {
-                        AttributeColumn::Text(indices.iter().map(|&i| v[i].clone()).collect())
-                    }
-                };
-                (name.clone(), sub)
-            })
-            .collect();
-        (pts, cols)
-    }
+    // pub fn extract_bbox(&self, bbox: [f64; 4]) -> (Vec<[f64; 2]>, Vec<(String, AttributeColumn)>) {
+    //     let indices = match &self.index {
+    //         Some(idx) => idx.search(&bbox),
+    //         None => self
+    //             .points
+    //             .iter()
+    //             .enumerate()
+    //             .filter(|(_, p)| {
+    //                 p[0] >= bbox[0] && p[0] <= bbox[2] && p[1] >= bbox[1] && p[1] <= bbox[3]
+    //             })
+    //             .map(|(i, _)| i)
+    //             .collect(),
+    //     };
+    //     let pts = indices.iter().map(|&i| self.points[i]).collect();
+    //     let cols = self
+    //         .field_names
+    //         .iter()
+    //         .zip(self.attributes.iter())
+    //         .map(|(name, col)| {
+    //             let sub = match col {
+    //                 AttributeColumn::Float(v) => {
+    //                     AttributeColumn::Float(indices.iter().map(|&i| v[i]).collect())
+    //                 }
+    //                 AttributeColumn::Integer(v) => {
+    //                     AttributeColumn::Integer(indices.iter().map(|&i| v[i]).collect())
+    //                 }
+    //                 AttributeColumn::Text(v) => {
+    //                     AttributeColumn::Text(indices.iter().map(|&i| v[i].clone()).collect())
+    //                 }
+    //             };
+    //             (name.clone(), sub)
+    //         })
+    //         .collect();
+    //     (pts, cols)
+    // }
 }
 
 pub fn stream_index_bbox(
     dest_idx: usize,
-    pts: Vec<[f64; 2]>,
+    pts: Vec<(u32, [f64; 2])>,
     cols: Vec<(String, AttributeColumn)>,
     tx: mpsc::SyncSender<BatchMessage>,
     cancel: Arc<AtomicBool>,
@@ -244,25 +254,27 @@ pub fn stream_index_bbox(
 
 pub fn query_and_stream_viewport(
     dest_idx: usize,
-    points: Vec<[f64; 2]>,
+    points: Arc<Vec<(u32, [f64; 2])>>,
     index: Option<Arc<SpatialIndex>>,
     bbox: [f64; 4],
     tx: mpsc::SyncSender<BatchMessage>,
     cancel: Arc<AtomicBool>,
 ) {
     let t0 = std::time::Instant::now();
-    let viewport_pts: Vec<[f64; 2]> = match &index {
-        Some(idx) => idx.points_in_bbox(&points, bbox),
-        None => points
-            .iter()
-            .copied()
-            .filter(|p| p[0] >= bbox[0] && p[0] <= bbox[2] && p[1] >= bbox[1] && p[1] <= bbox[3])
-            .collect(),
+    let viewport_pts: Vec<u32> = match &index {
+        Some(idx) => idx.points_idx_in_bbox(bbox),
+        None => Vec::new(),
+        // None => points
+        //     .iter()
+        //     .map(|(i, p)| p)
+        //     .copied()
+        //     .filter(|p| p[0] >= bbox[0] && p[0] <= bbox[2] && p[1] >= bbox[1] && p[1] <= bbox[3])
+        //     .collect(),
     };
     let filter_time = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    const BATCH: usize = 50_000;
+    const BATCH: usize = 10_000;
     let mut start = 0;
     while start < viewport_pts.len() {
         if cancel.load(Ordering::Relaxed) {

@@ -1,6 +1,7 @@
 use egui::{ComboBox, RichText, ScrollArea, Ui};
 
 use crate::{
+    app::LayerAttributeFilter,
     gis_layer::{AttributeType, AttributeValue, LayerEntry},
     uncertainty_quadtree::{UncertaintyMeasure, UncertaintyMeasurement},
 };
@@ -31,12 +32,15 @@ pub enum SidebarAction {
 
 pub fn show_sidebar(
     ui: &mut Ui,
-    layer_entries: &[LayerEntry],
+    layer_entries: &mut [LayerEntry],
     active_layer_idx: Option<usize>,
     selected_id: Option<usize>,
     form: &mut AddAttributeForm,
     save_path: &mut String,
     selected_index_cell_data: Option<&UncertaintyMeasure>,
+    // current_filters: &mut Option<&mut Vec<LayerAttributeFilter>>,
+    adding_filter: &mut Option<LayerAttributeFilter>,
+    mut updated_filters: &mut bool,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
 
@@ -49,11 +53,90 @@ pub fn show_sidebar(
         return action;
     };
 
-    let layer = &layer_entries[active_idx];
+    let layer = &mut layer_entries[active_idx];
 
     // ── Layer info ────────────────────────────────────────────────────────────
     ui.label(RichText::new(&layer.name).strong());
     ui.label(format!("{} features", layer.data.feature_count()));
+    ui.separator();
+    ui.label(RichText::new("Layer Filters").strong());
+    let field_names = &layer.data.field_names();
+    let mut to_remove: Option<usize> = None;
+
+    for (idx, filter) in layer.filters.iter().enumerate() {
+        ui.label(&format!("Filter on: {}", filter.attribute.clone().unwrap()));
+        ui.label(&format!(
+            "By: {}",
+            filter.operation.clone().unwrap().to_string()
+        ));
+        ui.label(&format!("Compare to: {}", filter.comparitor_raw));
+        if ui.button("Delete Filter").clicked() {
+            println!("Delete Filter");
+            to_remove = Some(idx);
+        }
+    }
+
+    if let Some(idx) = to_remove {
+        layer.filters.remove(idx);
+        *updated_filters = true;
+    }
+    if let Some(filter) = adding_filter {
+        ui.menu_button("Attribute", |ui| {
+            for name in field_names.iter() {
+                ui.selectable_value(&mut filter.attribute, Some(name.clone()), name.as_str());
+            }
+        });
+        ui.menu_button("Operation", |ui| {
+            ui.selectable_value(
+                &mut filter.operation,
+                Some(crate::app::FilterOperation::LessThan),
+                "Less Than",
+            );
+            ui.selectable_value(
+                &mut filter.operation,
+                Some(crate::app::FilterOperation::GreaterThan),
+                "Greater Than",
+            );
+            ui.selectable_value(
+                &mut filter.operation,
+                Some(crate::app::FilterOperation::Equal),
+                "Equal",
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Compare to:");
+            ui.text_edit_singleline(&mut filter.comparitor_raw);
+        });
+        if ui.button("Create Filter").clicked() {
+            let attr_type = filter
+                .attribute
+                .as_deref()
+                .and_then(|name| layer.data.column_type_for(name))
+                .unwrap_or(AttributeType::Text);
+            let comparitor = attr_type
+                .parse_value(&filter.comparitor_raw)
+                .unwrap_or(AttributeValue::Text(filter.comparitor_raw.clone()));
+            layer.filters.push(LayerAttributeFilter {
+                attribute: filter.attribute.clone(),
+                operation: filter.operation.clone(),
+                comparitor,
+                comparitor_raw: filter.comparitor_raw.clone(),
+            });
+            adding_filter.take();
+            // layer.filters.push(adding_filter.take().unwrap());
+            *updated_filters = true;
+            // current_filters.push(adding_filter.take().unwrap());
+        }
+    } else {
+        if ui.button("Add Filter").clicked() {
+            adding_filter.replace(LayerAttributeFilter {
+                attribute: None,
+                operation: None,
+                comparitor: AttributeValue::Text(String::new()),
+                comparitor_raw: String::new(),
+            });
+        }
+    }
     ui.separator();
     if let Some(cell_data) = selected_index_cell_data {
         match cell_data {

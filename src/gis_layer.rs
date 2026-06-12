@@ -5,6 +5,7 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::mpsc;
 
+use crate::app::LayerAttributeFilter;
 use crate::gis_reader::LayerDescriptor;
 use crate::hilbert_r_tree::HilbertRTree;
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
@@ -262,8 +263,8 @@ fn bounding_box(geom: &Geometry<f64>) -> [f64; 4] {
 }
 
 pub enum BatchMessage {
-    Points(usize, Vec<[f64; 2]>, Vec<(String, AttributeColumn)>),
-    ViewportPoints(usize, Vec<[f64; 2]>),
+    Points(usize, Vec<(u32, [f64; 2])>, Vec<(String, AttributeColumn)>),
+    ViewportPoints(usize, Vec<u32>),
     Vector(usize, Vec<GisFeature>),
 }
 
@@ -272,10 +273,16 @@ pub enum LayerKind {
     Vector(GisLayer),
 }
 impl LayerKind {
+    pub fn reset_filter_mask(&mut self) {
+        match self {
+            LayerKind::Points(point_cloud_layer) => point_cloud_layer.filter_mask.fill(true),
+            LayerKind::Vector(gis_layer) => {}
+        }
+    }
     pub fn clear_layer(&mut self) {
         match self {
             LayerKind::Points(point_cloud_layer) => {
-                point_cloud_layer.points.clear();
+                std::sync::Arc::make_mut(&mut point_cloud_layer.points).clear();
                 point_cloud_layer.attributes.clear();
                 point_cloud_layer.bbox = None;
             }
@@ -311,6 +318,29 @@ impl LayerKind {
         match self {
             LayerKind::Points(pc) => pc.numeric_field_names(),
             LayerKind::Vector(gl) => gl.field_names.clone(),
+        }
+    }
+    pub fn column_type_for(&self, name: &str) -> Option<AttributeType> {
+        match self {
+            LayerKind::Points(pc) => pc
+                .field_names
+                .iter()
+                .zip(pc.attributes.iter())
+                .find(|(n, _)| n.as_str() == name)
+                .map(|(_, col)| match col {
+                    AttributeColumn::Float(_) => AttributeType::Float,
+                    AttributeColumn::Integer(_) => AttributeType::Integer,
+                    AttributeColumn::Text(_) => AttributeType::Text,
+                }),
+            LayerKind::Vector(gl) => gl
+                .features
+                .first()
+                .and_then(|f| f.attributes.get(name))
+                .map(|v| match v {
+                    AttributeValue::Float(_) => AttributeType::Float,
+                    AttributeValue::Integer(_) => AttributeType::Integer,
+                    AttributeValue::Text(_) => AttributeType::Text,
+                }),
         }
     }
     pub fn index(&self, kind: IndexKind) -> Option<&SpatialIndex> {
@@ -351,6 +381,7 @@ pub struct LayerEntry {
     pub color: [u8; 3],
     pub opacity: u8,
     pub descriptor: LayerDescriptor,
+    pub filters: Vec<LayerAttributeFilter>,
 }
 impl LayerEntry {}
 

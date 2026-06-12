@@ -1,7 +1,11 @@
+use bitvec::vec::BitVec;
+use bitvec::{bitarr, bitvec, BitArr};
 use egui::{CentralPanel, Color32, UiKind};
+use futures_channel::oneshot;
 use rfd::FileHandle;
 use rstar::primitives::GeomWithData;
 use std::cell::Cell;
+use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, TryRecvError};
@@ -28,12 +32,13 @@ enum LoadMode {
 use wgpu::naga::proc::vector_size_str;
 
 use crate::basemap::BasemapCache;
-use crate::gis_layer::{BatchMessage, GisLayer, LayerEntry, LayerKind};
+use crate::gis_layer::{AttributeValue, BatchMessage, GisLayer, LayerEntry, LayerKind};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::FgbReaderCache;
 use crate::gis_reader::{GisFilePath, GisReader, LayerDescriptor};
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
+use crate::parquet::{extract_batch_as_u32, extract_u32, query_parquet};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
 use crate::quadtree::Quadtree;
 use crate::sidebar::{show_sidebar, AddAttributeForm, SidebarAction};
@@ -63,6 +68,28 @@ fn now_ms() -> f64 {
         .unwrap()
         .as_secs_f64()
         * 1000.0
+}
+#[derive(PartialEq, Clone)]
+pub enum FilterOperation {
+    LessThan,
+    GreaterThan,
+    Equal,
+}
+impl fmt::Display for FilterOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FilterOperation::Equal => write!(f, "="),
+            FilterOperation::GreaterThan => write!(f, ">"),
+            FilterOperation::LessThan => write!(f, "<"),
+        }
+    }
+}
+
+pub struct LayerAttributeFilter {
+    pub attribute: Option<String>,
+    pub operation: Option<FilterOperation>,
+    pub comparitor: AttributeValue,
+    pub comparitor_raw: String,
 }
 
 pub struct GisEditorApp {
@@ -126,6 +153,10 @@ pub struct GisEditorApp {
     streaming_features: bool,
     #[cfg(target_arch = "wasm32")]
     fgb_reader_cache: FgbReaderCache,
+    current_filters: Vec<LayerAttributeFilter>,
+    adding_filter: Option<LayerAttributeFilter>,
+    updated_filters: bool,
+    filtered_idx_rx: Option<oneshot::Receiver<(usize, Vec<u32>)>>,
 }
 
 impl GisEditorApp {
@@ -199,6 +230,10 @@ impl GisEditorApp {
             fgb_reader_cache: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             )),
+            current_filters: Vec::new(),
+            adding_filter: None,
+            updated_filters: false,
+            filtered_idx_rx: None,
         }
     }
 
@@ -299,7 +334,7 @@ fn collect_gpu_points(
     layers: &[LayerEntry],
     active_idx: Option<usize>,
     selected_id: Option<usize>,
-    viewport_bbox: Option<[f64; 4]>,
+    _viewport_bbox: Option<[f64; 4]>,
     point_size: f32,
     out: &mut Vec<GpuPoint>,
 ) {
@@ -307,8 +342,8 @@ fn collect_gpu_points(
     for (i, entry) in layers.iter().enumerate() {
         if !entry.visible
             || match &entry.data {
-                LayerKind::Points(point_cloud_layer) => false,
-                LayerKind::Vector(gis_layer) => true,
+                LayerKind::Points(_) => false,
+                LayerKind::Vector(_) => true,
             }
         {
             continue;
@@ -316,14 +351,27 @@ fn collect_gpu_points(
         let is_active = active_idx == Some(i);
         let point_cloud_layer = match &entry.data {
             LayerKind::Points(pc) => pc,
-            LayerKind::Vector(gis_layer) => panic!("Unexpected layer kind in collect_gpu_points!"),
+            LayerKind::Vector(_) => panic!("Unexpected layer kind in collect_gpu_points!"),
         };
-        let render_pts: &[[f64; 2]] = if !point_cloud_layer.viewport_points.is_empty() {
-            &point_cloud_layer.viewport_points
-        } else {
-            &point_cloud_layer.points
-        };
-        for (idx, &point) in render_pts.iter().enumerate() {
+        let visible_points = point_cloud_layer
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, (pi, pv))| {
+                point_cloud_layer.viewport_mask[*i] & point_cloud_layer.filter_mask[*i]
+            })
+            .map(|(i, (pi, pv))| pv.clone())
+            .collect::<Vec<[f64; 2]>>();
+        // let render_pts: &[[f64; 2]] = if !point_cloud_layer.viewport_mask.is_empty() {
+        //     &point_cloud_layer.viewport_mask
+        // } else {
+        //     point_cloud_layer
+        //         .points
+        //         .iter()
+        //         .map(|(i, p)| p)
+        //         .collect::<&Vec<&[f64; 2]>>()
+        // };
+        for (idx, &point) in visible_points.iter().enumerate() {
             let fill = if is_active && selected_id == Some(idx) {
                 FILL_SELECTED
             } else {
@@ -699,7 +747,7 @@ impl eframe::App for GisEditorApp {
                         if let Some(LayerKind::Points(pc)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
                         {
-                            pc.points.extend(pts);
+                            std::sync::Arc::make_mut(&mut pc.points).extend(pts);
                             if pc.attributes.is_empty() && !named_cols.is_empty() {
                                 for (name, col) in named_cols {
                                     // pc.field_names.push(name);
@@ -717,7 +765,8 @@ impl eframe::App for GisEditorApp {
                         if let Some(LayerKind::Points(pc)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
                         {
-                            pc.viewport_points.extend(pts);
+                            pts.iter()
+                                .for_each(|idx| pc.viewport_mask.set(*idx as usize, true));
                         }
                         self.points_dirty = true;
                     }
@@ -900,18 +949,22 @@ impl eframe::App for GisEditorApp {
             });
 
         // ── Sidebar (right) ───────────────────────────────────────────────────
+        let mut layer_filters = self.active_layer_idx.map(|i| &mut self.layers[i].filters);
         egui::Panel::right("sidebar")
             .min_size(260.0)
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let action = show_sidebar(
                         ui,
-                        &self.layers,
+                        &mut self.layers,
                         self.active_layer_idx,
                         self.selected_id,
                         &mut self.add_form,
                         &mut self.save_path,
                         self.selected_index_cell_data.as_ref(),
+                        // &mut layer_filters,
+                        &mut self.adding_filter,
+                        &mut self.updated_filters,
                     );
 
                     match action {
@@ -949,6 +1002,87 @@ impl eframe::App for GisEditorApp {
                     }
                 });
             });
+
+        if self.updated_filters {
+            let layer = &mut self.layers[self.active_layer_idx.unwrap()];
+            let idx = self.active_layer_idx.unwrap().clone();
+            match layer.filters.len() {
+                0 => {
+                    layer.data.reset_filter_mask();
+                    self.points_dirty = true;
+                    self.updated_filters = false;
+                    // ui.request_repaint();
+                }
+                _ => {
+                    let query = format!(
+                        "SELECT idx,{} from layer WHERE {}",
+                        layer.data.field_names().join(","),
+                        layer
+                            .filters
+                            .iter()
+                            .map(|f| {
+                                format!(
+                                    "{} {} {}",
+                                    f.attribute.clone().unwrap(),
+                                    f.operation.clone().unwrap().to_string(),
+                                    f.comparitor_raw
+                                )
+                            })
+                            .collect::<Vec<String>>()
+                            .join(" and ")
+                    );
+                    println!("{}", query);
+                    let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
+                    self.filtered_idx_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            let matching_ids =
+                                match query_parquet("./assets/output.parquet", query).await {
+                                    Ok(batch_vec) => {
+                                        println!("Ok Query!");
+                                        batch_vec
+                                            .iter()
+                                            .filter_map(|b| extract_batch_as_u32(b, "idx"))
+                                            .flatten()
+                                            .collect::<Vec<u32>>()
+                                    }
+                                    Err(e) => {
+                                        println!("{:?}", e);
+                                        Vec::new()
+                                    }
+                                };
+                            println!("Thread DOne!");
+                            let _ = tx.send((idx, matching_ids));
+                        });
+                    });
+                    self.updated_filters = false;
+                }
+            };
+        }
+        if let Some(rx) = &mut self.filtered_idx_rx {
+            match rx.try_recv() {
+                Ok(Some((layer_idx, idx_vec))) => {
+                    println!("{}", idx_vec.len());
+                    if let Some(l) = self.layers.get_mut(layer_idx) {
+                        match &mut l.data {
+                            LayerKind::Points(point_cloud_layer) => {
+                                let mut mask: BitVec = bitvec![0;point_cloud_layer.points.len()];
+                                idx_vec.iter().for_each(|idx| mask.set(*idx as usize, true));
+                                point_cloud_layer.filter_mask &= mask;
+                                self.points_dirty = true;
+                                ui.request_repaint();
+                            }
+                            LayerKind::Vector(_) => {}
+                        }
+                    }
+                }
+                Ok(None) => {
+                    println!("Not Ready Yet")
+                }
+                Err(e) => self.filtered_idx_rx = None,
+            }
+        }
 
         // ── Rebuild quadtree when split-density slider changes ────────────────
         if self.spatial_index_split_density != self.last_split_density {
@@ -992,6 +1126,8 @@ impl eframe::App for GisEditorApp {
             if viewport_changed {
                 self.viewport_stable_frames = 0;
                 self.viewport_load_pending = true;
+                self.last_viewport_center = self.viewport.center;
+                self.last_viewport_ppu = self.viewport.pixels_per_unit;
             } else if self.viewport_load_pending {
                 self.viewport_stable_frames += 1;
             }
@@ -999,11 +1135,13 @@ impl eframe::App for GisEditorApp {
                 ui.ctx().request_repaint();
             }
 
+            let viewport_reload_ready =
+                self.viewport_load_pending && self.viewport_stable_frames >= 3;
             if self.points_dirty
                 || layer_changed
                 || selection_changed
                 || size_changed
-                || viewport_changed
+                || viewport_reload_ready
             {
                 if let Some(wrs) = frame.wgpu_render_state() {
                     let device = &wrs.device;
@@ -1051,8 +1189,9 @@ impl eframe::App for GisEditorApp {
                     .viewport_bbox(self.last_canvas_rect.clone().unwrap());
                 for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
                     if let LayerKind::Points(pc) = &mut layer.data {
-                        pc.viewport_points.clear();
-                        let pts_clone = pc.points.clone();
+                        // pc.viewport_mask.clear();
+                        pc.viewport_mask.set_elements(0);
+                        let pts_clone = Arc::clone(&pc.points);
                         let idx_clone = pc.index.clone();
                         let cancel_clone = self.cancel_stream.clone();
                         let tx_clone = tx.clone();
@@ -1081,7 +1220,7 @@ impl eframe::App for GisEditorApp {
                 for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
                     if let LayerKind::Points(pc) = &mut layer.data {
                         pc.viewport_points.clear();
-                        let pts_clone = pc.points.clone();
+                        let pts_clone = Arc::clone(&pc.points);
                         let idx_clone = pc.index.clone();
                         let tx_clone = tx.clone();
                         let cancel_clone = self.cancel_stream.clone();

@@ -89,8 +89,12 @@ impl SpatialIndex {
         }
     }
 
-    pub fn points_in_bbox(&self, points: &[[f64; 2]], bbox: [f64; 4]) -> Vec<[f64; 2]> {
-        self.search(&bbox).into_iter().map(|i| points[i]).collect()
+    // pub fn points_in_bbox(&self, points: &[[f64; 2]], bbox: [f64; 4]) -> Vec<[f64; 2]> {
+    //     self.search(&bbox).into_iter().map(|i| points[i]).collect()
+    // }
+
+    pub fn points_idx_in_bbox(&self, bbox: [f64; 4]) -> Vec<u32> {
+        self.search(&bbox).into_iter().map(|i| i as u32).collect()
     }
 
     pub fn heatmap_cells(&self) -> Vec<HeatmapCell> {
