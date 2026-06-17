@@ -2435,6 +2435,7 @@ name = "gis_editor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "bitvec",
  "bytemuck",
  "console_error_panic_hook",
@@ -2453,6 +2454,7 @@ dependencies = [
  "image",
  "js-sys",
  "kernel-density-estimation",
+ "parquet",
  "pollster",
  "rand 0.10.1",
  "reqwest",

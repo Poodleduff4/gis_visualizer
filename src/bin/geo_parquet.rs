@@ -45,10 +45,20 @@ pub struct PointBatch {
     pub columns: Vec<(String, AttributeCol)>,
 }
 
+/// Candidate column name pairs to probe for lon/lat, in priority order.
+/// First pair whose both columns exist in the schema wins.
+const XY_CANDIDATES: &[(&str, &str)] = &[
+    ("x", "y"),
+    ("longitude", "latitude"),
+    ("lon", "lat"),
+    ("lng", "lat"),
+    ("long", "lat"),
+];
+
 #[derive(Debug)]
 pub enum GeometrySource {
-    /// Separate `x` and `y` float columns (current parquet style).
-    XYColumns,
+    /// Two float columns carrying x/lon and y/lat, detected by name heuristic.
+    XYColumns { x_col: String, y_col: String },
     /// Standard GeoParquet `geometry` WKB binary column.
     WkbColumn,
 }
@@ -132,9 +142,44 @@ impl GeoParquetReader {
 
     fn detect_geometry_source(schema: &datafusion::arrow::datatypes::Schema) -> GeometrySource {
         if schema.field_with_name("geometry").is_ok() {
-            GeometrySource::WkbColumn
-        } else {
-            GeometrySource::XYColumns
+            return GeometrySource::WkbColumn;
+        }
+        // Check exact candidates first, then do a substring scan for columns whose
+        // lowercased name contains "lon"/"lat" or "x"/"y" as whole words.
+        let names: Vec<String> = schema.fields().iter().map(|f| f.name().to_lowercase()).collect();
+        let orig: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Priority 1: known exact pairs
+        for (xk, yk) in XY_CANDIDATES {
+            if let (Some(xi), Some(yi)) = (
+                names.iter().position(|n| n == xk),
+                names.iter().position(|n| n == yk),
+            ) {
+                return GeometrySource::XYColumns {
+                    x_col: orig[xi].to_string(),
+                    y_col: orig[yi].to_string(),
+                };
+            }
+        }
+        // Priority 2: substring scan — find first col containing "lon"/"lng" and "lat"
+        let x_col = orig.iter().find(|n| {
+            let l = n.to_lowercase();
+            l.contains("longitude") || l.contains("_lon") || l.contains("lon_") || l == "lon" || l.contains("_lng") || l.contains("lng_")
+        });
+        let y_col = orig.iter().find(|n| {
+            let l = n.to_lowercase();
+            l.contains("latitude") || l.contains("_lat") || l.contains("lat_") || l == "lat"
+        });
+        if let (Some(x), Some(y)) = (x_col, y_col) {
+            return GeometrySource::XYColumns {
+                x_col: x.to_string(),
+                y_col: y.to_string(),
+            };
+        }
+        // Fallback: no geometry detected — caller should handle this
+        GeometrySource::XYColumns {
+            x_col: "x".to_string(),
+            y_col: "y".to_string(),
         }
     }
 
@@ -151,16 +196,29 @@ impl GeoParquetReader {
             .await?;
         let num_features = count_batches
             .first()
-            .and_then(|b| b.column(0).as_any().downcast_ref::<UInt64Array>())
-            .map(|a| a.value(0))
+            .and_then(|b| {
+                let col = b.column(0);
+                if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                    Some(a.value(0) as u64)
+                } else if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+                    Some(a.value(0))
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0);
 
-        let skip = ["x", "y", "geometry", "idx"];
+        let geom_cols: std::collections::HashSet<String> = match &geometry_source {
+            GeometrySource::XYColumns { x_col, y_col } => {
+                [x_col.clone(), y_col.clone(), "idx".to_string()].into()
+            }
+            GeometrySource::WkbColumn => ["geometry".to_string(), "idx".to_string()].into(),
+        };
         let field_names = schema
             .fields()
             .iter()
             .map(|f| f.name().clone())
-            .filter(|n| !skip.contains(&n.as_str()))
+            .filter(|n| !geom_cols.contains(n.as_str()))
             .collect();
 
         let name = std::path::Path::new(path)
@@ -224,8 +282,8 @@ impl GeoParquetReader {
         let sel = Self::build_select(&geom_src, selected_fields.as_deref(), &schema);
 
         let sql = match &geom_src {
-            GeometrySource::XYColumns => format!(
-                "SELECT {sel} FROM layer WHERE x BETWEEN {xmin} AND {xmax} AND y BETWEEN {ymin} AND {ymax}",
+            GeometrySource::XYColumns { x_col, y_col } => format!(
+                "SELECT {sel} FROM layer WHERE \"{x_col}\" BETWEEN {xmin} AND {xmax} AND \"{y_col}\" BETWEEN {ymin} AND {ymax}",
                 xmin = bbox[0], ymin = bbox[1], xmax = bbox[2], ymax = bbox[3],
             ),
             GeometrySource::WkbColumn => format!("SELECT {sel} FROM layer"),
@@ -273,9 +331,9 @@ impl GeoParquetReader {
     ) -> String {
         let mut cols = vec!["idx".to_string()];
         match geom_src {
-            GeometrySource::XYColumns => {
-                cols.push("x".to_string());
-                cols.push("y".to_string());
+            GeometrySource::XYColumns { x_col, y_col } => {
+                cols.push(x_col.clone());
+                cols.push(y_col.clone());
             }
             GeometrySource::WkbColumn => cols.push("geometry".to_string()),
         }
@@ -322,9 +380,9 @@ impl GeoParquetReader {
 
         // geometry → per-row Option<[f64;2]>
         let coords: Vec<Option<[f64; 2]>> = match geom_src {
-            GeometrySource::XYColumns => {
-                let xs = batch.column_by_name("x");
-                let ys = batch.column_by_name("y");
+            GeometrySource::XYColumns { x_col, y_col } => {
+                let xs = batch.column_by_name(x_col);
+                let ys = batch.column_by_name(y_col);
                 (0..nrows)
                     .map(|i| {
                         let x = xs.and_then(|a| extract_f64_at(a.as_ref(), i))?;

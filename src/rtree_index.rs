@@ -5,7 +5,8 @@ pub type SpatialTree = RTree<GeomWithData<[f64; 2], usize>>;
 pub fn build(coords: &[(u32, [f64; 2])]) -> SpatialTree {
     let entries = coords
         .iter()
-        .map(|(id, pt)| GeomWithData::new(*pt, *id as usize))
+        .enumerate()
+        .map(|(pos, (_, pt))| GeomWithData::new(*pt, pos))
         .collect();
     RTree::bulk_load(entries)
 }

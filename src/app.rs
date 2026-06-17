@@ -35,7 +35,7 @@ use crate::basemap::BasemapCache;
 use crate::gis_layer::{AttributeValue, BatchMessage, GisLayer, LayerEntry, LayerKind};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::FgbReaderCache;
-use crate::gis_reader::{GisFilePath, GisReader, LayerDescriptor};
+use crate::gis_reader::{GeoParquetReader, GisFilePath, GisReader, LayerDescriptor};
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
 use crate::parquet::{extract_batch_as_u32, extract_u32, query_parquet};
@@ -251,21 +251,32 @@ impl GisEditorApp {
         file_url: GisFilePath,
         tx: mpsc::SyncSender<LayerDescriptor>,
     ) -> Result<(), anyhow::Error> {
-        let GisFilePath::HttpLocation(url) = file_url else {
-            use anyhow::bail;
-
-            bail!("Wrong GisFilePath type!");
-        };
-        spawn_local(async move {
-            match GisReader::load_layer_descriptor(&url).await {
-                Ok(descriptor) => {
-                    // self.pending_bytes = Some(bytes);
-                    web_sys::console::log_1(&JsValue::from_str(&format!("{}", url)));
-                    tx.send(descriptor);
-                }
-                Err(e) => {} // self.status = format!("Error reading layers: {e}"),            }
+        match file_url {
+            GisFilePath::HttpLocation(url) => {
+                spawn_local(async move {
+                    match GisReader::load_layer_descriptor(&url).await {
+                        Ok(descriptor) => {
+                            web_sys::console::log_1(&JsValue::from_str(&format!("{}", url)));
+                            tx.send(descriptor);
+                        }
+                        Err(_e) => {}
+                    }
+                });
             }
-        });
+            GisFilePath::Bytes(bytes, name) => {
+                match GeoParquetReader::load_descriptor_from_bytes(&bytes, &name) {
+                    Ok(descriptor) => {
+                        let _ = tx.send(descriptor);
+                    }
+                    Err(e) => {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "parquet open error: {e}"
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -357,10 +368,8 @@ fn collect_gpu_points(
             .points
             .iter()
             .enumerate()
-            .filter(|(i, (pi, pv))| {
-                point_cloud_layer.viewport_mask[*i] & point_cloud_layer.filter_mask[*i]
-            })
-            .map(|(i, (pi, pv))| pv.clone())
+            .filter(|(i, (_pi, _pv))| point_cloud_layer.filter_mask[*i])
+            .map(|(_, (_pi, pv))| *pv)
             .collect::<Vec<[f64; 2]>>();
         // let render_pts: &[[f64; 2]] = if !point_cloud_layer.viewport_mask.is_empty() {
         //     &point_cloud_layer.viewport_mask
@@ -471,6 +480,8 @@ impl eframe::App for GisEditorApp {
                             if let Some(f) = pollster::block_on(
                                 rfd::AsyncFileDialog::new()
                                     .add_filter("FlatGeobuf", &["fgb"])
+                                    .add_filter("GeoParquet", &["parquet"])
+                                    .add_filter("All Supported", &["fgb", "parquet"])
                                     .pick_file(),
                             ) {
                                 let path =
@@ -481,29 +492,25 @@ impl eframe::App for GisEditorApp {
 
                         #[cfg(target_arch = "wasm32")]
                         {
-                            // let file_handle_slot = self.file_handle_slot.clone();
-                            let mut url = self.fgb_file_url.clone();
+                            let mut base_url = self.fgb_file_url.clone();
                             spawn_local(async move {
                                 if let Some(f) = rfd::AsyncFileDialog::new()
                                     .add_filter("FlatGeobuf", &["fgb"])
+                                    .add_filter("GeoParquet", &["parquet"])
+                                    .add_filter("All Supported", &["fgb", "parquet"])
                                     .pick_file()
                                     .await
                                 {
-                                    // let raw = f.inner().clone();
-                                    // // Read only first 64 KiB — enough for any FGB header.
-                                    // let blob = raw.slice_with_i32_and_i32(0, 65536).unwrap();
-                                    // let ab =
-                                    //     wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
-                                    //         .await
-                                    //         .unwrap();
-                                    // let header = js_sys::Uint8Array::new(&ab).to_vec();
-                                    // *file_handle_slot.borrow_mut() = Some(raw);
-                                    url.push_str(f.file_name().as_str());
-                                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                                        "chosen_file_name: {}",
-                                        url
-                                    )));
-                                    let _ = f_tx.send(GisFilePath::HttpLocation(url));
+                                    let name = f.file_name();
+                                    let path = if name.ends_with(".parquet") {
+                                        let raw = f.read().await;
+                                        let arc: std::sync::Arc<[u8]> = raw.into();
+                                        GisFilePath::Bytes(arc, name)
+                                    } else {
+                                        base_url.push_str(&name);
+                                        GisFilePath::HttpLocation(base_url)
+                                    };
+                                    let _ = f_tx.send(path);
                                 }
                             });
                         }
@@ -765,10 +772,11 @@ impl eframe::App for GisEditorApp {
                         if let Some(LayerKind::Points(pc)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
                         {
+                            pc.viewport_mask.set_elements(0);
                             pts.iter()
                                 .for_each(|idx| pc.viewport_mask.set(*idx as usize, true));
                         }
-                        self.points_dirty = true;
+                        // viewport_mask no longer drives GPU rendering; no points_dirty needed
                     }
                     BatchMessage::Vector(layer_idx, features) => {
                         if let Some(LayerKind::Vector(gl)) =
@@ -908,9 +916,11 @@ impl eframe::App for GisEditorApp {
                     if let Some(idx) = rebuild_rtree_idx {
                         match &mut self.layers[idx].data {
                             LayerKind::Points(pc) => pc.rebuild_rtree(),
-                            LayerKind::Vector(gl) => {}
+                            LayerKind::Vector(_) => {}
                         }
-                        self.fitted = true; // don't auto-fit viewport; would clear_layer() and invalidate the new index
+                        self.fitted = true;
+                        self.viewport_load_pending = true;
+                        self.viewport_stable_frames = 0;
                     }
                     if let Some(idx) = rebuild_quadtree_idx {
                         let capacity = self.spatial_index_split_density;
@@ -918,7 +928,9 @@ impl eframe::App for GisEditorApp {
                             LayerKind::Points(pc) => pc.rebuild_quadtree(capacity),
                             LayerKind::Vector(gl) => gl.rebuild_quadtree(capacity),
                         }
-                        self.fitted = true; // don't auto-fit viewport; would clear_layer() and invalidate the new index
+                        self.fitted = true;
+                        self.viewport_load_pending = true;
+                        self.viewport_stable_frames = 0;
                     }
                     if let Some(idx) = rebuild_uncertainty_quadtree_idx {
                         match &mut self.layers[idx].data {
@@ -941,6 +953,8 @@ impl eframe::App for GisEditorApp {
                             LayerKind::Vector(gl) => gl.rebuild_hilbert_tree(order),
                         }
                         self.fitted = true;
+                        self.viewport_load_pending = true;
+                        self.viewport_stable_frames = 0;
                     }
                     if visibility_changed {
                         self.points_dirty = true;
@@ -1067,8 +1081,17 @@ impl eframe::App for GisEditorApp {
                     if let Some(l) = self.layers.get_mut(layer_idx) {
                         match &mut l.data {
                             LayerKind::Points(point_cloud_layer) => {
+                                // idx_vec contains parquet idx column values, NOT enumerate positions.
+                                // Build a HashSet of matching parquet ids, then scan pc.points to find
+                                // their enumerate positions for filter_mask.
+                                let matching: std::collections::HashSet<u32> =
+                                    idx_vec.into_iter().collect();
                                 let mut mask: BitVec = bitvec![0;point_cloud_layer.points.len()];
-                                idx_vec.iter().for_each(|idx| mask.set(*idx as usize, true));
+                                for (pos, (parquet_id, _)) in point_cloud_layer.points.iter().enumerate() {
+                                    if matching.contains(parquet_id) {
+                                        mask.set(pos, true);
+                                    }
+                                }
                                 point_cloud_layer.filter_mask &= mask;
                                 self.points_dirty = true;
                                 ui.request_repaint();
@@ -1099,6 +1122,8 @@ impl eframe::App for GisEditorApp {
             }
             self.last_split_density = capacity;
             self.points_dirty = true;
+            self.viewport_load_pending = true;
+            self.viewport_stable_frames = 0;
         }
         if self.hilbert_order != self.last_hilbert_order {
             let order = self.hilbert_order;
@@ -1114,6 +1139,8 @@ impl eframe::App for GisEditorApp {
             }
             self.last_hilbert_order = order;
             self.points_dirty = true;
+            self.viewport_load_pending = true;
+            self.viewport_stable_frames = 0;
         }
 
         // ── Re-upload GPU points when data or style changes ───────────────────
@@ -1137,11 +1164,12 @@ impl eframe::App for GisEditorApp {
 
             let viewport_reload_ready =
                 self.viewport_load_pending && self.viewport_stable_frames >= 3;
-            if self.points_dirty
+            if (self.points_dirty
                 || layer_changed
                 || selection_changed
                 || size_changed
-                || viewport_reload_ready
+                || viewport_reload_ready)
+                && !self.streaming_features
             {
                 if let Some(wrs) = frame.wgpu_render_state() {
                     let device = &wrs.device;
@@ -1175,7 +1203,7 @@ impl eframe::App for GisEditorApp {
             }
 
             #[cfg(not(target_arch = "wasm32"))]
-            if self.viewport_load_pending && self.viewport_stable_frames >= 3 {
+            if self.viewport_load_pending && self.viewport_stable_frames >= 3 && !self.streaming_features {
                 // println!("Reloading From Index!");
                 self.viewport_load_pending = false;
                 // Cancel previous quad threads before starting new ones.
@@ -1187,17 +1215,16 @@ impl eframe::App for GisEditorApp {
                 let full_bbox = self
                     .viewport
                     .viewport_bbox(self.last_canvas_rect.clone().unwrap());
-                for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
+                for (actual_idx, layer) in self.layers.iter_mut().enumerate() {
+                    if !layer.visible { continue; }
                     if let LayerKind::Points(pc) = &mut layer.data {
-                        // pc.viewport_mask.clear();
-                        pc.viewport_mask.set_elements(0);
                         let pts_clone = Arc::clone(&pc.points);
                         let idx_clone = pc.index.clone();
                         let cancel_clone = self.cancel_stream.clone();
                         let tx_clone = tx.clone();
                         std::thread::spawn(move || {
                             crate::point_cloud_layer::query_and_stream_viewport(
-                                i,
+                                actual_idx,
                                 pts_clone,
                                 idx_clone,
                                 full_bbox,
@@ -1210,14 +1237,15 @@ impl eframe::App for GisEditorApp {
             }
 
             #[cfg(target_arch = "wasm32")]
-            if self.viewport_load_pending && self.viewport_stable_frames >= 3 {
+            if self.viewport_load_pending && self.viewport_stable_frames >= 3 && !self.streaming_features {
                 self.viewport_load_pending = false;
                 let (tx, rx) = mpsc::sync_channel(40);
                 self.load_rx = Some(rx);
                 let full_bbox = self
                     .viewport
                     .viewport_bbox(self.last_canvas_rect.clone().unwrap());
-                for (i, layer) in self.layers.iter_mut().filter(|l| l.visible).enumerate() {
+                for (actual_idx, layer) in self.layers.iter_mut().enumerate() {
+                    if !layer.visible { continue; }
                     if let LayerKind::Points(pc) = &mut layer.data {
                         pc.viewport_points.clear();
                         let pts_clone = Arc::clone(&pc.points);
@@ -1226,7 +1254,7 @@ impl eframe::App for GisEditorApp {
                         let cancel_clone = self.cancel_stream.clone();
                         spawn_local(async move {
                             crate::point_cloud_layer::query_and_stream_viewport(
-                                i,
+                                actual_idx,
                                 pts_clone,
                                 idx_clone,
                                 full_bbox,

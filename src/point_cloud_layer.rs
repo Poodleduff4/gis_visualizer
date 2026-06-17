@@ -76,15 +76,10 @@ impl PointCloudLayer {
         self.ensure_bbox();
         if let Some(bbox) = self.bbox {
             let mut qt = SpatialIndex::Quadtree(Quadtree::new(bbox, capacity));
-            let filtered_points = self
-                .points
-                .iter()
-                .filter(|(i, p)| self.filter_mask[*i as usize])
-                .map(|(i, p)| (*i, *p))
-                .collect::<Vec<(u32, [f64; 2])>>();
-
-            for (i, p) in filtered_points.iter() {
-                qt.insert(*i as usize, [p[0], p[1], p[0], p[1]]);
+            for (pos, (_, p)) in self.points.iter().enumerate() {
+                if self.filter_mask[pos] {
+                    qt.insert(pos, [p[0], p[1], p[0], p[1]]);
+                }
             }
             self.index = Some(Arc::new(qt));
         }
@@ -104,8 +99,8 @@ impl PointCloudLayer {
         self.ensure_bbox();
         if let Some(bbox) = self.bbox {
             let mut ht = SpatialIndex::HilbertCurve(HilbertRTree::new(bbox, order));
-            for (i, p) in self.points.iter() {
-                ht.insert(*i as usize, [p[0], p[1], p[0], p[1]]);
+            for (pos, (_, p)) in self.points.iter().enumerate() {
+                ht.insert(pos, [p[0], p[1], p[0], p[1]]);
             }
             self.index = Some(Arc::new(ht));
         }
@@ -260,40 +255,33 @@ pub fn query_and_stream_viewport(
     tx: mpsc::SyncSender<BatchMessage>,
     cancel: Arc<AtomicBool>,
 ) {
+    let total_pts = points.len();
+    let index_size = match &index {
+        Some(idx) => idx.len(),
+        None => 0,
+    };
+    println!("viewport_query: total_pts={total_pts} index_size={index_size} bbox={bbox:?}");
+
     let t0 = std::time::Instant::now();
     let viewport_pts: Vec<u32> = match &index {
         Some(idx) => idx.points_idx_in_bbox(bbox),
         None => Vec::new(),
-        // None => points
-        //     .iter()
-        //     .map(|(i, p)| p)
-        //     .copied()
-        //     .filter(|p| p[0] >= bbox[0] && p[0] <= bbox[2] && p[1] >= bbox[1] && p[1] <= bbox[3])
-        //     .collect(),
     };
     let filter_time = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    const BATCH: usize = 10_000;
-    let mut start = 0;
-    while start < viewport_pts.len() {
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        let end = (start + BATCH).min(viewport_pts.len());
-        tx.send(BatchMessage::ViewportPoints(
-            dest_idx,
-            viewport_pts[start..end].to_vec(),
-        ))
-        .ok();
-        start = end;
+    let pt_count = viewport_pts.len();
+    let max_pos = viewport_pts.iter().copied().max();
+    println!("viewport_query result: {pt_count} pts, max_pos={max_pos:?}, cancelled={}", cancel.load(Ordering::Relaxed));
+    if !viewport_pts.is_empty() && !cancel.load(Ordering::Relaxed) {
+        tx.send(BatchMessage::ViewportPoints(dest_idx, viewport_pts)).ok();
     }
     let send_time = t1.elapsed();
 
     println!(
         "filter: {:.2?} ({} pts) | send: {:.2?}",
         filter_time,
-        viewport_pts.len(),
+        pt_count,
         send_time,
     );
 }

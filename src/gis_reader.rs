@@ -14,11 +14,26 @@ use std::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
 
-#[cfg(target_arch = "wasm32")]
-use std::{
-    io::Cursor,
-    sync::{atomic::AtomicBool, Arc},
+// Arrow array/schema types — same crate on both targets (arrow = "53").
+// On desktop datafusion re-exports these from the same crate version.
+use arrow::array::{
+    Array, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    UInt32Array, UInt64Array,
 };
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
+use std::sync::{atomic::AtomicBool, Arc};
+
+// Desktop: DataFusion SQL engine for GeoParquet queries.
+#[cfg(not(target_arch = "wasm32"))]
+use datafusion::prelude::*;
+
+// Wasm: read parquet directly from bytes using the parquet crate.
+#[cfg(target_arch = "wasm32")]
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+#[cfg(target_arch = "wasm32")]
+use std::io::Cursor;
 
 #[cfg(target_arch = "wasm32")]
 pub type FgbReaderCache = std::rc::Rc<
@@ -34,12 +49,15 @@ use crate::{
 pub enum GisFilePath {
     LocalFile(String),
     HttpLocation(String),
+    /// In-memory bytes from a local file pick on wasm (parquet only).
+    Bytes(Arc<[u8]>, String),
 }
 impl GisFilePath {
     pub fn to_string(&self) -> String {
         match self {
             GisFilePath::LocalFile(p) => p.clone(),
             GisFilePath::HttpLocation(p) => p.clone(),
+            GisFilePath::Bytes(_, name) => name.clone(),
         }
     }
 }
@@ -117,13 +135,604 @@ impl PropertyProcessor for PropertyExtractor<'_> {
     }
 }
 
+fn is_parquet(path: &str) -> bool {
+    path.ends_with(".parquet")
+}
+
+// ── GeoParquetReader shared types and helpers ─────────────────────────────
+
+const XY_CANDIDATES: &[(&str, &str)] = &[
+    ("x", "y"),
+    ("longitude", "latitude"),
+    ("lon", "lat"),
+    ("lng", "lat"),
+    ("long", "lat"),
+];
+
+enum GeometrySource {
+    XYColumns { x_col: String, y_col: String },
+    WkbColumn,
+}
+
+fn decode_wkb_point(bytes: &[u8]) -> Option<[f64; 2]> {
+    if bytes.len() < 21 {
+        return None;
+    }
+    let le = bytes[0] == 1;
+    let geom_type = if le {
+        u32::from_le_bytes(bytes[1..5].try_into().ok()?)
+    } else {
+        u32::from_be_bytes(bytes[1..5].try_into().ok()?)
+    };
+    if geom_type != 1 {
+        return None;
+    }
+    let x = if le {
+        f64::from_le_bytes(bytes[5..13].try_into().ok()?)
+    } else {
+        f64::from_be_bytes(bytes[5..13].try_into().ok()?)
+    };
+    let y = if le {
+        f64::from_le_bytes(bytes[13..21].try_into().ok()?)
+    } else {
+        f64::from_be_bytes(bytes[13..21].try_into().ok()?)
+    };
+    Some([x, y])
+}
+
+fn pq_extract_f64(arr: &dyn Array, i: usize) -> Option<f64> {
+    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+        Some(a.value(i))
+    } else if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
+        Some(a.value(i) as f64)
+    } else {
+        None
+    }
+}
+
+fn pq_extract_i64(arr: &dyn Array, i: usize) -> Option<i64> {
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        Some(a.value(i))
+    } else if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
+        Some(a.value(i) as i64)
+    } else if let Some(a) = arr.as_any().downcast_ref::<UInt32Array>() {
+        Some(a.value(i) as i64)
+    } else {
+        None
+    }
+}
+
+fn pq_attr_col(dt: &DataType, cap: usize) -> crate::point_cloud_layer::AttributeColumn {
+    use crate::point_cloud_layer::AttributeColumn;
+    match dt {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => AttributeColumn::Integer(Vec::with_capacity(cap)),
+        DataType::Float32 | DataType::Float64 => AttributeColumn::Float(Vec::with_capacity(cap)),
+        _ => AttributeColumn::Text(Vec::with_capacity(cap)),
+    }
+}
+
+pub struct GeoParquetReader;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GeoParquetReader {
+    async fn make_ctx(path: &str) -> datafusion::error::Result<SessionContext> {
+        let config = SessionConfig::new().with_target_partitions(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        );
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_parquet("layer", path, ParquetReadOptions::default())
+            .await?;
+        Ok(ctx)
+    }
+
+    fn detect_geometry_source(schema: &datafusion::arrow::datatypes::Schema) -> GeometrySource {
+        if schema.field_with_name("geometry").is_ok() {
+            return GeometrySource::WkbColumn;
+        }
+        let names: Vec<String> = schema.fields().iter().map(|f| f.name().to_lowercase()).collect();
+        let orig: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        for (xk, yk) in XY_CANDIDATES {
+            if let (Some(xi), Some(yi)) = (
+                names.iter().position(|n| n == xk),
+                names.iter().position(|n| n == yk),
+            ) {
+                return GeometrySource::XYColumns {
+                    x_col: orig[xi].to_string(),
+                    y_col: orig[yi].to_string(),
+                };
+            }
+        }
+        // Substring scan for lon/lat-style column names
+        let x_col = orig.iter().find(|n| {
+            let l = n.to_lowercase();
+            l.contains("longitude") || l.contains("_lon") || l.contains("lon_") || l == "lon"
+                || l.contains("_lng") || l.contains("lng_")
+        });
+        let y_col = orig.iter().find(|n| {
+            let l = n.to_lowercase();
+            l.contains("latitude") || l.contains("_lat") || l.contains("lat_") || l == "lat"
+        });
+        if let (Some(x), Some(y)) = (x_col, y_col) {
+            return GeometrySource::XYColumns {
+                x_col: x.to_string(),
+                y_col: y.to_string(),
+            };
+        }
+        GeometrySource::XYColumns { x_col: "x".to_string(), y_col: "y".to_string() }
+    }
+
+    async fn load_descriptor_async(path: &str) -> anyhow::Result<LayerDescriptor> {
+        let ctx = Self::make_ctx(path).await?;
+        let schema = ctx.table("layer").await?.schema().as_arrow().clone();
+        let geom_src = Self::detect_geometry_source(&schema);
+
+        let count_batches = ctx.sql("SELECT COUNT(*) FROM layer").await?.collect().await?;
+        let num_features = count_batches
+            .first()
+            .and_then(|b| {
+                let col = b.column(0);
+                if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                    Some(a.value(0) as u64)
+                } else if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+                    Some(a.value(0))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let geom_cols: std::collections::HashSet<String> = match &geom_src {
+            GeometrySource::XYColumns { x_col, y_col } => {
+                [x_col.clone(), y_col.clone(), "idx".to_string()].into()
+            }
+            GeometrySource::WkbColumn => ["geometry".to_string(), "idx".to_string()].into(),
+        };
+        let field_names = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| !geom_cols.contains(n.as_str()))
+            .collect();
+
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("layer")
+            .to_string();
+
+        Ok(LayerDescriptor {
+            name,
+            num_features,
+            field_names,
+            geometry_type: GeometryType(1), // Point
+            location: GisFilePath::LocalFile(path.to_string()),
+        })
+    }
+
+    pub fn load_descriptor(path: &str) -> anyhow::Result<LayerDescriptor> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(Self::load_descriptor_async(path))
+    }
+
+    fn build_select(
+        geom_src: &GeometrySource,
+        selected_fields: Option<&[String]>,
+        schema: &datafusion::arrow::datatypes::Schema,
+    ) -> String {
+        let mut cols = vec!["idx".to_string()];
+        match geom_src {
+            GeometrySource::XYColumns { x_col, y_col } => {
+                cols.push(x_col.clone());
+                cols.push(y_col.clone());
+            }
+            GeometrySource::WkbColumn => cols.push("geometry".to_string()),
+        }
+        if let Some(fields) = selected_fields {
+            for f in fields {
+                if schema.field_with_name(f).is_ok() {
+                    cols.push(f.clone());
+                }
+            }
+        }
+        cols.join(", ")
+    }
+
+    fn extract_points(
+        batch: &RecordBatch,
+        dest_idx: usize,
+        geom_src: &GeometrySource,
+        bbox_filter: Option<[f64; 4]>,
+        selected_fields: Option<&[String]>,
+    ) -> anyhow::Result<Option<crate::gis_layer::BatchMessage>> {
+        use crate::gis_layer::BatchMessage;
+        use crate::point_cloud_layer::AttributeColumn;
+
+        let nrows = batch.num_rows();
+        if nrows == 0 {
+            return Ok(None);
+        }
+
+        let ids: Vec<u32> = match batch.column_by_name("idx") {
+            Some(c) => {
+                if let Some(a) = c.as_any().downcast_ref::<UInt32Array>() {
+                    a.values().to_vec()
+                } else if let Some(a) = c.as_any().downcast_ref::<Int32Array>() {
+                    a.values().iter().map(|v| *v as u32).collect()
+                } else if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
+                    a.values().iter().map(|v| *v as u32).collect()
+                } else {
+                    (0..nrows as u32).collect()
+                }
+            }
+            None => (0..nrows as u32).collect(),
+        };
+
+        let coords: Vec<Option<[f64; 2]>> = match geom_src {
+            GeometrySource::XYColumns { x_col, y_col } => {
+                let xs = batch.column_by_name(x_col);
+                let ys = batch.column_by_name(y_col);
+                (0..nrows)
+                    .map(|i| {
+                        let x = xs.and_then(|a| pq_extract_f64(a.as_ref(), i))?;
+                        let y = ys.and_then(|a| pq_extract_f64(a.as_ref(), i))?;
+                        Some([x, y])
+                    })
+                    .collect()
+            }
+            GeometrySource::WkbColumn => {
+                let geom_col = batch.column_by_name("geometry");
+                (0..nrows)
+                    .map(|i| {
+                        let arr = geom_col?.as_any().downcast_ref::<BinaryArray>()?;
+                        decode_wkb_point(arr.value(i))
+                    })
+                    .collect()
+            }
+        };
+
+        let mut columns: Vec<(String, AttributeColumn)> = match selected_fields {
+            Some(fields) => fields
+                .iter()
+                .filter_map(|f| {
+                    let idx = batch.schema().index_of(f).ok()?;
+                    let dt = batch.schema().field(idx).data_type().clone();
+                    Some((f.clone(), pq_attr_col(&dt, nrows)))
+                })
+                .collect(),
+            None => vec![],
+        };
+
+        let mut points: Vec<(u32, [f64; 2])> = Vec::with_capacity(nrows);
+        for i in 0..nrows {
+            let Some(xy) = coords[i] else { continue };
+            if let Some(bb) = bbox_filter {
+                if xy[0] < bb[0] || xy[0] > bb[2] || xy[1] < bb[1] || xy[1] > bb[3] {
+                    continue;
+                }
+            }
+            points.push((ids[i], xy));
+            for (name, col) in &mut columns {
+                let arr = batch.column_by_name(name);
+                match col {
+                    AttributeColumn::Integer(v) => {
+                        v.push(arr.and_then(|a| pq_extract_i64(a.as_ref(), i)).unwrap_or(0));
+                    }
+                    AttributeColumn::Float(v) => {
+                        v.push(arr.and_then(|a| pq_extract_f64(a.as_ref(), i)).unwrap_or(0.0));
+                    }
+                    AttributeColumn::Text(v) => {
+                        let val = arr
+                            .and_then(|a| {
+                                a.as_any()
+                                    .downcast_ref::<StringArray>()
+                                    .map(|sa| sa.value(i).to_string())
+                            })
+                            .unwrap_or_default();
+                        v.push(val);
+                    }
+                }
+            }
+        }
+
+        if points.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(BatchMessage::Points(dest_idx, points, columns)))
+    }
+
+    async fn load_point_layer_batched_async(
+        path: &str,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<crate::gis_layer::BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let ctx = Self::make_ctx(path).await?;
+        let schema = ctx.table("layer").await?.schema().as_arrow().clone();
+        let geom_src = Self::detect_geometry_source(&schema);
+        let sel = Self::build_select(&geom_src, selected_fields.as_deref(), &schema);
+
+        let batches = ctx
+            .sql(&format!("SELECT {} FROM layer", sel))
+            .await?
+            .collect()
+            .await?;
+
+        for batch in &batches {
+            if let Some(msg) = Self::extract_points(batch, dest_idx, &geom_src, None, selected_fields.as_deref())? {
+                tx.send(msg).ok();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_point_layer_batched(
+        path: &str,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<crate::gis_layer::BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(Self::load_point_layer_batched_async(path, dest_idx, tx, selected_fields))
+    }
+
+    /// Bbox-filtered stream. XY-column files push bbox into SQL; WKB files filter in Rust.
+    pub async fn stream_bbox(
+        path: &str,
+        bbox: [f64; 4],
+        dest_idx: usize,
+        tx: mpsc::SyncSender<crate::gis_layer::BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+        cancel: Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let ctx = Self::make_ctx(path).await?;
+        let schema = ctx.table("layer").await?.schema().as_arrow().clone();
+        let geom_src = Self::detect_geometry_source(&schema);
+        let sel = Self::build_select(&geom_src, selected_fields.as_deref(), &schema);
+
+        let sql = match &geom_src {
+            GeometrySource::XYColumns { x_col, y_col } => format!(
+                "SELECT {sel} FROM layer WHERE \"{x_col}\" BETWEEN {xmin} AND {xmax} AND \"{y_col}\" BETWEEN {ymin} AND {ymax}",
+                xmin = bbox[0], ymin = bbox[1], xmax = bbox[2], ymax = bbox[3],
+            ),
+            GeometrySource::WkbColumn => format!("SELECT {sel} FROM layer"),
+        };
+
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        for batch in &batches {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let wkb_bbox = matches!(geom_src, GeometrySource::WkbColumn).then_some(bbox);
+            if let Some(msg) = Self::extract_points(batch, dest_idx, &geom_src, wkb_bbox, selected_fields.as_deref())? {
+                tx.send(msg).ok();
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── GeoParquetReader — wasm impl (reads from in-memory bytes) ────────────
+
+#[cfg(target_arch = "wasm32")]
+impl GeoParquetReader {
+    fn detect_geometry_source(schema: &arrow::datatypes::Schema) -> GeometrySource {
+        if schema.field_with_name("geometry").is_ok() {
+            return GeometrySource::WkbColumn;
+        }
+        let names: Vec<String> =
+            schema.fields().iter().map(|f| f.name().to_lowercase()).collect();
+        let orig: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        for (xk, yk) in XY_CANDIDATES {
+            if let (Some(xi), Some(yi)) = (
+                names.iter().position(|n| n == xk),
+                names.iter().position(|n| n == yk),
+            ) {
+                return GeometrySource::XYColumns {
+                    x_col: orig[xi].to_string(),
+                    y_col: orig[yi].to_string(),
+                };
+            }
+        }
+        let x_col = orig.iter().find(|n| {
+            let l = n.to_lowercase();
+            l.contains("longitude") || l.contains("_lon") || l.contains("lon_") || l == "lon"
+                || l.contains("_lng") || l.contains("lng_")
+        });
+        let y_col = orig.iter().find(|n| {
+            let l = n.to_lowercase();
+            l.contains("latitude") || l.contains("_lat") || l.contains("lat_") || l == "lat"
+        });
+        if let (Some(x), Some(y)) = (x_col, y_col) {
+            return GeometrySource::XYColumns {
+                x_col: x.to_string(),
+                y_col: y.to_string(),
+            };
+        }
+        GeometrySource::XYColumns { x_col: "x".to_string(), y_col: "y".to_string() }
+    }
+
+    fn extract_points_from_batch(
+        batch: &RecordBatch,
+        dest_idx: usize,
+        geom_src: &GeometrySource,
+        bbox_filter: Option<[f64; 4]>,
+        selected_fields: Option<&[String]>,
+    ) -> anyhow::Result<Option<crate::gis_layer::BatchMessage>> {
+        use crate::gis_layer::BatchMessage;
+        use crate::point_cloud_layer::AttributeColumn;
+
+        let nrows = batch.num_rows();
+        if nrows == 0 {
+            return Ok(None);
+        }
+        let ids: Vec<u32> = match batch.column_by_name("idx") {
+            Some(c) => {
+                if let Some(a) = c.as_any().downcast_ref::<UInt32Array>() {
+                    a.values().to_vec()
+                } else if let Some(a) = c.as_any().downcast_ref::<Int32Array>() {
+                    a.values().iter().map(|v| *v as u32).collect()
+                } else if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
+                    a.values().iter().map(|v| *v as u32).collect()
+                } else {
+                    (0..nrows as u32).collect()
+                }
+            }
+            None => (0..nrows as u32).collect(),
+        };
+        let coords: Vec<Option<[f64; 2]>> = match geom_src {
+            GeometrySource::XYColumns { x_col, y_col } => {
+                let xs = batch.column_by_name(x_col);
+                let ys = batch.column_by_name(y_col);
+                (0..nrows)
+                    .map(|i| {
+                        let x = xs.and_then(|a| pq_extract_f64(a.as_ref(), i))?;
+                        let y = ys.and_then(|a| pq_extract_f64(a.as_ref(), i))?;
+                        Some([x, y])
+                    })
+                    .collect()
+            }
+            GeometrySource::WkbColumn => {
+                let geom_col = batch.column_by_name("geometry");
+                (0..nrows)
+                    .map(|i| {
+                        let arr = geom_col?.as_any().downcast_ref::<BinaryArray>()?;
+                        decode_wkb_point(arr.value(i))
+                    })
+                    .collect()
+            }
+        };
+        let mut columns: Vec<(String, AttributeColumn)> = match selected_fields {
+            Some(fields) => fields
+                .iter()
+                .filter_map(|f| {
+                    let idx = batch.schema().index_of(f).ok()?;
+                    let dt = batch.schema().field(idx).data_type().clone();
+                    Some((f.clone(), pq_attr_col(&dt, nrows)))
+                })
+                .collect(),
+            None => vec![],
+        };
+        let mut points: Vec<(u32, [f64; 2])> = Vec::with_capacity(nrows);
+        for i in 0..nrows {
+            let Some(xy) = coords[i] else { continue };
+            if let Some(bb) = bbox_filter {
+                if xy[0] < bb[0] || xy[0] > bb[2] || xy[1] < bb[1] || xy[1] > bb[3] {
+                    continue;
+                }
+            }
+            points.push((ids[i], xy));
+            for (name, col) in &mut columns {
+                let arr = batch.column_by_name(name);
+                match col {
+                    AttributeColumn::Integer(v) => {
+                        v.push(arr.and_then(|a| pq_extract_i64(a.as_ref(), i)).unwrap_or(0));
+                    }
+                    AttributeColumn::Float(v) => {
+                        v.push(arr.and_then(|a| pq_extract_f64(a.as_ref(), i)).unwrap_or(0.0));
+                    }
+                    AttributeColumn::Text(v) => {
+                        let val = arr
+                            .and_then(|a| {
+                                a.as_any()
+                                    .downcast_ref::<StringArray>()
+                                    .map(|sa| sa.value(i).to_string())
+                            })
+                            .unwrap_or_default();
+                        v.push(val);
+                    }
+                }
+            }
+        }
+        if points.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(BatchMessage::Points(dest_idx, points, columns)))
+    }
+
+    pub fn load_descriptor_from_bytes(bytes: &[u8], name: &str) -> anyhow::Result<LayerDescriptor> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let bytes = ::bytes::Bytes::copy_from_slice(bytes);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+        let schema = builder.schema().as_ref().clone();
+        let num_features = builder.metadata().file_metadata().num_rows() as u64;
+        let geom_src = Self::detect_geometry_source(&schema);
+        let geom_cols: std::collections::HashSet<String> = match &geom_src {
+            GeometrySource::XYColumns { x_col, y_col } => {
+                [x_col.clone(), y_col.clone(), "idx".to_string()].into()
+            }
+            GeometrySource::WkbColumn => ["geometry".to_string(), "idx".to_string()].into(),
+        };
+        let field_names = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|n| !geom_cols.contains(n.as_str()))
+            .collect();
+        let display_name = std::path::Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name)
+            .to_string();
+        Ok(LayerDescriptor {
+            name: display_name,
+            num_features,
+            field_names,
+            geometry_type: flatgeobuf::GeometryType(1),
+            location: GisFilePath::Bytes(Arc::from(bytes.as_ref()), name.to_string()),
+        })
+    }
+
+    pub fn load_point_layer_batched_from_bytes(
+        bytes: Arc<[u8]>,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<crate::gis_layer::BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let pq_bytes = ::bytes::Bytes::copy_from_slice(&bytes);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(pq_bytes)?;
+        let schema = builder.schema().as_ref().clone();
+        let geom_src = Self::detect_geometry_source(&schema);
+        let reader = builder.build()?;
+        for result in reader {
+            let batch = result?;
+            if let Some(msg) = Self::extract_points_from_batch(
+                &batch,
+                dest_idx,
+                &geom_src,
+                None,
+                selected_fields.as_deref(),
+            )? {
+                tx.send(msg).ok();
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct GisReader {}
 
 impl GisReader {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_layer_descriptor(path: &str) -> anyhow::Result<LayerDescriptor> {
+        if is_parquet(path) {
+            return GeoParquetReader::load_descriptor(path);
+        }
         let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
-
         Self::make_layer_descriptor(reader.header(), GisFilePath::LocalFile(path.to_string()))
     }
 
@@ -280,6 +889,9 @@ impl GisReader {
         let GisFilePath::LocalFile(str_path) = path else {
             bail!("Wrong GisFilePath type!");
         };
+        if is_parquet(&str_path) {
+            return GeoParquetReader::load_point_layer_batched(&str_path, dest_idx, tx, selected_fields);
+        }
         let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
         Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
     }
@@ -564,6 +1176,15 @@ impl GisReader {
         if cancel_stream.load(Ordering::Relaxed) {
             return Ok(());
         }
+        // Parquet bytes path — dispatch to GeoParquetReader, skip FGB logic.
+        if let GisFilePath::Bytes(bytes, _) = path {
+            return GeoParquetReader::load_point_layer_batched_from_bytes(
+                bytes.clone(),
+                dest_idx,
+                tx,
+                selected_fields,
+            );
+        }
         let GisFilePath::HttpLocation(url) = path else {
             bail!("Wrong GisFilePath type!");
         };
@@ -690,8 +1311,12 @@ impl GisReader {
             use anyhow::bail;
             bail!("Wrong GisFilePath type!");
         };
-        let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
-        let descriptor = Self::make_layer_descriptor(reader.header(), path)?;
+        let descriptor = if is_parquet(str_path) {
+            GeoParquetReader::load_descriptor(str_path)?
+        } else {
+            let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
+            Self::make_layer_descriptor(reader.header(), path)?
+        };
         Ok(vec![Self::layer_entry_from_descriptor(
             descriptor,
             field_names,
