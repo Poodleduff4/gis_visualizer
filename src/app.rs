@@ -479,9 +479,9 @@ impl eframe::App for GisEditorApp {
                         std::thread::spawn(move || {
                             if let Some(f) = pollster::block_on(
                                 rfd::AsyncFileDialog::new()
+                                    .add_filter("All Supported", &["fgb", "parquet"])
                                     .add_filter("FlatGeobuf", &["fgb"])
                                     .add_filter("GeoParquet", &["parquet"])
-                                    .add_filter("All Supported", &["fgb", "parquet"])
                                     .pick_file(),
                             ) {
                                 let path =
@@ -1087,7 +1087,9 @@ impl eframe::App for GisEditorApp {
                                 let matching: std::collections::HashSet<u32> =
                                     idx_vec.into_iter().collect();
                                 let mut mask: BitVec = bitvec![0;point_cloud_layer.points.len()];
-                                for (pos, (parquet_id, _)) in point_cloud_layer.points.iter().enumerate() {
+                                for (pos, (parquet_id, _)) in
+                                    point_cloud_layer.points.iter().enumerate()
+                                {
                                     if matching.contains(parquet_id) {
                                         mask.set(pos, true);
                                     }
@@ -1203,7 +1205,10 @@ impl eframe::App for GisEditorApp {
             }
 
             #[cfg(not(target_arch = "wasm32"))]
-            if self.viewport_load_pending && self.viewport_stable_frames >= 3 && !self.streaming_features {
+            if self.viewport_load_pending
+                && self.viewport_stable_frames >= 3
+                && !self.streaming_features
+            {
                 // println!("Reloading From Index!");
                 self.viewport_load_pending = false;
                 // Cancel previous quad threads before starting new ones.
@@ -1216,7 +1221,9 @@ impl eframe::App for GisEditorApp {
                     .viewport
                     .viewport_bbox(self.last_canvas_rect.clone().unwrap());
                 for (actual_idx, layer) in self.layers.iter_mut().enumerate() {
-                    if !layer.visible { continue; }
+                    if !layer.visible {
+                        continue;
+                    }
                     if let LayerKind::Points(pc) = &mut layer.data {
                         let pts_clone = Arc::clone(&pc.points);
                         let idx_clone = pc.index.clone();
@@ -1237,7 +1244,10 @@ impl eframe::App for GisEditorApp {
             }
 
             #[cfg(target_arch = "wasm32")]
-            if self.viewport_load_pending && self.viewport_stable_frames >= 3 && !self.streaming_features {
+            if self.viewport_load_pending
+                && self.viewport_stable_frames >= 3
+                && !self.streaming_features
+            {
                 self.viewport_load_pending = false;
                 let (tx, rx) = mpsc::sync_channel(40);
                 self.load_rx = Some(rx);
@@ -1245,7 +1255,9 @@ impl eframe::App for GisEditorApp {
                     .viewport
                     .viewport_bbox(self.last_canvas_rect.clone().unwrap());
                 for (actual_idx, layer) in self.layers.iter_mut().enumerate() {
-                    if !layer.visible { continue; }
+                    if !layer.visible {
+                        continue;
+                    }
                     if let LayerKind::Points(pc) = &mut layer.data {
                         pc.viewport_points.clear();
                         let pts_clone = Arc::clone(&pc.points);

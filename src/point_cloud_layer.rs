@@ -113,11 +113,16 @@ impl PointCloudLayer {
             if !results.is_empty() {
                 let mut b_dist = f64::MAX;
                 let mut b_idx: Option<usize> = None;
-                for idx in results.iter() {
-                    let p = &self.points[*idx].1;
+                for idx in results
+                    .iter()
+                    .filter(|i| self.filter_mask[**i as usize])
+                    .map(|i| *i)
+                    .collect::<Vec<usize>>()
+                {
+                    let p = &self.points[idx].1;
                     let dist = ((x - p[0]).powf(2.) + (y - p[1]).powf(2.)).sqrt();
                     if dist < b_dist {
-                        b_idx = Some(*idx);
+                        b_idx = Some(idx);
                         b_dist = dist;
                     }
                 }
@@ -129,10 +134,12 @@ impl PointCloudLayer {
             let mut b_dist = f64::MAX;
             let mut b_idx: Option<usize> = None;
             for (idx, p) in self.points.iter() {
-                let dist = ((x - p[0]).powf(2.) + (y - p[1]).powf(2.)).sqrt();
-                if dist < b_dist {
-                    b_idx = Some(*idx as usize);
-                    b_dist = dist;
+                if self.filter_mask[*idx as usize] {
+                    let dist = ((x - p[0]).powf(2.) + (y - p[1]).powf(2.)).sqrt();
+                    if dist < b_dist {
+                        b_idx = Some(*idx as usize);
+                        b_dist = dist;
+                    }
                 }
             }
             return b_idx;
@@ -158,20 +165,30 @@ impl PointCloudLayer {
         let Some(bbox) = self.bbox else { return };
         let field_idx = self.field_names.iter().position(|n| n == &attribute);
         let mut uq = UncertaintyQuadtree::new(bbox, attribute.clone(), threshold, measurement_type);
-        uq.insert_batch(self.points.iter().map(|(i, p)| {
-            let value = field_idx
-                .and_then(|fi| self.attributes.get(fi))
-                .map(|col| match col {
-                    AttributeColumn::Float(v) => v.get(*i as usize).copied().unwrap_or(0.0),
-                    AttributeColumn::Integer(v) => v.get(*i as usize).copied().unwrap_or(0) as f64,
-                    AttributeColumn::Text(_) => 0.0,
-                })
-                .unwrap_or_else(|| {
-                    eprintln!("attribute '{}' not found", attribute);
-                    0.0
-                });
-            (*i as usize, [p[0], p[1], p[0], p[1]], value)
+        uq.insert_batch(self.points.iter().enumerate().filter_map(|(idx, (i, p))| {
+            match self.filter_mask[idx] {
+                true => {
+                    let value = field_idx
+                        .and_then(|fi| self.attributes.get(fi))
+                        .map(|col| match col {
+                            AttributeColumn::Float(v) => {
+                                v.get(idx as usize).copied().unwrap_or(0.0)
+                            }
+                            AttributeColumn::Integer(v) => {
+                                v.get(idx as usize).copied().unwrap_or(0) as f64
+                            }
+                            AttributeColumn::Text(_) => 0.0,
+                        })
+                        .unwrap_or_else(|| {
+                            eprintln!("attribute '{}' not found", attribute);
+                            0.0
+                        });
+                    Some((*i as usize, [p[0], p[1], p[0], p[1]], value))
+                }
+                false => None,
+            }
         }));
+
         self.index = Some(Arc::new(SpatialIndex::UncertaintyQuadtree(uq)));
     }
 
@@ -272,16 +289,18 @@ pub fn query_and_stream_viewport(
     let t1 = std::time::Instant::now();
     let pt_count = viewport_pts.len();
     let max_pos = viewport_pts.iter().copied().max();
-    println!("viewport_query result: {pt_count} pts, max_pos={max_pos:?}, cancelled={}", cancel.load(Ordering::Relaxed));
+    println!(
+        "viewport_query result: {pt_count} pts, max_pos={max_pos:?}, cancelled={}",
+        cancel.load(Ordering::Relaxed)
+    );
     if !viewport_pts.is_empty() && !cancel.load(Ordering::Relaxed) {
-        tx.send(BatchMessage::ViewportPoints(dest_idx, viewport_pts)).ok();
+        tx.send(BatchMessage::ViewportPoints(dest_idx, viewport_pts))
+            .ok();
     }
     let send_time = t1.elapsed();
 
     println!(
         "filter: {:.2?} ({} pts) | send: {:.2?}",
-        filter_time,
-        pt_count,
-        send_time,
+        filter_time, pt_count, send_time,
     );
 }
