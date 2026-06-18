@@ -667,6 +667,7 @@ impl GeoParquetReader {
     pub fn load_descriptor_from_bytes(bytes: &[u8], name: &str) -> anyhow::Result<LayerDescriptor> {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let bytes = ::bytes::Bytes::copy_from_slice(bytes);
+        let raw: Arc<[u8]> = Arc::from(bytes.as_ref());
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
         let schema = builder.schema().as_ref().clone();
         let num_features = builder.metadata().file_metadata().num_rows() as u64;
@@ -693,7 +694,7 @@ impl GeoParquetReader {
             num_features,
             field_names,
             geometry_type: flatgeobuf::GeometryType(1),
-            location: GisFilePath::Bytes(Arc::from(bytes.as_ref()), name.to_string()),
+            location: GisFilePath::Bytes(raw, name.to_string()),
         })
     }
 

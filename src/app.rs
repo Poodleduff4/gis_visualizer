@@ -38,6 +38,7 @@ use crate::gis_reader::FgbReaderCache;
 use crate::gis_reader::{GeoParquetReader, GisFilePath, GisReader, LayerDescriptor};
 use crate::heatmap::HeatmapLayer;
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::parquet::{extract_batch_as_u32, extract_u32, query_parquet};
 use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
 use crate::quadtree::Quadtree;
@@ -675,6 +676,10 @@ impl eframe::App for GisEditorApp {
             let rect_clone = self
                 .viewport
                 .viewport_bbox(self.last_canvas_rect.clone().unwrap());
+            // wasm: large capacity so synchronous senders never block the single thread
+            #[cfg(target_arch = "wasm32")]
+            let (load_tx, load_rx) = mpsc::sync_channel::<BatchMessage>(100_000);
+            #[cfg(not(target_arch = "wasm32"))]
             let (load_tx, load_rx) = mpsc::sync_channel::<BatchMessage>(10);
             self.load_rx = Some(load_rx);
             let cancel_clone = self.cancel_stream.clone();
@@ -707,39 +712,57 @@ impl eframe::App for GisEditorApp {
             });
             #[cfg(target_arch = "wasm32")]
             spawn_local(async move {
-                // let file = wasm_file.expect("no file handle for batch load");
-                // let ab = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
-                //     .await
-                //     .expect("failed to read file bytes");
-                // let bytes: std::sync::Arc<[u8]> =
-                //     std::sync::Arc::from(js_sys::Uint8Array::new(&ab).to_vec());
+                web_sys::console::log_1(&JsValue::from_str("spawn_local: starting load"));
                 for (pos, file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
-                    let result = if is_points[pos] {
-                        GisReader::stream_fgb_bbox(
-                            &path_clone,
-                            rect_clone,
-                            file_idx,
-                            dest,
-                            load_tx.clone(),
-                            attr_fields.clone(),
-                            cancel_clone.clone(),
-                            reader_cache_for_load.clone(),
-                        )
-                        .await
-                    } else {
-                        // GisReader::load_layer_batched(
-                        //     bytes.clone(),
-                        //     file_idx,
-                        //     dest,
-                        //     load_tx.clone(),
-                        //     attr_fields.clone(),
-                        // )
-                        // .await
-                        Ok(())
-                    };
+                    let result: anyhow::Result<()> =
+                        match &path_clone {
+                            crate::gis_reader::GisFilePath::Bytes(bytes, _) => {
+                                web_sys::console::log_1(&JsValue::from_str(&format!(
+                                    "spawn_local: loading parquet bytes={} is_points={}",
+                                    bytes.len(), is_points[pos]
+                                )));
+                                if is_points[pos] {
+                                    let r = crate::gis_reader::GeoParquetReader::load_point_layer_batched_from_bytes(
+                                        bytes.clone(),
+                                        dest,
+                                        load_tx.clone(),
+                                        attr_fields.clone(),
+                                    );
+                                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                                        "spawn_local: load result ok={}", r.is_ok()
+                                    )));
+                                    if let Err(ref e) = r {
+                                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                                            "spawn_local: load error: {e}"
+                                        )));
+                                    }
+                                    r
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                            _ => {
+                                if is_points[pos] {
+                                    GisReader::stream_fgb_bbox(
+                                        &path_clone,
+                                        rect_clone,
+                                        file_idx,
+                                        dest,
+                                        load_tx.clone(),
+                                        attr_fields.clone(),
+                                        cancel_clone.clone(),
+                                        reader_cache_for_load.clone(),
+                                    )
+                                    .await
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        };
                     let _ = result;
                 }
+                web_sys::console::log_1(&JsValue::from_str("spawn_local: done"));
             });
             // self.load_rx = Some(rx);
         } else if cancel_pending {
@@ -751,13 +774,17 @@ impl eframe::App for GisEditorApp {
             for msg in load_rx.try_iter() {
                 match msg {
                     BatchMessage::Points(layer_idx, pts, named_cols) => {
+                        #[cfg(target_arch = "wasm32")]
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "BatchMessage::Points layer={layer_idx} count={}", pts.len()
+                        )));
                         if let Some(LayerKind::Points(pc)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
                         {
                             std::sync::Arc::make_mut(&mut pc.points).extend(pts);
                             if pc.attributes.is_empty() && !named_cols.is_empty() {
-                                for (name, col) in named_cols {
-                                    // pc.field_names.push(name);
+                                pc.field_names = named_cols.iter().map(|(n, _)| n.clone()).collect();
+                                for (_, col) in named_cols {
                                     pc.attributes.push(col);
                                 }
                             } else {
@@ -1028,48 +1055,103 @@ impl eframe::App for GisEditorApp {
                     // ui.request_repaint();
                 }
                 _ => {
-                    let query = format!(
-                        "SELECT idx,{} from layer WHERE {}",
-                        layer.data.field_names().join(","),
-                        layer
-                            .filters
-                            .iter()
-                            .map(|f| {
-                                format!(
-                                    "{} {} {}",
-                                    f.attribute.clone().unwrap(),
-                                    f.operation.clone().unwrap().to_string(),
-                                    f.comparitor_raw
-                                )
-                            })
-                            .collect::<Vec<String>>()
-                            .join(" and ")
-                    );
-                    println!("{}", query);
-                    let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
-                    self.filtered_idx_rx = Some(rx);
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                            let matching_ids =
-                                match query_parquet("./assets/output.parquet", query).await {
-                                    Ok(batch_vec) => {
-                                        println!("Ok Query!");
-                                        batch_vec
-                                            .iter()
-                                            .filter_map(|b| extract_batch_as_u32(b, "idx"))
-                                            .flatten()
-                                            .collect::<Vec<u32>>()
-                                    }
-                                    Err(e) => {
-                                        println!("{:?}", e);
-                                        Vec::new()
-                                    }
-                                };
-                            println!("Thread DOne!");
-                            let _ = tx.send((idx, matching_ids));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let query = format!(
+                            "SELECT idx,{} from layer WHERE {}",
+                            layer.data.field_names().join(","),
+                            layer
+                                .filters
+                                .iter()
+                                .map(|f| {
+                                    format!(
+                                        "{} {} {}",
+                                        f.attribute.clone().unwrap(),
+                                        f.operation.clone().unwrap().to_string(),
+                                        f.comparitor_raw
+                                    )
+                                })
+                                .collect::<Vec<String>>()
+                                .join(" and ")
+                        );
+                        println!("{}", query);
+                        let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
+                        self.filtered_idx_rx = Some(rx);
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            rt.block_on(async {
+                                let matching_ids =
+                                    match query_parquet("./assets/output.parquet", query).await {
+                                        Ok(batch_vec) => {
+                                            println!("Ok Query!");
+                                            batch_vec
+                                                .iter()
+                                                .filter_map(|b| extract_batch_as_u32(b, "idx"))
+                                                .flatten()
+                                                .collect::<Vec<u32>>()
+                                        }
+                                        Err(e) => {
+                                            println!("{:?}", e);
+                                            Vec::new()
+                                        }
+                                    };
+                                println!("Thread DOne!");
+                                let _ = tx.send((idx, matching_ids));
+                            });
                         });
-                    });
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use crate::point_cloud_layer::AttributeColumn;
+                        let matching_ids: Vec<u32> =
+                            if let LayerKind::Points(pc) = &layer.data {
+                                let filters = &layer.filters;
+                                let field_names = &pc.field_names;
+                                let attributes = &pc.attributes;
+                                pc.points
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(pos, (parquet_id, _))| {
+                                        let passes = filters.iter().all(|f| {
+                                            let Some(attr) = f.attribute.as_deref() else { return false; };
+                                            let Some(col_pos) = field_names.iter().position(|n| n == attr) else { return false; };
+                                            let Some(col) = attributes.get(col_pos) else { return false; };
+                                            let raw = &f.comparitor_raw;
+                                            match (&f.operation, col) {
+                                                (Some(FilterOperation::GreaterThan), AttributeColumn::Float(v)) => {
+                                                    raw.parse::<f64>().map(|t| v[pos] > t).unwrap_or(false)
+                                                }
+                                                (Some(FilterOperation::LessThan), AttributeColumn::Float(v)) => {
+                                                    raw.parse::<f64>().map(|t| v[pos] < t).unwrap_or(false)
+                                                }
+                                                (Some(FilterOperation::Equal), AttributeColumn::Float(v)) => {
+                                                    raw.parse::<f64>().map(|t| (v[pos] - t).abs() < 1e-9).unwrap_or(false)
+                                                }
+                                                (Some(FilterOperation::GreaterThan), AttributeColumn::Integer(v)) => {
+                                                    raw.parse::<i64>().map(|t| v[pos] > t).unwrap_or(false)
+                                                }
+                                                (Some(FilterOperation::LessThan), AttributeColumn::Integer(v)) => {
+                                                    raw.parse::<i64>().map(|t| v[pos] < t).unwrap_or(false)
+                                                }
+                                                (Some(FilterOperation::Equal), AttributeColumn::Integer(v)) => {
+                                                    raw.parse::<i64>().map(|t| v[pos] == t).unwrap_or(false)
+                                                }
+                                                (Some(FilterOperation::Equal), AttributeColumn::Text(v)) => {
+                                                    v[pos] == *raw
+                                                }
+                                                _ => false,
+                                            }
+                                        });
+                                        if passes { Some(*parquet_id) } else { None }
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                        let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
+                        self.filtered_idx_rx = Some(rx);
+                        let _ = tx.send((idx, matching_ids));
+                    }
                     self.updated_filters = false;
                 }
             };
@@ -1259,7 +1341,7 @@ impl eframe::App for GisEditorApp {
                         continue;
                     }
                     if let LayerKind::Points(pc) = &mut layer.data {
-                        pc.viewport_points.clear();
+                        // pc.viewport_points.clear();
                         let pts_clone = Arc::clone(&pc.points);
                         let idx_clone = pc.index.clone();
                         let tx_clone = tx.clone();

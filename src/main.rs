@@ -6,6 +6,7 @@ mod heatmap;
 mod hilbert_curve;
 mod hilbert_r_tree;
 mod map_view;
+#[cfg(not(target_arch = "wasm32"))]
 mod parquet;
 mod point_cloud;
 mod point_cloud_layer;

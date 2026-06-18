@@ -279,14 +279,11 @@ pub fn query_and_stream_viewport(
     };
     println!("viewport_query: total_pts={total_pts} index_size={index_size} bbox={bbox:?}");
 
-    let t0 = std::time::Instant::now();
     let viewport_pts: Vec<u32> = match &index {
         Some(idx) => idx.points_idx_in_bbox(bbox),
         None => Vec::new(),
     };
-    let filter_time = t0.elapsed();
 
-    let t1 = std::time::Instant::now();
     let pt_count = viewport_pts.len();
     let max_pos = viewport_pts.iter().copied().max();
     println!(
@@ -297,10 +294,4 @@ pub fn query_and_stream_viewport(
         tx.send(BatchMessage::ViewportPoints(dest_idx, viewport_pts))
             .ok();
     }
-    let send_time = t1.elapsed();
-
-    println!(
-        "filter: {:.2?} ({} pts) | send: {:.2?}",
-        filter_time, pt_count, send_time,
-    );
 }
