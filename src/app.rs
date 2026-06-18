@@ -93,6 +93,17 @@ pub struct LayerAttributeFilter {
     pub comparitor_raw: String,
 }
 
+pub struct HistogramState {
+    pub field: String,
+    pub counts: Vec<u32>,
+    pub bin_edges: Vec<f64>,
+    pub min: f64,
+    pub max: f64,
+    pub range_lo: f64,
+    pub range_hi: f64,
+    pub filtered_only: bool,
+}
+
 pub struct GisEditorApp {
     layers: Vec<LayerEntry>,
     active_layer_idx: Option<usize>,
@@ -158,6 +169,9 @@ pub struct GisEditorApp {
     adding_filter: Option<LayerAttributeFilter>,
     updated_filters: bool,
     filtered_idx_rx: Option<oneshot::Receiver<(usize, Vec<u32>)>>,
+    histogram: Option<HistogramState>,
+    show_histogram: bool,
+    histogram_field: String,
 }
 
 impl GisEditorApp {
@@ -235,7 +249,60 @@ impl GisEditorApp {
             adding_filter: None,
             updated_filters: false,
             filtered_idx_rx: None,
+            histogram: None,
+            show_histogram: false,
+            histogram_field: String::new(),
         }
+    }
+
+    fn compute_histogram(
+        pc: &crate::point_cloud_layer::PointCloudLayer,
+        field: &str,
+        bin_count: usize,
+        filtered_only: bool,
+    ) -> Option<HistogramState> {
+        use crate::point_cloud_layer::AttributeColumn;
+        let col_idx = pc.field_names.iter().position(|n| n == field)?;
+        let col = pc.attributes.get(col_idx)?;
+        if matches!(col, AttributeColumn::Text(_)) {
+            return None;
+        }
+        let values: Vec<f64> = pc
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !filtered_only || pc.filter_mask[*i])
+            .map(|(i, _)| match col {
+                AttributeColumn::Float(v) => v[i],
+                AttributeColumn::Integer(v) => v[i] as f64,
+                AttributeColumn::Text(_) => 0.0,
+            })
+            .collect();
+        if values.is_empty() {
+            return None;
+        }
+        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if (max - min).abs() < 1e-12 {
+            return None;
+        }
+        let mut counts = vec![0u32; bin_count];
+        for v in &values {
+            let idx = ((v - min) / (max - min) * bin_count as f64) as usize;
+            counts[idx.min(bin_count - 1)] += 1;
+        }
+        let bin_width = (max - min) / bin_count as f64;
+        let bin_edges: Vec<f64> = (0..=bin_count).map(|i| min + i as f64 * bin_width).collect();
+        Some(HistogramState {
+            field: field.to_string(),
+            counts,
+            bin_edges,
+            min,
+            max,
+            range_lo: min,
+            range_hi: max,
+            filtered_only,
+        })
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -826,6 +893,128 @@ impl eframe::App for GisEditorApp {
             }
         }
 
+        // ── Histogram window ─────────────────────────────────────────────────
+        if self.show_histogram {
+            let mut open = true;
+            // Collect actions from the window closure; apply them after to avoid borrow conflicts.
+            let mut hist_recompute = false;
+            let mut hist_apply_filter: Option<(String, f64, f64)> = None;
+
+            egui::Window::new("Histogram")
+                .open(&mut open)
+                .resizable(true)
+                .default_size([480.0, 320.0])
+                .show(ui.ctx(), |ui| {
+                    if let Some(hist) = &mut self.histogram {
+                        ui.horizontal(|ui| {
+                            ui.label("Field:");
+                            ui.label(egui::RichText::new(&hist.field).strong());
+                            if ui.checkbox(&mut hist.filtered_only, "Filtered only").changed() {
+                                hist_recompute = true;
+                            }
+                            if ui.button("Recompute").clicked() {
+                                hist_recompute = true;
+                            }
+                        });
+
+                        let counts = hist.counts.clone();
+                        let bin_edges = hist.bin_edges.clone();
+                        let n = counts.len();
+                        let range_lo = hist.range_lo;
+                        let range_hi = hist.range_hi;
+                        egui_plot::Plot::new("histogram_plot")
+                            .height(220.0)
+                            .allow_drag(false)
+                            .allow_scroll(false)
+                            .show(ui, |plot_ui| {
+                                let bars: Vec<egui_plot::Bar> = counts
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &c)| {
+                                        let center = (bin_edges[i] + bin_edges[i + 1]) * 0.5;
+                                        let width = bin_edges[i + 1] - bin_edges[i];
+                                        egui_plot::Bar::new(center, c as f64)
+                                            .width(width * 0.95)
+                                    })
+                                    .collect();
+                                plot_ui.bar_chart(egui_plot::BarChart::new("counts", bars));
+                                plot_ui.vline(
+                                    egui_plot::VLine::new("lo", range_lo)
+                                        .color(egui::Color32::from_rgb(255, 100, 100)),
+                                );
+                                plot_ui.vline(
+                                    egui_plot::VLine::new("hi", range_hi)
+                                        .color(egui::Color32::from_rgb(100, 200, 100)),
+                                );
+                            });
+
+                        ui.separator();
+                        let speed = (hist.max - hist.min) / 200.0;
+                        let lo_max = hist.range_hi;
+                        let hi_min = hist.range_lo;
+                        ui.horizontal(|ui| {
+                            ui.label("Range:");
+                            ui.add(
+                                egui::DragValue::new(&mut hist.range_lo)
+                                    .speed(speed)
+                                    .range(hist.min..=lo_max),
+                            );
+                            ui.label("to");
+                            ui.add(
+                                egui::DragValue::new(&mut hist.range_hi)
+                                    .speed(speed)
+                                    .range(hi_min..=hist.max),
+                            );
+                            if ui.button("Apply as Range Filter").clicked() {
+                                hist_apply_filter =
+                                    Some((hist.field.clone(), hist.range_lo, hist.range_hi));
+                            }
+                        });
+                        ui.label(format!(
+                            "min: {:.4}  max: {:.4}  bins: {}",
+                            hist.min, hist.max, n
+                        ));
+                    }
+                });
+
+            if !open {
+                self.show_histogram = false;
+            }
+            if hist_recompute {
+                if let Some(idx) = self.active_layer_idx {
+                    if let LayerKind::Points(pc) = &self.layers[idx].data {
+                        let (field, filtered_only) = self
+                            .histogram
+                            .as_ref()
+                            .map(|h| (h.field.clone(), h.filtered_only))
+                            .unwrap_or_default();
+                        self.histogram = Self::compute_histogram(pc, &field, 50, filtered_only);
+                    }
+                }
+            }
+            if let Some((field, lo, hi)) = hist_apply_filter {
+                if let Some(idx) = self.active_layer_idx {
+                    let entry = &mut self.layers[idx];
+                    entry
+                        .filters
+                        .retain(|f| f.attribute.as_deref() != Some(field.as_str()));
+                    entry.filters.push(LayerAttributeFilter {
+                        attribute: Some(field.clone()),
+                        operation: Some(FilterOperation::GreaterThan),
+                        comparitor: AttributeValue::Float(lo),
+                        comparitor_raw: lo.to_string(),
+                    });
+                    entry.filters.push(LayerAttributeFilter {
+                        attribute: Some(field.clone()),
+                        operation: Some(FilterOperation::LessThan),
+                        comparitor: AttributeValue::Float(hi),
+                        comparitor_raw: hi.to_string(),
+                    });
+                    self.updated_filters = true;
+                }
+            }
+        }
+
         // ── Status bar ────────────────────────────────────────────────────────
         egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1006,6 +1195,7 @@ impl eframe::App for GisEditorApp {
                         // &mut layer_filters,
                         &mut self.adding_filter,
                         &mut self.updated_filters,
+                        &mut self.histogram_field,
                     );
 
                     match action {
@@ -1015,29 +1205,17 @@ impl eframe::App for GisEditorApp {
                             value,
                         } => {
                             // COMMENTED OUT FOR NOW BECAUSE THIS BRANCH IS MORE ABOUT VIEWING
-                            // if let Some(entry) =
-                            //     self.active_layer_idx.and_then(|i| self.layers.get_mut(i))
-                            // {
-                            //     if !entry.layer.extra_field_names.contains(&name) {
-                            //         entry.layer.extra_field_names.push(name.clone());
-                            //     }
-                            //     entry.layer.features[feature_id]
-                            //         .attributes
-                            //         .insert(name.clone(), value);
-                            //     self.status =
-                            //         format!("Added attribute '{name}' to feature #{feature_id}");
-                            // }
                         }
-                        SidebarAction::SaveAs(path) => {
+                        SidebarAction::SaveAs(_path) => {
                             // COMMENTED OUT FOR NOW BECAUSE THIS BRANCH IS MORE ABOUT VIEWING
-                            // if let Some(entry) =
-                            //     self.active_layer_idx.and_then(|i| self.layers.get(i))
-                            // {
-                            //     match entry.layer.save(&path) {
-                            //         Ok(()) => self.status = format!("Saved to {path}"),
-                            //         Err(e) => self.status = format!("Save failed: {e}"),
-                            //     }
-                            // }
+                        }
+                        SidebarAction::OpenHistogram(field) => {
+                            if let Some(idx) = self.active_layer_idx {
+                                if let LayerKind::Points(pc) = &self.layers[idx].data {
+                                    self.histogram = Self::compute_histogram(pc, &field, 50, false);
+                                    self.show_histogram = self.histogram.is_some();
+                                }
+                            }
                         }
                         SidebarAction::None => {}
                     }

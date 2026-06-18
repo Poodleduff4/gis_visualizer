@@ -26,6 +26,7 @@ pub enum SidebarAction {
         value: AttributeValue,
     },
     SaveAs(String),
+    OpenHistogram(String),
 }
 
 // ── Main sidebar widget ───────────────────────────────────────────────────────
@@ -40,7 +41,8 @@ pub fn show_sidebar(
     selected_index_cell_data: Option<&UncertaintyMeasure>,
     // current_filters: &mut Option<&mut Vec<LayerAttributeFilter>>,
     adding_filter: &mut Option<LayerAttributeFilter>,
-    mut updated_filters: &mut bool,
+    updated_filters: &mut bool,
+    histogram_field: &mut String,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
 
@@ -135,6 +137,27 @@ pub fn show_sidebar(
                 comparitor: AttributeValue::Text(String::new()),
                 comparitor_raw: String::new(),
             });
+        }
+    }
+    ui.separator();
+    ui.label(RichText::new("Distribution").strong());
+    let numeric_fields = layer.data.numeric_field_names();
+    if numeric_fields.is_empty() {
+        ui.label("No numeric fields.");
+    } else {
+        ComboBox::from_id_salt("histogram_field")
+            .selected_text(if histogram_field.is_empty() {
+                "<select field>"
+            } else {
+                histogram_field.as_str()
+            })
+            .show_ui(ui, |ui| {
+                for name in &numeric_fields {
+                    ui.selectable_value(histogram_field, name.clone(), name.as_str());
+                }
+            });
+        if ui.button("Show Histogram").clicked() && !histogram_field.is_empty() {
+            action = SidebarAction::OpenHistogram(histogram_field.clone());
         }
     }
     ui.separator();

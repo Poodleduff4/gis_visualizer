@@ -11,6 +11,7 @@ check.targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 eframe = { version = "0.34", features = ["wgpu", "wayland"] }
 egui = "0.34"
 egui-wgpu = "0.34"
+egui_plot = "0.35"
 wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 geo = "0.33"
