@@ -14,7 +14,7 @@ use crate::gis_layer::{BatchMessage, LayerEntry};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::FgbReaderCache;
 use crate::gis_reader::{GisFilePath, LayerDescriptor};
-use crate::histogram::{FieldStats, HistogramState};
+use crate::histogram::{BivariateStats, FieldStats, HistogramState};
 use crate::map_view::Viewport;
 use crate::point_cloud::{GpuPoint, PointCloudPipeline};
 use crate::sidebar::AddAttributeForm;
@@ -118,6 +118,11 @@ pub struct GisEditorApp {
     pub(super) histogram_field: String,
     pub(super) field_stats: Option<FieldStats>,
     pub(super) last_stats_field: String,
+    pub(super) bivariate: Option<BivariateStats>,
+    pub(super) show_bivariate: bool,
+    pub(super) bivariate_y_field: String,
+    /// Counts down from N after any map-relevant change; GPU callback runs while > 0 or cursor is in map.
+    pub(super) map_render_ttl: u32,
 }
 
 impl GisEditorApp {
@@ -198,6 +203,10 @@ impl GisEditorApp {
             histogram_field: String::new(),
             field_stats: None,
             last_stats_field: String::new(),
+            bivariate: None,
+            show_bivariate: false,
+            bivariate_y_field: String::new(),
+            map_render_ttl: 0,
         }
     }
 }

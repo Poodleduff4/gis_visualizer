@@ -20,6 +20,7 @@ pub fn collect_gpu_points(
     out: &mut Vec<GpuPoint>,
 ) {
     out.clear();
+    println!("collecting...");
     for (i, entry) in layers.iter().enumerate() {
         if !entry.visible
             || match &entry.data {

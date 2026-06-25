@@ -28,6 +28,7 @@ pub enum SidebarAction {
     },
     SaveAs(String),
     OpenHistogram(String),
+    OpenBivariate(String, String),
     ExportFiltered,
 }
 
@@ -44,6 +45,7 @@ pub fn show_sidebar(
     adding_filter: &mut Option<LayerAttributeFilter>,
     updated_filters: &mut bool,
     histogram_field: &mut String,
+    bivariate_y_field: &mut String,
     field_stats: Option<&FieldStats>,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
@@ -207,6 +209,7 @@ pub fn show_sidebar(
     if numeric_fields.is_empty() {
         ui.label("No numeric fields.");
     } else {
+        ui.label("X field:");
         ComboBox::from_id_salt("histogram_field")
             .selected_text(if histogram_field.is_empty() {
                 "<select field>"
@@ -225,6 +228,28 @@ pub fn show_sidebar(
                     action = SidebarAction::OpenHistogram(histogram_field.clone());
                 }
             });
+
+            ui.label("Y field (scatter):");
+            ComboBox::from_id_salt("bivariate_y_field")
+                .selected_text(if bivariate_y_field.is_empty() {
+                    "<select field>"
+                } else {
+                    bivariate_y_field.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for name in &numeric_fields {
+                        ui.selectable_value(bivariate_y_field, name.clone(), name.as_str());
+                    }
+                });
+
+            if !bivariate_y_field.is_empty() && bivariate_y_field != histogram_field.as_str() {
+                if ui.button("Scatter / Correlation").clicked() {
+                    action = SidebarAction::OpenBivariate(
+                        histogram_field.clone(),
+                        bivariate_y_field.clone(),
+                    );
+                }
+            }
 
             if let Some(stats) = field_stats {
                 egui::Grid::new("stats_grid")

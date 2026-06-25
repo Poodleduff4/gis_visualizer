@@ -1,5 +1,85 @@
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 
+pub struct BivariateStats {
+    pub x_field: String,
+    pub y_field: String,
+    pub n: usize,
+    pub pearson_r: f64,
+    pub covariance: f64,
+    pub x_mean: f64,
+    pub y_mean: f64,
+    pub x_std: f64,
+    pub y_std: f64,
+    pub scatter_points: Vec<[f64; 2]>,
+}
+
+fn col_values(pc: &PointCloudLayer, field: &str, filtered_only: bool) -> Option<Vec<f64>> {
+    let col_idx = pc.field_names.iter().position(|n| n == field)?;
+    let col = pc.attributes.get(col_idx)?;
+    if matches!(col, AttributeColumn::Text(_)) {
+        return None;
+    }
+    let values: Vec<f64> = pc
+        .points
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !filtered_only || pc.filter_mask[*i])
+        .map(|(i, _)| match col {
+            AttributeColumn::Float(v) => v[i],
+            AttributeColumn::Integer(v) => v[i] as f64,
+            AttributeColumn::Text(_) => 0.0,
+        })
+        .collect();
+    Some(values)
+}
+
+pub fn compute_bivariate(
+    pc: &PointCloudLayer,
+    x_field: &str,
+    y_field: &str,
+    filtered_only: bool,
+    max_plot_points: usize,
+) -> Option<BivariateStats> {
+    let xs = col_values(pc, x_field, filtered_only)?;
+    let ys = col_values(pc, y_field, filtered_only)?;
+    if xs.len() != ys.len() || xs.is_empty() {
+        return None;
+    }
+    let n = xs.len();
+    let x_mean = xs.iter().sum::<f64>() / n as f64;
+    let y_mean = ys.iter().sum::<f64>() / n as f64;
+    let cov = xs.iter().zip(ys.iter()).map(|(x, y)| (x - x_mean) * (y - y_mean)).sum::<f64>() / n as f64;
+    let x_var = xs.iter().map(|x| (x - x_mean).powi(2)).sum::<f64>() / n as f64;
+    let y_var = ys.iter().map(|y| (y - y_mean).powi(2)).sum::<f64>() / n as f64;
+    let x_std = x_var.sqrt();
+    let y_std = y_var.sqrt();
+    let pearson_r = if x_std > 1e-12 && y_std > 1e-12 {
+        cov / (x_std * y_std)
+    } else {
+        0.0
+    };
+
+    let scatter_points: Vec<[f64; 2]> = if n <= max_plot_points {
+        xs.iter().zip(ys.iter()).map(|(&x, &y)| [x, y]).collect()
+    } else {
+        let step = n / max_plot_points;
+        xs.iter().zip(ys.iter()).step_by(step).map(|(&x, &y)| [x, y]).collect()
+    };
+
+    Some(BivariateStats {
+        x_field: x_field.to_string(),
+        y_field: y_field.to_string(),
+        n,
+        pearson_r,
+        covariance: cov,
+        x_mean,
+        y_mean,
+        x_std,
+        y_std,
+        scatter_points,
+    })
+}
+
 pub struct FieldStats {
     pub count: usize,
     pub filtered_count: usize,
@@ -13,23 +93,8 @@ pub struct FieldStats {
 }
 
 pub fn compute_field_stats(pc: &PointCloudLayer, field: &str, filtered_only: bool) -> Option<FieldStats> {
-    let col_idx = pc.field_names.iter().position(|n| n == field)?;
-    let col = pc.attributes.get(col_idx)?;
-    if matches!(col, AttributeColumn::Text(_)) {
-        return None;
-    }
     let all_count = pc.points.len();
-    let values: Vec<f64> = pc
-        .points
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !filtered_only || pc.filter_mask[*i])
-        .map(|(i, _)| match col {
-            AttributeColumn::Float(v) => v[i],
-            AttributeColumn::Integer(v) => v[i] as f64,
-            AttributeColumn::Text(_) => 0.0,
-        })
-        .collect();
+    let values = col_values(pc, field, filtered_only)?;
     if values.is_empty() {
         return None;
     }
@@ -75,22 +140,7 @@ pub fn compute_histogram(
     bin_count: usize,
     filtered_only: bool,
 ) -> Option<HistogramState> {
-    let col_idx = pc.field_names.iter().position(|n| n == field)?;
-    let col = pc.attributes.get(col_idx)?;
-    if matches!(col, AttributeColumn::Text(_)) {
-        return None;
-    }
-    let values: Vec<f64> = pc
-        .points
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !filtered_only || pc.filter_mask[*i])
-        .map(|(i, _)| match col {
-            AttributeColumn::Float(v) => v[i],
-            AttributeColumn::Integer(v) => v[i] as f64,
-            AttributeColumn::Text(_) => 0.0,
-        })
-        .collect();
+    let values = col_values(pc, field, filtered_only)?;
     if values.is_empty() {
         return None;
     }

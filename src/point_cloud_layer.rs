@@ -56,7 +56,7 @@ pub struct PointCloudLayer {
     pub filter_mask: BitVec,
 }
 impl PointCloudLayer {
-    fn ensure_bbox(&mut self) {
+    pub fn ensure_bbox(&mut self) {
         if self.points.is_empty() || self.bbox.is_none() {
             let mut xmin = f64::MAX;
             let mut ymin = f64::MAX;

@@ -20,6 +20,7 @@ use arrow::array::{
     Array, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
     UInt32Array, UInt64Array,
 };
+use arrow::datatypes::DataType as ArrowDataType;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -394,11 +395,13 @@ impl GeoParquetReader {
                     .collect()
             }
             GeometrySource::WkbColumn => {
-                let geom_col = batch.column_by_name("geometry");
+                let casted = batch
+                    .column_by_name("geometry")
+                    .and_then(|arr| datafusion::arrow::compute::cast(arr, &ArrowDataType::Binary).ok());
                 (0..nrows)
                     .map(|i| {
-                        let arr = geom_col?.as_any().downcast_ref::<BinaryArray>()?;
-                        decode_wkb_point(arr.value(i))
+                        let a = casted.as_ref()?.as_any().downcast_ref::<BinaryArray>()?;
+                        decode_wkb_point(a.value(i))
                     })
                     .collect()
             }
@@ -614,8 +617,13 @@ impl GeoParquetReader {
                 let geom_col = batch.column_by_name("geometry");
                 (0..nrows)
                     .map(|i| {
-                        let arr = geom_col?.as_any().downcast_ref::<BinaryArray>()?;
-                        decode_wkb_point(arr.value(i))
+                        let arr = geom_col?;
+                        if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
+                            decode_wkb_point(a.value(i))
+                        } else {
+                            use arrow::array::LargeBinaryArray;
+                            arr.as_any().downcast_ref::<LargeBinaryArray>().and_then(|a| decode_wkb_point(a.value(i)))
+                        }
                     })
                     .collect()
             }

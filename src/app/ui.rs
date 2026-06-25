@@ -17,7 +17,7 @@ use crate::gis_reader::GeoParquetReader;
 use crate::gis_reader::{GisFilePath, GisReader};
 use crate::gpu_collect::collect_gpu_points;
 use crate::heatmap::HeatmapLayer;
-use crate::histogram::{compute_field_stats, compute_histogram};
+use crate::histogram::{compute_bivariate, compute_field_stats, compute_histogram};
 use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::parquet::{extract_batch_as_u32, query_parquet};
@@ -330,7 +330,9 @@ impl eframe::App for GisEditorApp {
                             attr_fields.clone(),
                         )
                     };
-                    let _ = result;
+                    if let Err(e) = result {
+                        eprintln!("[load thread] error: {e:#}");
+                    }
                 }
             });
             #[cfg(target_arch = "wasm32")]
@@ -439,10 +441,10 @@ impl eframe::App for GisEditorApp {
                     }
                 }
             }
-            // Keep egui polling so the channel is drained every frame.
-            // Without this, egui sleeps when there's no input and the
-            // bounded channel fills up, blocking the stream future.
-            ui.ctx().request_repaint();
+            self.map_render_ttl = 10;
+            // Keep polling so the bounded channel doesn't fill and block the stream future.
+            // 16 ms cap is fast enough to drain without pinning the UI at full vsync rate.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
             if let Err(TryRecvError::Disconnected) = load_rx.try_recv() {
                 self.status = "Ready".to_string();
                 self.load_rx = None;
@@ -573,6 +575,90 @@ impl eframe::App for GisEditorApp {
             }
         }
 
+        // ── Bivariate / Scatter window ────────────────────────────────────────
+        if self.show_bivariate {
+            let mut open = true;
+            egui::Window::new("Scatter / Correlation")
+                .open(&mut open)
+                .resizable(true)
+                .default_size([520.0, 400.0])
+                .show(ui.ctx(), |ui| {
+                    if let Some(bv) = &self.bivariate {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("X: {}   Y: {}", bv.x_field, bv.y_field)).strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(format!("n = {}", bv.n));
+                            });
+                        });
+
+                        let points = bv.scatter_points.clone();
+                        egui_plot::Plot::new("bivariate_scatter")
+                            .height(260.0)
+                            .x_axis_label(&bv.x_field)
+                            .y_axis_label(&bv.y_field)
+                            .show(ui, |plot_ui| {
+                                let pts: egui_plot::PlotPoints = points.into_iter().map(|[x, y]| [x, y]).collect();
+                                plot_ui.points(
+                                    egui_plot::Points::new("pts", pts)
+                                        .radius(2.0)
+                                        .color(egui::Color32::from_rgba_unmultiplied(80, 160, 220, 160)),
+                                );
+                            });
+
+                        ui.separator();
+                        egui::Grid::new("bv_stats_grid")
+                            .num_columns(2)
+                            .striped(true)
+                            .min_col_width(120.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Stat").strong());
+                                ui.label(egui::RichText::new("Value").strong());
+                                ui.end_row();
+
+                                ui.label("Pearson r");
+                                ui.label(format!("{:.6}", bv.pearson_r));
+                                ui.end_row();
+
+                                ui.label("r²");
+                                ui.label(format!("{:.6}", bv.pearson_r * bv.pearson_r));
+                                ui.end_row();
+
+                                ui.label("Covariance");
+                                ui.label(format!("{:.4}", bv.covariance));
+                                ui.end_row();
+
+                                ui.label(format!("Mean {}", bv.x_field));
+                                ui.label(format!("{:.4}", bv.x_mean));
+                                ui.end_row();
+
+                                ui.label(format!("Std {}", bv.x_field));
+                                ui.label(format!("{:.4}", bv.x_std));
+                                ui.end_row();
+
+                                ui.label(format!("Mean {}", bv.y_field));
+                                ui.label(format!("{:.4}", bv.y_mean));
+                                ui.end_row();
+
+                                ui.label(format!("Std {}", bv.y_field));
+                                ui.label(format!("{:.4}", bv.y_std));
+                                ui.end_row();
+                            });
+
+                        let strength = match bv.pearson_r.abs() {
+                            r if r >= 0.7 => "strong",
+                            r if r >= 0.4 => "moderate",
+                            r if r >= 0.2 => "weak",
+                            _ => "negligible",
+                        };
+                        let direction = if bv.pearson_r >= 0.0 { "positive" } else { "negative" };
+                        ui.label(format!("{} {} correlation", strength, direction));
+                    }
+                });
+            if !open {
+                self.show_bivariate = false;
+            }
+        }
+
         // ── Status bar ────────────────────────────────────────────────────────
         egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -612,9 +698,14 @@ impl eframe::App for GisEditorApp {
                                     if !is_active {
                                         self.active_layer_idx = Some(i);
                                         self.selected_id = None;
-                                        self.fitted = false;
                                         self.points_dirty = true;
                                     }
+                                    if let LayerKind::Points(pc) = &mut entry.data {
+                                        if !pc.points.is_empty() {
+                                            pc.ensure_bbox();
+                                        }
+                                    }
+                                    self.fitted = false;
                                 }
                                 label_resp.context_menu(|ui| {
                                     if ui.button("Build Quadtree").clicked() {
@@ -766,6 +857,7 @@ impl eframe::App for GisEditorApp {
                         &mut self.adding_filter,
                         &mut self.updated_filters,
                         &mut self.histogram_field,
+                        &mut self.bivariate_y_field,
                         self.field_stats.as_ref(),
                     );
 
@@ -781,6 +873,14 @@ impl eframe::App for GisEditorApp {
                                 if let LayerKind::Points(pc) = &self.layers[idx].data {
                                     self.histogram = compute_histogram(pc, &field, 50, true);
                                     self.show_histogram = self.histogram.is_some();
+                                }
+                            }
+                        }
+                        SidebarAction::OpenBivariate(x_field, y_field) => {
+                            if let Some(idx) = self.active_layer_idx {
+                                if let LayerKind::Points(pc) = &self.layers[idx].data {
+                                    self.bivariate = compute_bivariate(pc, &x_field, &y_field, true, 5000);
+                                    self.show_bivariate = self.bivariate.is_some();
                                 }
                             }
                         }
@@ -1068,20 +1168,23 @@ impl eframe::App for GisEditorApp {
                 self.viewport_load_pending = true;
                 self.last_viewport_center = self.viewport.center;
                 self.last_viewport_ppu = self.viewport.pixels_per_unit;
+                self.map_render_ttl = 2;
             } else if self.viewport_load_pending {
                 self.viewport_stable_frames += 1;
             }
             if self.viewport_load_pending {
-                ui.ctx().request_repaint();
+                let cursor_in_map = self.last_canvas_rect
+                    .and_then(|rect| ui.ctx().pointer_latest_pos().map(|p| rect.contains(p)))
+                    .unwrap_or(false);
+                if cursor_in_map {
+                    ui.ctx().request_repaint();
+                }
             }
 
-            let viewport_reload_ready =
-                self.viewport_load_pending && self.viewport_stable_frames >= 3;
             if (self.points_dirty
                 || layer_changed
                 || selection_changed
-                || size_changed
-                || viewport_reload_ready)
+                || size_changed)
                 && !self.streaming_features
             {
                 if let Some(wrs) = frame.wgpu_render_state() {
@@ -1107,6 +1210,7 @@ impl eframe::App for GisEditorApp {
                         pipeline.upload_points(device, queue, &self.gpu_points_buf);
                     }
                 }
+                self.map_render_ttl = 2;
                 self.points_dirty = false;
                 self.last_selected_id = self.selected_id;
                 self.last_point_size = self.point_size;
@@ -1225,11 +1329,16 @@ impl eframe::App for GisEditorApp {
                 &mut self.selected_index_cell_data,
             );
 
-            // GPU point cloud composites on top of basemap, below index overlay
+            // GPU point cloud: always blit the cached offscreen texture (cheap).
+            // The offscreen re-render only happens when map_render_ttl > 0 (viewport/data changed).
             if self.has_gpu {
                 let rect = response.rect;
                 let [wx_min, wy_min, wx_max, wy_max] = self.viewport.viewport_bbox(rect);
                 let world_size = [(wx_max - wx_min) as f32, (wy_max - wy_min) as f32];
+                let render_dirty = self.map_render_ttl > 0;
+                if self.map_render_ttl > 0 {
+                    self.map_render_ttl -= 1;
+                }
                 painter.add(egui::Shape::Callback(
                     egui_wgpu::Callback::new_paint_callback(
                         rect,
@@ -1238,6 +1347,7 @@ impl eframe::App for GisEditorApp {
                             world_size,
                             screen_min: [rect.left(), rect.top()],
                             screen_size: [rect.width(), rect.height()],
+                            render_dirty,
                         },
                     ),
                 ));
