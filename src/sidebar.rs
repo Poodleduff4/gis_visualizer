@@ -1,9 +1,10 @@
 use egui::{ComboBox, RichText, ScrollArea, Ui};
 
 use crate::{
-    app::LayerAttributeFilter,
+    filter::{FilterLogic, FilterOperation, LayerAttributeFilter},
     gis_layer::{AttributeType, AttributeValue, LayerEntry},
-    uncertainty_quadtree::{UncertaintyMeasure, UncertaintyMeasurement},
+    histogram::FieldStats,
+    uncertainty_quadtree::UncertaintyMeasure,
 };
 
 // ── Add-attribute form state ──────────────────────────────────────────────────
@@ -27,6 +28,7 @@ pub enum SidebarAction {
     },
     SaveAs(String),
     OpenHistogram(String),
+    ExportFiltered,
 }
 
 // ── Main sidebar widget ───────────────────────────────────────────────────────
@@ -37,12 +39,12 @@ pub fn show_sidebar(
     active_layer_idx: Option<usize>,
     selected_id: Option<usize>,
     form: &mut AddAttributeForm,
-    save_path: &mut String,
+    _save_path: &mut String,
     selected_index_cell_data: Option<&UncertaintyMeasure>,
-    // current_filters: &mut Option<&mut Vec<LayerAttributeFilter>>,
     adding_filter: &mut Option<LayerAttributeFilter>,
     updated_filters: &mut bool,
     histogram_field: &mut String,
+    field_stats: Option<&FieldStats>,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
 
@@ -59,57 +61,107 @@ pub fn show_sidebar(
 
     // ── Layer info ────────────────────────────────────────────────────────────
     ui.label(RichText::new(&layer.name).strong());
-    ui.label(format!("{} features", layer.data.feature_count()));
+    let total = layer.data.feature_count();
+    let visible = layer.data.filtered_count();
+    if visible < total {
+        ui.label(format!("{} / {} features (filtered)", visible, total));
+    } else {
+        ui.label(format!("{} features", total));
+    }
     ui.separator();
-    ui.label(RichText::new("Layer Filters").strong());
-    let field_names = &layer.data.field_names();
-    let mut to_remove: Option<usize> = None;
 
-    for (idx, filter) in layer.filters.iter().enumerate() {
-        ui.label(&format!("Filter on: {}", filter.attribute.clone().unwrap()));
-        ui.label(&format!(
-            "By: {}",
-            filter.operation.clone().unwrap().to_string()
-        ));
-        ui.label(&format!("Compare to: {}", filter.comparitor_raw));
-        if ui.button("Delete Filter").clicked() {
-            println!("Delete Filter");
-            to_remove = Some(idx);
+    // ── Filters ───────────────────────────────────────────────────────────────
+    ui.label(RichText::new("Filters").strong());
+
+    if !layer.filters.is_empty() {
+        // AND / OR toggle
+        ui.horizontal(|ui| {
+            ui.label("Logic:");
+            ui.selectable_value(&mut layer.filter_logic, FilterLogic::And, "AND");
+            ui.selectable_value(&mut layer.filter_logic, FilterLogic::Or, "OR");
+        });
+
+        let mut to_remove: Option<usize> = None;
+        for (idx, filter) in layer.filters.iter().enumerate() {
+            let attr = filter.attribute.as_deref().unwrap_or("?");
+            let op = filter
+                .operation
+                .as_ref()
+                .map(|o| o.to_string())
+                .unwrap_or_default();
+            let val = &filter.comparitor_raw;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{attr} {op} {val}")).monospace());
+                if ui.small_button("✕").clicked() {
+                    to_remove = Some(idx);
+                }
+            });
+        }
+        if let Some(idx) = to_remove {
+            layer.filters.remove(idx);
+            *updated_filters = true;
         }
     }
 
-    if let Some(idx) = to_remove {
-        layer.filters.remove(idx);
-        *updated_filters = true;
-    }
-    if let Some(filter) = adding_filter {
-        ui.menu_button("Attribute", |ui| {
-            for name in field_names.iter() {
-                ui.selectable_value(&mut filter.attribute, Some(name.clone()), name.as_str());
-            }
-        });
-        ui.menu_button("Operation", |ui| {
-            ui.selectable_value(
-                &mut filter.operation,
-                Some(crate::app::FilterOperation::LessThan),
-                "Less Than",
-            );
-            ui.selectable_value(
-                &mut filter.operation,
-                Some(crate::app::FilterOperation::GreaterThan),
-                "Greater Than",
-            );
-            ui.selectable_value(
-                &mut filter.operation,
-                Some(crate::app::FilterOperation::Equal),
-                "Equal",
-            );
-        });
+    let field_names = layer.data.field_names();
+    let mut do_confirm = false;
+    let mut do_cancel = false;
+
+    if let Some(filter) = adding_filter.as_mut() {
         ui.horizontal(|ui| {
-            ui.label("Compare to:");
+            ComboBox::from_id_salt("filter_attr")
+                .selected_text(filter.attribute.as_deref().unwrap_or("<field>"))
+                .show_ui(ui, |ui| {
+                    for name in field_names.iter() {
+                        ui.selectable_value(
+                            &mut filter.attribute,
+                            Some(name.clone()),
+                            name.as_str(),
+                        );
+                    }
+                });
+            ComboBox::from_id_salt("filter_op")
+                .selected_text(
+                    filter
+                        .operation
+                        .as_ref()
+                        .map(|o| o.to_string())
+                        .unwrap_or_else(|| "<op>".into()),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut filter.operation,
+                        Some(FilterOperation::LessThan),
+                        "<",
+                    );
+                    ui.selectable_value(
+                        &mut filter.operation,
+                        Some(FilterOperation::GreaterThan),
+                        ">",
+                    );
+                    ui.selectable_value(
+                        &mut filter.operation,
+                        Some(FilterOperation::Equal),
+                        "=",
+                    );
+                });
             ui.text_edit_singleline(&mut filter.comparitor_raw);
         });
-        if ui.button("Create Filter").clicked() {
+        let ready = filter.attribute.is_some()
+            && filter.operation.is_some()
+            && !filter.comparitor_raw.is_empty();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(ready, egui::Button::new("Add")).clicked() {
+                do_confirm = true;
+            }
+            if ui.button("Cancel").clicked() {
+                do_cancel = true;
+            }
+        });
+    }
+
+    if do_confirm {
+        if let Some(filter) = adding_filter.take() {
             let attr_type = filter
                 .attribute
                 .as_deref()
@@ -119,27 +171,37 @@ pub fn show_sidebar(
                 .parse_value(&filter.comparitor_raw)
                 .unwrap_or(AttributeValue::Text(filter.comparitor_raw.clone()));
             layer.filters.push(LayerAttributeFilter {
-                attribute: filter.attribute.clone(),
-                operation: filter.operation.clone(),
+                attribute: filter.attribute,
+                operation: filter.operation,
                 comparitor,
-                comparitor_raw: filter.comparitor_raw.clone(),
+                comparitor_raw: filter.comparitor_raw,
             });
-            adding_filter.take();
-            // layer.filters.push(adding_filter.take().unwrap());
             *updated_filters = true;
-            // current_filters.push(adding_filter.take().unwrap());
         }
-    } else {
-        if ui.button("Add Filter").clicked() {
-            adding_filter.replace(LayerAttributeFilter {
-                attribute: None,
-                operation: None,
-                comparitor: AttributeValue::Text(String::new()),
-                comparitor_raw: String::new(),
-            });
-        }
+    } else if do_cancel {
+        *adding_filter = None;
     }
+
+    if adding_filter.is_none() {
+        ui.horizontal(|ui| {
+            if ui.button("+ Filter").clicked() {
+                adding_filter.replace(LayerAttributeFilter {
+                    attribute: None,
+                    operation: None,
+                    comparitor: AttributeValue::Text(String::new()),
+                    comparitor_raw: String::new(),
+                });
+            }
+            if !layer.filters.is_empty() && ui.button("Clear All").clicked() {
+                layer.filters.clear();
+                *updated_filters = true;
+            }
+        });
+    }
+
     ui.separator();
+
+    // ── Distribution / Stats ──────────────────────────────────────────────────
     ui.label(RichText::new("Distribution").strong());
     let numeric_fields = layer.data.numeric_field_names();
     if numeric_fields.is_empty() {
@@ -156,11 +218,77 @@ pub fn show_sidebar(
                     ui.selectable_value(histogram_field, name.clone(), name.as_str());
                 }
             });
-        if ui.button("Show Histogram").clicked() && !histogram_field.is_empty() {
-            action = SidebarAction::OpenHistogram(histogram_field.clone());
+
+        if !histogram_field.is_empty() {
+            ui.horizontal(|ui| {
+                if ui.button("Histogram").clicked() {
+                    action = SidebarAction::OpenHistogram(histogram_field.clone());
+                }
+            });
+
+            if let Some(stats) = field_stats {
+                egui::Grid::new("stats_grid")
+                    .num_columns(2)
+                    .striped(true)
+                    .min_col_width(60.0)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Stat").strong());
+                        ui.label(RichText::new("Value").strong());
+                        ui.end_row();
+
+                        if stats.filtered_count < stats.count {
+                            ui.label("Count");
+                            ui.label(format!("{} / {}", stats.filtered_count, stats.count));
+                            ui.end_row();
+                        } else {
+                            ui.label("Count");
+                            ui.label(stats.count.to_string());
+                            ui.end_row();
+                        }
+                        ui.label("Min");
+                        ui.label(format!("{:.4}", stats.min));
+                        ui.end_row();
+                        ui.label("Max");
+                        ui.label(format!("{:.4}", stats.max));
+                        ui.end_row();
+                        ui.label("Mean");
+                        ui.label(format!("{:.4}", stats.mean));
+                        ui.end_row();
+                        ui.label("Std Dev");
+                        ui.label(format!("{:.4}", stats.std_dev));
+                        ui.end_row();
+                        ui.label("P25");
+                        ui.label(format!("{:.4}", stats.p25));
+                        ui.end_row();
+                        ui.label("P50");
+                        ui.label(format!("{:.4}", stats.p50));
+                        ui.end_row();
+                        ui.label("P75");
+                        ui.label(format!("{:.4}", stats.p75));
+                        ui.end_row();
+                    });
+            }
         }
     }
+
     ui.separator();
+
+    // ── Export ────────────────────────────────────────────────────────────────
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        ui.label(RichText::new("Export").strong());
+        let filtered_count = layer.data.filtered_count();
+        let label = if filtered_count < layer.data.feature_count() {
+            format!("Export filtered ({} pts)", filtered_count)
+        } else {
+            format!("Export all ({} pts)", filtered_count)
+        };
+        if ui.button(label).clicked() {
+            action = SidebarAction::ExportFiltered;
+        }
+        ui.separator();
+    }
+
     if let Some(cell_data) = selected_index_cell_data {
         match cell_data {
             UncertaintyMeasure::Variance {
@@ -192,7 +320,6 @@ pub fn show_sidebar(
     ui.label(RichText::new(format!("Feature #{sel_id}")).strong());
     ui.add_space(4.0);
 
-    // Attribute table
     let all_names: Vec<String> = layer
         .data
         .field_names()
@@ -278,34 +405,6 @@ pub fn show_sidebar(
             }
         }
     }
-
-    ui.separator();
-
-    // ── Save ──────────────────────────────────────────────────────────────────
-    // ui.label(RichText::new("Save").strong());
-    // ui.add_space(2.0);
-    // ui.label("Output path:");
-    // ui.text_edit_singleline(save_path);
-
-    // ui.horizontal(|ui| {
-    //     if ui.button("Browse…").clicked() {
-    //         if let Some(path) = rfd::FileDialog::new()
-    //             .add_filter("Shapefile", &["shp"])
-    //             .add_filter("GeoPackage", &["gpkg"])
-    //             .add_filter("GeoJSON", &["geojson"])
-    //             .save_file()
-    //         {
-    //             *save_path = path.to_string_lossy().to_string();
-    //         }
-    //     }
-
-    //     if ui.button("Save").clicked() {
-    //         let path = save_path.trim().to_string();
-    //         if !path.is_empty() {
-    //             action = SidebarAction::SaveAs(path);
-    //         }
-    //     }
-    // });
 
     action
 }

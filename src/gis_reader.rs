@@ -41,6 +41,7 @@ pub type FgbReaderCache = std::rc::Rc<
 >;
 
 use crate::{
+    filter::FilterLogic,
     gis_layer::{AttributeValue, BatchMessage, GisFeature, GisLayer, LayerEntry, LayerKind},
     point_cloud_layer::{AttributeColumn, PointCloudLayer},
 };
@@ -329,7 +330,10 @@ impl GeoParquetReader {
         selected_fields: Option<&[String]>,
         schema: &datafusion::arrow::datatypes::Schema,
     ) -> String {
-        let mut cols = vec!["idx".to_string()];
+        let mut cols: Vec<String> = Vec::new();
+        if schema.field_with_name("idx").is_ok() {
+            cols.push("idx".to_string());
+        }
         match geom_src {
             GeometrySource::XYColumns { x_col, y_col } => {
                 cols.push(x_col.clone());
@@ -1380,6 +1384,7 @@ impl GisReader {
             opacity: 255,
             descriptor: descriptor.clone(),
             filters: Vec::new(),
+            filter_logic: FilterLogic::default(),
         }
     }
 

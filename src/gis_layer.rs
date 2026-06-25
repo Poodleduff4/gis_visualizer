@@ -5,7 +5,7 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::mpsc;
 
-use crate::app::LayerAttributeFilter;
+use crate::filter::{FilterLogic, LayerAttributeFilter};
 use crate::gis_reader::LayerDescriptor;
 use crate::hilbert_r_tree::HilbertRTree;
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
@@ -302,6 +302,12 @@ impl LayerKind {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.points.len(),
         }
     }
+    pub fn filtered_count(&self) -> usize {
+        match self {
+            LayerKind::Points(pc) => pc.filter_mask.count_ones(),
+            LayerKind::Vector(gl) => gl.features.len(),
+        }
+    }
     pub fn feature(&self, idx: usize) -> Option<&GisFeature> {
         match self {
             LayerKind::Vector(gis_layer) => Some(&gis_layer.features[idx]),
@@ -382,6 +388,7 @@ pub struct LayerEntry {
     pub opacity: u8,
     pub descriptor: LayerDescriptor,
     pub filters: Vec<LayerAttributeFilter>,
+    pub filter_logic: FilterLogic,
 }
 impl LayerEntry {}
 

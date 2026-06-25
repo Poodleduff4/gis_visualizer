@@ -1,5 +1,9 @@
 mod app;
 mod basemap;
+mod exporter;
+mod filter;
+mod gpu_collect;
+mod histogram;
 mod gis_layer;
 mod gis_reader;
 mod heatmap;

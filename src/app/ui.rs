@@ -1,470 +1,32 @@
-use bitvec::vec::BitVec;
-use bitvec::{bitarr, bitvec, BitArr};
-use egui::{CentralPanel, Color32, UiKind};
-use futures_channel::oneshot;
-use rfd::FileHandle;
-use rstar::primitives::GeomWithData;
-use std::cell::Cell;
-use std::fmt;
-use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
-#[cfg(target_arch = "wasm32")]
-use std::time::Duration;
-use std::time::Instant;
+
+use bitvec::{bitvec, vec::BitVec};
+use futures_channel::oneshot;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
 
-#[cfg(not(target_arch = "wasm32"))]
-type PendingFile = String;
-#[cfg(target_arch = "wasm32")]
-type PendingFile = (Vec<u8>, String);
+use egui::{CentralPanel, UiKind};
 
-#[derive(Default, PartialEq)]
-enum LoadMode {
-    #[default]
-    GeometryOnly,
-    WithAttributes,
-}
-use wgpu::naga::proc::vector_size_str;
-
-use crate::basemap::BasemapCache;
-use crate::gis_layer::{AttributeValue, BatchMessage, GisLayer, LayerEntry, LayerKind};
+use crate::filter::{FilterLogic, FilterOperation, LayerAttributeFilter};
+use crate::gis_layer::{AttributeValue, BatchMessage, LayerKind};
 #[cfg(target_arch = "wasm32")]
-use crate::gis_reader::FgbReaderCache;
-use crate::gis_reader::{GeoParquetReader, GisFilePath, GisReader, LayerDescriptor};
+use crate::gis_reader::GeoParquetReader;
+use crate::gis_reader::{GisFilePath, GisReader};
+use crate::gpu_collect::collect_gpu_points;
 use crate::heatmap::HeatmapLayer;
-use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid, Viewport};
+use crate::histogram::{compute_field_stats, compute_histogram};
+use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::parquet::{extract_batch_as_u32, extract_u32, query_parquet};
-use crate::point_cloud::{GpuPoint, PointCloudCallback, PointCloudPipeline};
-use crate::quadtree::Quadtree;
-use crate::sidebar::{show_sidebar, AddAttributeForm, SidebarAction};
-use crate::spatial_index::{IndexKind, SpatialIndex};
-use crate::uncertainty_quadtree::{MeasurementType, UncertaintyMeasure, UncertaintyMeasurement};
+use crate::parquet::{extract_batch_as_u32, query_parquet};
+use crate::point_cloud::{PointCloudCallback, PointCloudPipeline};
+use crate::sidebar::{show_sidebar, SidebarAction};
+use crate::spatial_index::IndexKind;
+use crate::uncertainty_quadtree::MeasurementType;
 
-const LAYER_PANEL_WIDTH: f32 = 180.0;
-
-const FILL_NORMAL: Color32 = Color32::from_rgb(100, 149, 237);
-const FILL_SELECTED: Color32 = Color32::from_rgb(255, 165, 0);
-#[derive(PartialEq)]
-pub enum ClickTarget {
-    Feature,
-    GridCell,
-}
-
-#[cfg(target_arch = "wasm32")]
-fn now_ms() -> f64 {
-    web_sys::window().unwrap().performance().unwrap().now() // returns f64 milliseconds
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn now_ms() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
-        * 1000.0
-}
-#[derive(PartialEq, Clone)]
-pub enum FilterOperation {
-    LessThan,
-    GreaterThan,
-    Equal,
-}
-impl fmt::Display for FilterOperation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FilterOperation::Equal => write!(f, "="),
-            FilterOperation::GreaterThan => write!(f, ">"),
-            FilterOperation::LessThan => write!(f, "<"),
-        }
-    }
-}
-
-pub struct LayerAttributeFilter {
-    pub attribute: Option<String>,
-    pub operation: Option<FilterOperation>,
-    pub comparitor: AttributeValue,
-    pub comparitor_raw: String,
-}
-
-pub struct HistogramState {
-    pub field: String,
-    pub counts: Vec<u32>,
-    pub bin_edges: Vec<f64>,
-    pub min: f64,
-    pub max: f64,
-    pub range_lo: f64,
-    pub range_hi: f64,
-    pub filtered_only: bool,
-}
-
-pub struct GisEditorApp {
-    layers: Vec<LayerEntry>,
-    active_layer_idx: Option<usize>,
-    layer_picker_window_open: bool,
-    viewport: Viewport,
-    selected_id: Option<usize>,
-    file_pick_rx: Option<mpsc::Receiver<GisFilePath>>,
-    #[cfg(target_arch = "wasm32")]
-    pending_bytes: Option<Vec<u8>>,
-    #[cfg(target_arch = "wasm32")]
-    file_handle_slot: std::rc::Rc<std::cell::RefCell<Option<web_sys::File>>>,
-    add_form: AddAttributeForm,
-    save_path: String,
-    status: String,
-    fitted: bool,
-    show_basemap: bool,
-    basemap_cache: BasemapCache,
-    show_index: bool,
-    index_kind: IndexKind,
-    show_heatmap: bool,
-    click_target: ClickTarget,
-
-    // Layer selector state (populated after file pick, before load)
-    pending_file: Option<GisFilePath>,
-    pending_file_descriptor: Option<LayerDescriptor>,
-    pending_layers: Vec<(LayerDescriptor, bool)>,
-    pending_load_mode: LoadMode,
-    pending_field_selection: Vec<(String, bool)>,
-    load_rx: Option<mpsc::Receiver<BatchMessage>>,
-    // load_tx: Option<mpsc::SyncSender<BatchMessage>>,
-    load_layer_descriptor_rx: mpsc::Receiver<LayerDescriptor>,
-    load_layer_descriptor_tx: mpsc::SyncSender<LayerDescriptor>,
-    viewport_stable_frames: u32,
-    viewport_load_pending: bool,
-
-    // GPU point cloud state
-    has_gpu: bool,
-    pub point_size: f32,
-    points_dirty: bool,
-    last_selected_id: Option<usize>,
-    last_point_size: f32,
-    last_layer_count: usize,
-    heatmap_opacity: u8,
-    gpu_points_buf: Vec<GpuPoint>,
-    spatial_index_split_density: usize,
-    last_split_density: usize,
-    hilbert_order: u32,
-    last_hilbert_order: u32,
-    last_viewport_center: [f64; 2],
-    last_viewport_ppu: f64,
-    last_canvas_rect: Option<egui::Rect>,
-    selected_uncertainty_attribute: Option<String>,
-    selected_index_cell_data: Option<UncertaintyMeasure>,
-    uncertainty_split_threshold: f32,
-    viewport_culling: bool,
-    selected_split_measurement_type: MeasurementType,
-    fgb_file_url: String,
-    cancel_stream: Arc<AtomicBool>,
-    streaming_features: bool,
-    #[cfg(target_arch = "wasm32")]
-    fgb_reader_cache: FgbReaderCache,
-    current_filters: Vec<LayerAttributeFilter>,
-    adding_filter: Option<LayerAttributeFilter>,
-    updated_filters: bool,
-    filtered_idx_rx: Option<oneshot::Receiver<(usize, Vec<u32>)>>,
-    histogram: Option<HistogramState>,
-    show_histogram: bool,
-    histogram_field: String,
-}
-
-impl GisEditorApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let has_gpu = if let Some(wrs) = cc.wgpu_render_state.as_ref() {
-            let pipeline = PointCloudPipeline::new(&wrs.device, wrs.target_format);
-            wrs.renderer.write().callback_resources.insert(pipeline);
-            true
-        } else {
-            false
-        };
-        // let (tx, rx) = mpsc::sync_channel::<BatchMessage>(10);
-        let (ld_tx, ld_rx) = mpsc::sync_channel::<LayerDescriptor>(1);
-
-        GisEditorApp {
-            layers: Vec::new(),
-            active_layer_idx: None,
-            layer_picker_window_open: false,
-            pending_file: None,
-            pending_layers: Vec::new(),
-            pending_load_mode: LoadMode::default(),
-            pending_field_selection: Vec::new(),
-            viewport: Viewport::default(),
-            selected_id: None,
-            add_form: AddAttributeForm::default(),
-            save_path: String::new(),
-            status: "Ready.".to_string(),
-            fitted: false,
-            show_basemap: true,
-            basemap_cache: BasemapCache::default(),
-            show_index: false,
-            index_kind: IndexKind::Quadtree,
-            show_heatmap: false,
-            click_target: ClickTarget::GridCell,
-            has_gpu,
-            point_size: 5.0,
-            points_dirty: false,
-            last_selected_id: None,
-            last_point_size: 5.0,
-            last_layer_count: 0,
-            heatmap_opacity: 255,
-            gpu_points_buf: Vec::new(),
-            spatial_index_split_density: 10000,
-            last_split_density: 10000,
-            hilbert_order: 6,
-            last_hilbert_order: 6,
-            load_rx: None,
-            // load_tx: tx,
-            load_layer_descriptor_rx: ld_rx,
-            load_layer_descriptor_tx: ld_tx,
-            last_viewport_center: Default::default(),
-            last_viewport_ppu: Default::default(),
-            last_canvas_rect: None,
-            selected_uncertainty_attribute: None,
-            selected_index_cell_data: None,
-            uncertainty_split_threshold: 0.5,
-            viewport_culling: false,
-            selected_split_measurement_type: MeasurementType::Variance,
-            file_pick_rx: None,
-            #[cfg(target_arch = "wasm32")]
-            pending_bytes: None,
-            #[cfg(target_arch = "wasm32")]
-            file_handle_slot: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            fgb_file_url: "http://localhost:8001/".to_string(),
-            cancel_stream: Arc::new(AtomicBool::new(false)),
-            streaming_features: false,
-            pending_file_descriptor: None,
-            viewport_stable_frames: 0,
-            viewport_load_pending: false,
-            #[cfg(target_arch = "wasm32")]
-            fgb_reader_cache: std::rc::Rc::new(std::cell::RefCell::new(
-                std::collections::HashMap::new(),
-            )),
-            current_filters: Vec::new(),
-            adding_filter: None,
-            updated_filters: false,
-            filtered_idx_rx: None,
-            histogram: None,
-            show_histogram: false,
-            histogram_field: String::new(),
-        }
-    }
-
-    fn compute_histogram(
-        pc: &crate::point_cloud_layer::PointCloudLayer,
-        field: &str,
-        bin_count: usize,
-        filtered_only: bool,
-    ) -> Option<HistogramState> {
-        use crate::point_cloud_layer::AttributeColumn;
-        let col_idx = pc.field_names.iter().position(|n| n == field)?;
-        let col = pc.attributes.get(col_idx)?;
-        if matches!(col, AttributeColumn::Text(_)) {
-            return None;
-        }
-        let values: Vec<f64> = pc
-            .points
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !filtered_only || pc.filter_mask[*i])
-            .map(|(i, _)| match col {
-                AttributeColumn::Float(v) => v[i],
-                AttributeColumn::Integer(v) => v[i] as f64,
-                AttributeColumn::Text(_) => 0.0,
-            })
-            .collect();
-        if values.is_empty() {
-            return None;
-        }
-        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        if (max - min).abs() < 1e-12 {
-            return None;
-        }
-        let mut counts = vec![0u32; bin_count];
-        for v in &values {
-            let idx = ((v - min) / (max - min) * bin_count as f64) as usize;
-            counts[idx.min(bin_count - 1)] += 1;
-        }
-        let bin_width = (max - min) / bin_count as f64;
-        let bin_edges: Vec<f64> = (0..=bin_count).map(|i| min + i as f64 * bin_width).collect();
-        Some(HistogramState {
-            field: field.to_string(),
-            counts,
-            bin_edges,
-            min,
-            max,
-            range_lo: min,
-            range_hi: max,
-            filtered_only,
-        })
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn open_file(&mut self, path: GisFilePath) {
-        match GisReader::load_layer_descriptor(&path.to_string()) {
-            Ok(descriptor) => self.apply_layer(descriptor, path),
-            Err(e) => self.status = format!("Error reading layers: {e}"),
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn open_file(
-        &mut self,
-        file_url: GisFilePath,
-        tx: mpsc::SyncSender<LayerDescriptor>,
-    ) -> Result<(), anyhow::Error> {
-        match file_url {
-            GisFilePath::HttpLocation(url) => {
-                spawn_local(async move {
-                    match GisReader::load_layer_descriptor(&url).await {
-                        Ok(descriptor) => {
-                            web_sys::console::log_1(&JsValue::from_str(&format!("{}", url)));
-                            tx.send(descriptor);
-                        }
-                        Err(_e) => {}
-                    }
-                });
-            }
-            GisFilePath::Bytes(bytes, name) => {
-                match GeoParquetReader::load_descriptor_from_bytes(&bytes, &name) {
-                    Ok(descriptor) => {
-                        let _ = tx.send(descriptor);
-                    }
-                    Err(e) => {
-                        web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "parquet open error: {e}"
-                        )));
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn apply_layer(&mut self, descriptor: LayerDescriptor, file_path: GisFilePath) {
-        let mut seen = std::collections::HashSet::new();
-        let mut all_fields: Vec<String> = Vec::new();
-        for f in &descriptor.field_names {
-            if seen.insert(f.clone()) {
-                all_fields.push(f.clone());
-            }
-        }
-        all_fields.sort();
-        self.pending_field_selection = all_fields.into_iter().map(|f| (f, true)).collect();
-        self.pending_load_mode = LoadMode::GeometryOnly;
-        self.pending_layers = vec![descriptor.clone()]
-            .into_iter()
-            .map(|d| (d, true))
-            .collect();
-        self.pending_file = Some(file_path);
-        self.pending_file_descriptor = Some(descriptor.clone());
-    }
-    // UNUSED
-    // fn load_pending(&mut self, selected_layer_indices: Vec<usize>) {
-    //     let Some(path) = self.pending_file.take() else {
-    //         return;
-    //     };
-    //     self.pending_layers.clear();
-    //     match GisLayer::load_selected(&path, &selected_layer_indices) {
-    //         Ok(layers) if layers.is_empty() => {
-    //             self.status = "No layers loaded.".to_string();
-    //         }
-    //         Ok(layers) => {
-    //             let total: usize = layers.iter().map(|l| l.features.len()).sum();
-    //             self.status = format!("Loaded {} layer(s), {} total features", layers.len(), total);
-    //             let first_new = self.layers.len();
-    //             self.layers.extend(layers.into_iter().map(|l| {
-    //                 let name = l.name.clone();
-    //                 LayerEntry {
-    //                     layer: l,
-    //                     visible: true,
-    //                     name,
-    //                     color: [100, 149, 237],
-    //                     opacity: 255,
-    //                 }
-    //             }));
-    //             self.active_layer_idx = Some(first_new);
-    //             self.selected_id = None;
-    //             self.fitted = false;
-    //             self.points_dirty = true;
-    //         }
-    //         Err(e) => {
-    //             self.status = format!("Error: {e}");
-    //         }
-    //     }
-    // }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn pack_color(c: Color32) -> u32 {
-    let [r, g, b, a] = c.to_array();
-    r as u32 | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24)
-}
-
-fn collect_gpu_points(
-    layers: &[LayerEntry],
-    active_idx: Option<usize>,
-    selected_id: Option<usize>,
-    _viewport_bbox: Option<[f64; 4]>,
-    point_size: f32,
-    out: &mut Vec<GpuPoint>,
-) {
-    out.clear();
-    for (i, entry) in layers.iter().enumerate() {
-        if !entry.visible
-            || match &entry.data {
-                LayerKind::Points(_) => false,
-                LayerKind::Vector(_) => true,
-            }
-        {
-            continue;
-        }
-        let is_active = active_idx == Some(i);
-        let point_cloud_layer = match &entry.data {
-            LayerKind::Points(pc) => pc,
-            LayerKind::Vector(_) => panic!("Unexpected layer kind in collect_gpu_points!"),
-        };
-        let visible_points = point_cloud_layer
-            .points
-            .iter()
-            .enumerate()
-            .filter(|(i, (_pi, _pv))| point_cloud_layer.filter_mask[*i])
-            .map(|(_, (_pi, pv))| *pv)
-            .collect::<Vec<[f64; 2]>>();
-        // let render_pts: &[[f64; 2]] = if !point_cloud_layer.viewport_mask.is_empty() {
-        //     &point_cloud_layer.viewport_mask
-        // } else {
-        //     point_cloud_layer
-        //         .points
-        //         .iter()
-        //         .map(|(i, p)| p)
-        //         .collect::<&Vec<&[f64; 2]>>()
-        // };
-        for (idx, &point) in visible_points.iter().enumerate() {
-            let fill = if is_active && selected_id == Some(idx) {
-                FILL_SELECTED
-            } else {
-                FILL_NORMAL
-            };
-            let packed = pack_color(fill);
-            out.push(GpuPoint {
-                position: [point[0] as f32, point[1] as f32],
-                color: packed,
-                size: point_size,
-            });
-        }
-    }
-}
-
-// ── eframe::App ───────────────────────────────────────────────────────────────
+use super::{ClickTarget, GisEditorApp, LoadMode, LAYER_PANEL_WIDTH};
 
 impl eframe::App for GisEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -715,10 +277,6 @@ impl eframe::App for GisEditorApp {
             )
             .expect("Error loading featureless layers!");
             #[cfg(target_arch = "wasm32")]
-            // let header_bytes = self.pending_bytes.take().unwrap_or_default();
-            #[cfg(target_arch = "wasm32")]
-            // let wasm_file = self.file_handle_slot.borrow_mut().take();
-            #[cfg(target_arch = "wasm32")]
             web_sys::console::log_1(&JsValue::from_str(&format!(
                 "Before load layers: {}",
                 path.to_string()
@@ -738,12 +296,10 @@ impl eframe::App for GisEditorApp {
             self.layers.extend(layers.into_iter());
             self.active_layer_idx = Some(first_new);
             self.status = format!("Loading {} layer(s)…", indices.len());
-            let fgb_file_clone = self.fgb_file_url.clone();
 
             let rect_clone = self
                 .viewport
                 .viewport_bbox(self.last_canvas_rect.clone().unwrap());
-            // wasm: large capacity so synchronous senders never block the single thread
             #[cfg(target_arch = "wasm32")]
             let (load_tx, load_rx) = mpsc::sync_channel::<BatchMessage>(100_000);
             #[cfg(not(target_arch = "wasm32"))]
@@ -774,7 +330,7 @@ impl eframe::App for GisEditorApp {
                             attr_fields.clone(),
                         )
                     };
-                    let _ = result; // SendError just means receiver was dropped (new load started)
+                    let _ = result;
                 }
             });
             #[cfg(target_arch = "wasm32")]
@@ -782,56 +338,56 @@ impl eframe::App for GisEditorApp {
                 web_sys::console::log_1(&JsValue::from_str("spawn_local: starting load"));
                 for (pos, file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
-                    let result: anyhow::Result<()> =
-                        match &path_clone {
-                            crate::gis_reader::GisFilePath::Bytes(bytes, _) => {
-                                web_sys::console::log_1(&JsValue::from_str(&format!(
-                                    "spawn_local: loading parquet bytes={} is_points={}",
-                                    bytes.len(), is_points[pos]
-                                )));
-                                if is_points[pos] {
-                                    let r = crate::gis_reader::GeoParquetReader::load_point_layer_batched_from_bytes(
+                    let result: anyhow::Result<()> = match &path_clone {
+                        crate::gis_reader::GisFilePath::Bytes(bytes, _) => {
+                            web_sys::console::log_1(&JsValue::from_str(&format!(
+                                "spawn_local: loading parquet bytes={} is_points={}",
+                                bytes.len(),
+                                is_points[pos]
+                            )));
+                            if is_points[pos] {
+                                let r = crate::gis_reader::GeoParquetReader::load_point_layer_batched_from_bytes(
                                         bytes.clone(),
                                         dest,
                                         load_tx.clone(),
                                         attr_fields.clone(),
                                     );
+                                web_sys::console::log_1(&JsValue::from_str(&format!(
+                                    "spawn_local: load result ok={}",
+                                    r.is_ok()
+                                )));
+                                if let Err(ref e) = r {
                                     web_sys::console::log_1(&JsValue::from_str(&format!(
-                                        "spawn_local: load result ok={}", r.is_ok()
+                                        "spawn_local: load error: {e}"
                                     )));
-                                    if let Err(ref e) = r {
-                                        web_sys::console::log_1(&JsValue::from_str(&format!(
-                                            "spawn_local: load error: {e}"
-                                        )));
-                                    }
-                                    r
-                                } else {
-                                    Ok(())
                                 }
+                                r
+                            } else {
+                                Ok(())
                             }
-                            _ => {
-                                if is_points[pos] {
-                                    GisReader::stream_fgb_bbox(
-                                        &path_clone,
-                                        rect_clone,
-                                        file_idx,
-                                        dest,
-                                        load_tx.clone(),
-                                        attr_fields.clone(),
-                                        cancel_clone.clone(),
-                                        reader_cache_for_load.clone(),
-                                    )
-                                    .await
-                                } else {
-                                    Ok(())
-                                }
+                        }
+                        _ => {
+                            if is_points[pos] {
+                                GisReader::stream_fgb_bbox(
+                                    &path_clone,
+                                    rect_clone,
+                                    file_idx,
+                                    dest,
+                                    load_tx.clone(),
+                                    attr_fields.clone(),
+                                    cancel_clone.clone(),
+                                    reader_cache_for_load.clone(),
+                                )
+                                .await
+                            } else {
+                                Ok(())
                             }
-                        };
+                        }
+                    };
                     let _ = result;
                 }
                 web_sys::console::log_1(&JsValue::from_str("spawn_local: done"));
             });
-            // self.load_rx = Some(rx);
         } else if cancel_pending {
             self.pending_file = None;
             self.pending_layers.clear();
@@ -843,14 +399,16 @@ impl eframe::App for GisEditorApp {
                     BatchMessage::Points(layer_idx, pts, named_cols) => {
                         #[cfg(target_arch = "wasm32")]
                         web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "BatchMessage::Points layer={layer_idx} count={}", pts.len()
+                            "BatchMessage::Points layer={layer_idx} count={}",
+                            pts.len()
                         )));
                         if let Some(LayerKind::Points(pc)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
                         {
                             std::sync::Arc::make_mut(&mut pc.points).extend(pts);
                             if pc.attributes.is_empty() && !named_cols.is_empty() {
-                                pc.field_names = named_cols.iter().map(|(n, _)| n.clone()).collect();
+                                pc.field_names =
+                                    named_cols.iter().map(|(n, _)| n.clone()).collect();
                                 for (_, col) in named_cols {
                                     pc.attributes.push(col);
                                 }
@@ -870,7 +428,6 @@ impl eframe::App for GisEditorApp {
                             pts.iter()
                                 .for_each(|idx| pc.viewport_mask.set(*idx as usize, true));
                         }
-                        // viewport_mask no longer drives GPU rendering; no points_dirty needed
                     }
                     BatchMessage::Vector(layer_idx, features) => {
                         if let Some(LayerKind::Vector(gl)) =
@@ -896,7 +453,6 @@ impl eframe::App for GisEditorApp {
         // ── Histogram window ─────────────────────────────────────────────────
         if self.show_histogram {
             let mut open = true;
-            // Collect actions from the window closure; apply them after to avoid borrow conflicts.
             let mut hist_recompute = false;
             let mut hist_apply_filter: Option<(String, f64, f64)> = None;
 
@@ -909,7 +465,10 @@ impl eframe::App for GisEditorApp {
                         ui.horizontal(|ui| {
                             ui.label("Field:");
                             ui.label(egui::RichText::new(&hist.field).strong());
-                            if ui.checkbox(&mut hist.filtered_only, "Filtered only").changed() {
+                            if ui
+                                .checkbox(&mut hist.filtered_only, "Filtered only")
+                                .changed()
+                            {
                                 hist_recompute = true;
                             }
                             if ui.button("Recompute").clicked() {
@@ -933,8 +492,7 @@ impl eframe::App for GisEditorApp {
                                     .map(|(i, &c)| {
                                         let center = (bin_edges[i] + bin_edges[i + 1]) * 0.5;
                                         let width = bin_edges[i + 1] - bin_edges[i];
-                                        egui_plot::Bar::new(center, c as f64)
-                                            .width(width * 0.95)
+                                        egui_plot::Bar::new(center, c as f64).width(width * 0.95)
                                     })
                                     .collect();
                                 plot_ui.bar_chart(egui_plot::BarChart::new("counts", bars));
@@ -988,7 +546,7 @@ impl eframe::App for GisEditorApp {
                             .as_ref()
                             .map(|h| (h.field.clone(), h.filtered_only))
                             .unwrap_or_default();
-                        self.histogram = Self::compute_histogram(pc, &field, 50, filtered_only);
+                        self.histogram = compute_histogram(pc, &field, 50, filtered_only);
                     }
                 }
             }
@@ -1159,7 +717,7 @@ impl eframe::App for GisEditorApp {
                                     );
                                 }
                             }
-                            LayerKind::Vector(gl) => {}
+                            LayerKind::Vector(_gl) => {}
                         }
                     }
                     if let Some(idx) = rebuild_hilbert_idx {
@@ -1179,11 +737,24 @@ impl eframe::App for GisEditorApp {
             });
 
         // ── Sidebar (right) ───────────────────────────────────────────────────
-        let mut layer_filters = self.active_layer_idx.map(|i| &mut self.layers[i].filters);
         egui::Panel::right("sidebar")
             .min_size(260.0)
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Recompute stats when field or filters change
+                    let stats_stale = self.histogram_field != self.last_stats_field
+                        || (self.updated_filters && !self.histogram_field.is_empty());
+                    if stats_stale {
+                        self.field_stats = self.active_layer_idx.and_then(|idx| {
+                            if let LayerKind::Points(pc) = &self.layers[idx].data {
+                                compute_field_stats(pc, &self.histogram_field, false)
+                            } else {
+                                None
+                            }
+                        });
+                        self.last_stats_field = self.histogram_field.clone();
+                    }
+
                     let action = show_sidebar(
                         ui,
                         &mut self.layers,
@@ -1192,28 +763,66 @@ impl eframe::App for GisEditorApp {
                         &mut self.add_form,
                         &mut self.save_path,
                         self.selected_index_cell_data.as_ref(),
-                        // &mut layer_filters,
                         &mut self.adding_filter,
                         &mut self.updated_filters,
                         &mut self.histogram_field,
+                        self.field_stats.as_ref(),
                     );
 
                     match action {
                         SidebarAction::AddAttribute {
-                            feature_id,
-                            name,
-                            value,
-                        } => {
-                            // COMMENTED OUT FOR NOW BECAUSE THIS BRANCH IS MORE ABOUT VIEWING
-                        }
-                        SidebarAction::SaveAs(_path) => {
-                            // COMMENTED OUT FOR NOW BECAUSE THIS BRANCH IS MORE ABOUT VIEWING
-                        }
+                            feature_id: _,
+                            name: _,
+                            value: _,
+                        } => {}
+                        SidebarAction::SaveAs(_path) => {}
                         SidebarAction::OpenHistogram(field) => {
                             if let Some(idx) = self.active_layer_idx {
                                 if let LayerKind::Points(pc) = &self.layers[idx].data {
-                                    self.histogram = Self::compute_histogram(pc, &field, 50, false);
+                                    self.histogram = compute_histogram(pc, &field, 50, true);
                                     self.show_histogram = self.histogram.is_some();
+                                }
+                            }
+                        }
+                        SidebarAction::ExportFiltered => {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if let Some(idx) = self.active_layer_idx {
+                                if let LayerKind::Points(pc) = &self.layers[idx].data {
+                                    let points: Vec<(u32, [f64; 2])> = pc.points.iter().cloned().collect();
+                                    let field_names = pc.field_names.clone();
+                                    let filter_mask = pc.filter_mask.clone();
+                                    let attrs: Vec<_> = pc.attributes.iter().map(|col| {
+                                        use crate::point_cloud_layer::AttributeColumn;
+                                        match col {
+                                            AttributeColumn::Float(v) => AttributeColumn::Float(v.clone()),
+                                            AttributeColumn::Integer(v) => AttributeColumn::Integer(v.clone()),
+                                            AttributeColumn::Text(v) => AttributeColumn::Text(v.clone()),
+                                        }
+                                    }).collect();
+                                    let name = self.layers[idx].name.clone();
+                                    std::thread::spawn(move || {
+                                        if let Some(path) = pollster::block_on(
+                                            rfd::AsyncFileDialog::new()
+                                                .add_filter("GeoParquet", &["parquet"])
+                                                .set_file_name(format!("{}_export.parquet", name))
+                                                .save_file(),
+                                        ) {
+                                            use crate::point_cloud_layer::PointCloudLayer;
+                                            let pc_export = PointCloudLayer {
+                                                points: std::sync::Arc::new(points),
+                                                attributes: attrs,
+                                                field_names,
+                                                filter_mask,
+                                                index: None,
+                                                bbox: None,
+                                                viewport_mask: bitvec::bitvec![0; 0],
+                                            };
+                                            let _ = crate::exporter::export_filtered_points(
+                                                &pc_export,
+                                                path.path().to_string_lossy().as_ref(),
+                                            );
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -1224,17 +833,20 @@ impl eframe::App for GisEditorApp {
 
         if self.updated_filters {
             let layer = &mut self.layers[self.active_layer_idx.unwrap()];
-            let idx = self.active_layer_idx.unwrap().clone();
+            let idx = self.active_layer_idx.unwrap();
             match layer.filters.len() {
                 0 => {
                     layer.data.reset_filter_mask();
                     self.points_dirty = true;
                     self.updated_filters = false;
-                    // ui.request_repaint();
                 }
                 _ => {
                     #[cfg(not(target_arch = "wasm32"))]
                     {
+                        let join_op = match layer.filter_logic {
+                            FilterLogic::And => " AND ",
+                            FilterLogic::Or => " OR ",
+                        };
                         let query = format!(
                             "SELECT idx,{} from layer WHERE {}",
                             layer.data.field_names().join(","),
@@ -1250,7 +862,7 @@ impl eframe::App for GisEditorApp {
                                     )
                                 })
                                 .collect::<Vec<String>>()
-                                .join(" and ")
+                                .join(join_op)
                         );
                         println!("{}", query);
                         let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
@@ -1281,51 +893,93 @@ impl eframe::App for GisEditorApp {
                     #[cfg(target_arch = "wasm32")]
                     {
                         use crate::point_cloud_layer::AttributeColumn;
-                        let matching_ids: Vec<u32> =
-                            if let LayerKind::Points(pc) = &layer.data {
-                                let filters = &layer.filters;
-                                let field_names = &pc.field_names;
-                                let attributes = &pc.attributes;
-                                pc.points
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(pos, (parquet_id, _))| {
-                                        let passes = filters.iter().all(|f| {
-                                            let Some(attr) = f.attribute.as_deref() else { return false; };
-                                            let Some(col_pos) = field_names.iter().position(|n| n == attr) else { return false; };
-                                            let Some(col) = attributes.get(col_pos) else { return false; };
-                                            let raw = &f.comparitor_raw;
-                                            match (&f.operation, col) {
-                                                (Some(FilterOperation::GreaterThan), AttributeColumn::Float(v)) => {
-                                                    raw.parse::<f64>().map(|t| v[pos] > t).unwrap_or(false)
-                                                }
-                                                (Some(FilterOperation::LessThan), AttributeColumn::Float(v)) => {
-                                                    raw.parse::<f64>().map(|t| v[pos] < t).unwrap_or(false)
-                                                }
-                                                (Some(FilterOperation::Equal), AttributeColumn::Float(v)) => {
-                                                    raw.parse::<f64>().map(|t| (v[pos] - t).abs() < 1e-9).unwrap_or(false)
-                                                }
-                                                (Some(FilterOperation::GreaterThan), AttributeColumn::Integer(v)) => {
-                                                    raw.parse::<i64>().map(|t| v[pos] > t).unwrap_or(false)
-                                                }
-                                                (Some(FilterOperation::LessThan), AttributeColumn::Integer(v)) => {
-                                                    raw.parse::<i64>().map(|t| v[pos] < t).unwrap_or(false)
-                                                }
-                                                (Some(FilterOperation::Equal), AttributeColumn::Integer(v)) => {
-                                                    raw.parse::<i64>().map(|t| v[pos] == t).unwrap_or(false)
-                                                }
-                                                (Some(FilterOperation::Equal), AttributeColumn::Text(v)) => {
-                                                    v[pos] == *raw
-                                                }
-                                                _ => false,
-                                            }
-                                        });
-                                        if passes { Some(*parquet_id) } else { None }
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
+                        let use_and = layer.filter_logic == FilterLogic::And;
+                        let matching_ids: Vec<u32> = if let LayerKind::Points(pc) = &layer.data {
+                            let filters = &layer.filters;
+                            let field_names = &pc.field_names;
+                            let attributes = &pc.attributes;
+                            pc.points
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(pos, (parquet_id, _))| {
+                                    let eval = |f: &LayerAttributeFilter| {
+                                        let Some(attr) = f.attribute.as_deref() else {
+                                            return false;
+                                        };
+                                        let Some(col_pos) =
+                                            field_names.iter().position(|n| n == attr)
+                                        else {
+                                            return false;
+                                        };
+                                        let Some(col) = attributes.get(col_pos) else {
+                                            return false;
+                                        };
+                                        let raw = &f.comparitor_raw;
+                                        match (&f.operation, col) {
+                                            (
+                                                Some(FilterOperation::GreaterThan),
+                                                AttributeColumn::Float(v),
+                                            ) => raw
+                                                .parse::<f64>()
+                                                .map(|t| v[pos] > t)
+                                                .unwrap_or(false),
+                                            (
+                                                Some(FilterOperation::LessThan),
+                                                AttributeColumn::Float(v),
+                                            ) => raw
+                                                .parse::<f64>()
+                                                .map(|t| v[pos] < t)
+                                                .unwrap_or(false),
+                                            (
+                                                Some(FilterOperation::Equal),
+                                                AttributeColumn::Float(v),
+                                            ) => raw
+                                                .parse::<f64>()
+                                                .map(|t| (v[pos] - t).abs() < 1e-9)
+                                                .unwrap_or(false),
+                                            (
+                                                Some(FilterOperation::GreaterThan),
+                                                AttributeColumn::Integer(v),
+                                            ) => raw
+                                                .parse::<i64>()
+                                                .map(|t| v[pos] > t)
+                                                .unwrap_or(false),
+                                            (
+                                                Some(FilterOperation::LessThan),
+                                                AttributeColumn::Integer(v),
+                                            ) => raw
+                                                .parse::<i64>()
+                                                .map(|t| v[pos] < t)
+                                                .unwrap_or(false),
+                                            (
+                                                Some(FilterOperation::Equal),
+                                                AttributeColumn::Integer(v),
+                                            ) => raw
+                                                .parse::<i64>()
+                                                .map(|t| v[pos] == t)
+                                                .unwrap_or(false),
+                                            (
+                                                Some(FilterOperation::Equal),
+                                                AttributeColumn::Text(v),
+                                            ) => v[pos] == *raw,
+                                            _ => false,
+                                        }
+                                    };
+                                    let passes = if use_and {
+                                        filters.iter().all(|f| eval(f))
+                                    } else {
+                                        filters.iter().any(|f| eval(f))
+                                    };
+                                    if passes {
+                                        Some(*parquet_id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
                         self.filtered_idx_rx = Some(rx);
                         let _ = tx.send((idx, matching_ids));
@@ -1341,9 +995,6 @@ impl eframe::App for GisEditorApp {
                     if let Some(l) = self.layers.get_mut(layer_idx) {
                         match &mut l.data {
                             LayerKind::Points(point_cloud_layer) => {
-                                // idx_vec contains parquet idx column values, NOT enumerate positions.
-                                // Build a HashSet of matching parquet ids, then scan pc.points to find
-                                // their enumerate positions for filter_mask.
                                 let matching: std::collections::HashSet<u32> =
                                     idx_vec.into_iter().collect();
                                 let mut mask: BitVec = bitvec![0;point_cloud_layer.points.len()];
@@ -1365,7 +1016,7 @@ impl eframe::App for GisEditorApp {
                 Ok(None) => {
                     println!("Not Ready Yet")
                 }
-                Err(e) => self.filtered_idx_rx = None,
+                Err(_e) => self.filtered_idx_rx = None,
             }
         }
 
@@ -1469,9 +1120,7 @@ impl eframe::App for GisEditorApp {
                 && self.viewport_stable_frames >= 3
                 && !self.streaming_features
             {
-                // println!("Reloading From Index!");
                 self.viewport_load_pending = false;
-                // Cancel previous quad threads before starting new ones.
                 self.cancel_stream
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 self.cancel_stream = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1519,7 +1168,6 @@ impl eframe::App for GisEditorApp {
                         continue;
                     }
                     if let LayerKind::Points(pc) = &mut layer.data {
-                        // pc.viewport_points.clear();
                         let pts_clone = Arc::clone(&pc.points);
                         let idx_clone = pc.index.clone();
                         let tx_clone = tx.clone();
@@ -1562,8 +1210,6 @@ impl eframe::App for GisEditorApp {
                 ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
             self.last_canvas_rect = Some(response.rect);
 
-            // CPU geometry: background, basemap, polygons, lines.
-            // Points are skipped here when the GPU path is active.
             let render_points = !self.has_gpu;
             show_map(
                 ui,
@@ -1579,8 +1225,7 @@ impl eframe::App for GisEditorApp {
                 &mut self.selected_index_cell_data,
             );
 
-            // GPU point cloud — added AFTER show_map so it composites on top
-            // of the background and basemap, but still below the index overlay.
+            // GPU point cloud composites on top of basemap, below index overlay
             if self.has_gpu {
                 let rect = response.rect;
                 let [wx_min, wy_min, wx_max, wy_max] = self.viewport.viewport_bbox(rect);
@@ -1598,8 +1243,6 @@ impl eframe::App for GisEditorApp {
                 ));
             }
 
-            // Detect selection change driven by click inside show_map so we
-            // re-upload colors on the next frame.
             if self.selected_id != self.last_selected_id {
                 self.points_dirty = true;
             }
