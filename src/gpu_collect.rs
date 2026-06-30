@@ -3,7 +3,6 @@ use egui::Color32;
 use crate::gis_layer::{LayerEntry, LayerKind};
 use crate::point_cloud::GpuPoint;
 
-pub const FILL_NORMAL: Color32 = Color32::from_rgb(100, 149, 237);
 pub const FILL_SELECTED: Color32 = Color32::from_rgb(255, 165, 0);
 
 pub fn pack_color(c: Color32) -> u32 {
@@ -42,11 +41,12 @@ pub fn collect_gpu_points(
             .filter(|(i, (_pi, _pv))| point_cloud_layer.filter_mask[*i])
             .map(|(_, (_pi, pv))| *pv)
             .collect::<Vec<[f64; 2]>>();
+        let layer_color = Color32::from_rgb(entry.color[0], entry.color[1], entry.color[2]);
         for (idx, &point) in visible_points.iter().enumerate() {
             let fill = if is_active && selected_id == Some(idx) {
                 FILL_SELECTED
             } else {
-                FILL_NORMAL
+                layer_color
             };
             let packed = pack_color(fill);
             out.push(GpuPoint {

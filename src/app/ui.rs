@@ -659,6 +659,37 @@ impl eframe::App for GisEditorApp {
             }
         }
 
+        // ── Layer color picker window ─────────────────────────────────────────
+        if let Some(layer_idx) = self.color_picker_layer {
+            if layer_idx < self.layers.len() {
+                let mut open = true;
+                let name = self.layers[layer_idx].name.clone();
+                let mut color = self.layers[layer_idx].color;
+                let mut color_changed = false;
+                egui::Window::new("Layer Color")
+                    .open(&mut open)
+                    .resizable(false)
+                    .collapsible(false)
+                    .default_size([220.0, 240.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.label(&name);
+                        ui.separator();
+                        if egui::color_picker::color_edit_button_srgb(ui, &mut color).changed() {
+                            color_changed = true;
+                        }
+                    });
+                if color_changed {
+                    self.layers[layer_idx].color = color;
+                    self.points_dirty = true;
+                }
+                if !open {
+                    self.color_picker_layer = None;
+                }
+            } else {
+                self.color_picker_layer = None;
+            }
+        }
+
         // ── Status bar ────────────────────────────────────────────────────────
         egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -748,6 +779,11 @@ impl eframe::App for GisEditorApp {
                                     ui.separator();
                                     if ui.button("Build Hilbert").clicked() {
                                         rebuild_hilbert_idx = Some(i);
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
+                                    ui.separator();
+                                    if ui.button("Change Color…").clicked() {
+                                        self.color_picker_layer = Some(i);
                                         ui.close_kind(egui::UiKind::Menu);
                                     }
                                 });

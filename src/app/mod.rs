@@ -123,6 +123,7 @@ pub struct GisEditorApp {
     pub(super) bivariate_y_field: String,
     /// Counts down from N after any map-relevant change; GPU callback runs while > 0 or cursor is in map.
     pub(super) map_render_ttl: u32,
+    pub(super) color_picker_layer: Option<usize>,
 }
 
 impl GisEditorApp {
@@ -207,6 +208,7 @@ impl GisEditorApp {
             show_bivariate: false,
             bivariate_y_field: String::new(),
             map_render_ttl: 0,
+            color_picker_layer: None,
         }
     }
 }
