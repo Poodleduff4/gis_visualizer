@@ -1,4 +1,8 @@
+use bitvec::vec::BitVec;
+use rstar::{primitives::GeomWithData, RTree, AABB};
+
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
+use crate::spatial_index::SpatialIndex;
 
 pub struct BivariateStats {
     pub x_field: String,
@@ -166,4 +170,238 @@ pub fn compute_histogram(
         range_hi: max,
         filtered_only,
     })
+}
+
+// ── Spatial analysis ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LisaCluster {
+    HighHigh,
+    LowLow,
+    HighLow,
+    LowHigh,
+}
+
+pub struct LisaPoint {
+    pub local_i: f64,
+    pub z_score: f64,
+    pub cluster: LisaCluster,
+}
+
+/// Extract numeric field values for all points (unfiltered). Returns None for Text columns.
+pub fn extract_field_values(pc: &PointCloudLayer, field: &str) -> Option<Vec<f64>> {
+    col_values(pc, field, false)
+}
+
+// Build a fallback RTree from the filtered subset of points when no reusable index exists.
+fn build_temp_rtree(
+    points: &[(u32, [f64; 2])],
+    filter_mask: &BitVec,
+) -> RTree<GeomWithData<[f64; 2], usize>> {
+    RTree::bulk_load(
+        points
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| filter_mask[*i])
+            .map(|(i, (_, p))| GeomWithData::new(*p, i))
+            .collect(),
+    )
+}
+
+/// Welford's online mean+variance for a stream of neighbor values looked up via index query.
+/// Returns (variance, n) or None if fewer than 2 neighbors.
+#[inline]
+fn welford_variance_from_index(
+    pos: [f64; 2],
+    radius: f64,
+    values: &[f64],
+    filter_mask: &BitVec,
+    index: &SpatialIndex,
+) -> Option<f64> {
+    let bbox = [pos[0] - radius, pos[1] - radius, pos[0] + radius, pos[1] + radius];
+    let mut n = 0usize;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+    for j in index.search(&bbox) {
+        if !filter_mask[j] {
+            continue;
+        }
+        let x = values[j];
+        n += 1;
+        let delta = x - mean;
+        mean += delta / n as f64;
+        m2 += delta * (x - mean);
+    }
+    if n < 2 { None } else { Some(m2 / n as f64) }
+}
+
+#[inline]
+fn welford_variance_from_rtree(
+    pos: [f64; 2],
+    radius: f64,
+    values: &[f64],
+    filter_mask: &BitVec,
+    tree: &RTree<GeomWithData<[f64; 2], usize>>,
+) -> Option<f64> {
+    let mut n = 0usize;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+    for e in tree.locate_in_envelope(&AABB::from_corners(
+        [pos[0] - radius, pos[1] - radius],
+        [pos[0] + radius, pos[1] + radius],
+    )) {
+        let j = e.data;
+        if !filter_mask[j] {
+            continue;
+        }
+        let x = values[j];
+        n += 1;
+        let delta = x - mean;
+        mean += delta / n as f64;
+        m2 += delta * (x - mean);
+    }
+    if n < 2 { None } else { Some(m2 / n as f64) }
+}
+
+/// Per-point variance of attribute values within `radius` (in data units).
+///
+/// Reuses `index` when available (avoids rebuilding spatial structure).
+/// Uses Welford's algorithm — no per-point Vec allocation.
+/// Designed to run in a background thread: takes owned/Arc-cloneable inputs.
+pub fn local_variance_inner(
+    points: &[(u32, [f64; 2])],
+    filter_mask: &BitVec,
+    values: &[f64],
+    radius: f64,
+    index: Option<&SpatialIndex>,
+) -> Vec<Option<f64>> {
+    match index {
+        Some(idx) => points
+            .iter()
+            .enumerate()
+            .map(|(i, (_, p))| {
+                if !filter_mask[i] { return None; }
+                welford_variance_from_index(*p, radius, values, filter_mask, idx)
+            })
+            .collect(),
+        None => {
+            let tree = build_temp_rtree(points, filter_mask);
+            points
+                .iter()
+                .enumerate()
+                .map(|(i, (_, p))| {
+                    if !filter_mask[i] { return None; }
+                    welford_variance_from_rtree(*p, radius, values, filter_mask, &tree)
+                })
+                .collect()
+        }
+    }
+}
+
+/// Per-point Local Moran's I (LISA).
+///
+/// For each point i:
+///   z_i = (v_i - global_mean) / global_std
+///   lag_i = mean(z_j) for all neighbors j ≠ i within `radius`
+///   local_I_i = z_i × lag_i
+///
+/// Cluster types:
+///   HH (red)    — high surrounded by high  → spatial cluster
+///   LL (blue)   — low surrounded by low    → spatial cluster
+///   HL (orange) — high surrounded by low   → spatial outlier / low explainability
+///   LH (cyan)   — low surrounded by high   → spatial outlier / low explainability
+///
+/// Reuses `index` when available. Designed to run in a background thread.
+pub fn lisa_inner(
+    points: &[(u32, [f64; 2])],
+    filter_mask: &BitVec,
+    values: &[f64],
+    radius: f64,
+    index: Option<&SpatialIndex>,
+) -> Option<Vec<Option<LisaPoint>>> {
+    // Global mean + std (one pass, Welford)
+    let mut n = 0usize;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+    for (i, _) in points.iter().enumerate() {
+        if !filter_mask[i] { continue; }
+        let x = values[i];
+        n += 1;
+        let delta = x - mean;
+        mean += delta / n as f64;
+        m2 += delta * (x - mean);
+    }
+    if n < 2 { return None; }
+    let std = (m2 / n as f64).sqrt();
+    if std < 1e-12 { return None; }
+
+    let z: Vec<f64> = values.iter().map(|v| (v - mean) / std).collect();
+
+    let compute = |tree_query: &dyn Fn([f64; 2]) -> Vec<usize>| -> Vec<Option<LisaPoint>> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, (_, p))| {
+                if !filter_mask[i] { return None; }
+                let neighbors = tree_query(*p);
+                let k = neighbors.len() as f64;
+                if k == 0.0 { return None; }
+                let lag = neighbors.iter().map(|&j| z[j]).sum::<f64>() / k;
+                let local_i = z[i] * lag;
+                let cluster = match (z[i] > 0.0, local_i > 0.0) {
+                    (true, true)   => LisaCluster::HighHigh,
+                    (false, true)  => LisaCluster::LowLow,
+                    (true, false)  => LisaCluster::HighLow,
+                    (false, false) => LisaCluster::LowHigh,
+                };
+                Some(LisaPoint { local_i, z_score: z[i], cluster })
+            })
+            .collect()
+    };
+
+    Some(match index {
+        Some(idx) => compute(&|p: [f64; 2]| {
+            let bbox = [p[0] - radius, p[1] - radius, p[0] + radius, p[1] + radius];
+            idx.search(&bbox)
+                .into_iter()
+                .filter(|&j| filter_mask[j])
+                .collect()
+        }),
+        None => {
+            let tree = build_temp_rtree(points, filter_mask);
+            compute(&|p: [f64; 2]| {
+                tree.locate_in_envelope(&AABB::from_corners(
+                    [p[0] - radius, p[1] - radius],
+                    [p[0] + radius, p[1] + radius],
+                ))
+                .filter_map(|e| if filter_mask[e.data] { Some(e.data) } else { None })
+                .collect()
+            })
+        }
+    })
+}
+
+// Convenience wrappers used when calling synchronously (e.g. small datasets).
+pub fn compute_local_variance(
+    pc: &PointCloudLayer,
+    field: &str,
+    radius: f64,
+) -> Option<Vec<Option<f64>>> {
+    let values = extract_field_values(pc, field)?;
+    Some(local_variance_inner(
+        &pc.points,
+        &pc.filter_mask,
+        &values,
+        radius,
+        pc.index.as_deref(),
+    ))
+}
+
+pub fn compute_lisa(
+    pc: &PointCloudLayer,
+    field: &str,
+    radius: f64,
+) -> Option<Vec<Option<LisaPoint>>> {
+    let values = extract_field_values(pc, field)?;
+    lisa_inner(&pc.points, &pc.filter_mask, &values, radius, pc.index.as_deref())
 }

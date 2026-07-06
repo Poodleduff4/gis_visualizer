@@ -1,10 +1,12 @@
+use bitvec::vec::BitVec;
+
 use crate::app::ClickTarget;
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{LayerEntry, LayerKind, TessellatedGeom};
 use crate::heatmap::HeatmapLayer;
+use crate::histogram::{LisaCluster, LisaPoint};
 use crate::spatial_index::{IndexKind, LineSegment, SpatialIndex};
-use crate::uncertainty_quadtree::{UncertaintyMeasure, UncertaintyMeasurement};
-use anyhow::bail;
+use crate::uncertainty_quadtree::UncertaintyMeasure;
 use egui::epaint::Mesh;
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Ui, Vec2};
 
@@ -255,6 +257,75 @@ pub fn show_quadtree_heatmap(
         let p1 = viewport.world_to_screen(cell.bbox[0], cell.bbox[1], rect);
         let p2 = viewport.world_to_screen(cell.bbox[2], cell.bbox[3], rect);
         painter.rect_filled(Rect::from_two_pos(p1, p2), 0.0, color);
+    }
+}
+
+/// Draw per-point local variance as a blue→red gradient overlay.
+/// `variances` is indexed by point position (same length as `points`).
+pub fn draw_local_variance_overlay(
+    painter: &Painter,
+    points: &[(u32, [f64; 2])],
+    filter_mask: &BitVec,
+    variances: &[Option<f64>],
+    viewport: &Viewport,
+    rect: Rect,
+    opacity: u8,
+) {
+    let vp = viewport.viewport_bbox(rect);
+    let max_var = variances
+        .iter()
+        .filter_map(|v| *v)
+        .fold(0.0_f64, f64::max);
+    if max_var < 1e-12 {
+        return;
+    }
+    for (i, (_, p)) in points.iter().enumerate() {
+        let Some(var) = variances.get(i).and_then(|v| *v) else { continue };
+        if !filter_mask[i] { continue; }
+        if p[0] < vp[0] || p[0] > vp[2] || p[1] < vp[1] || p[1] > vp[3] { continue; }
+        let t = ((var / max_var).sqrt() as f32).clamp(0.0, 1.0);
+        let color = variance_color(t, opacity);
+        let pos = viewport.world_to_screen(p[0], p[1], rect);
+        painter.circle_filled(pos, 5.0, color);
+    }
+}
+
+fn variance_color(t: f32, alpha: u8) -> Color32 {
+    let (r, g, b) = if t < 0.5 {
+        let s = t / 0.5;
+        (0_u8, (s * 200.0) as u8, (255.0 * (1.0 - s)) as u8)
+    } else {
+        let s = (t - 0.5) / 0.5;
+        ((s * 255.0) as u8, (200.0 * (1.0 - s)) as u8, 0_u8)
+    };
+    Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
+/// Draw LISA cluster classification as colored points.
+///
+/// HH = red, LL = blue, HL = orange, LH = cyan.
+pub fn draw_lisa_overlay(
+    painter: &Painter,
+    points: &[(u32, [f64; 2])],
+    filter_mask: &BitVec,
+    lisa: &[Option<LisaPoint>],
+    viewport: &Viewport,
+    rect: Rect,
+    opacity: u8,
+) {
+    let vp = viewport.viewport_bbox(rect);
+    for (i, (_, p)) in points.iter().enumerate() {
+        let Some(result) = lisa.get(i).and_then(|r| r.as_ref()) else { continue };
+        if !filter_mask[i] { continue; }
+        if p[0] < vp[0] || p[0] > vp[2] || p[1] < vp[1] || p[1] > vp[3] { continue; }
+        let color = match result.cluster {
+            LisaCluster::HighHigh => Color32::from_rgba_unmultiplied(220, 30, 30, opacity),
+            LisaCluster::LowLow => Color32::from_rgba_unmultiplied(30, 80, 220, opacity),
+            LisaCluster::HighLow => Color32::from_rgba_unmultiplied(240, 140, 20, opacity),
+            LisaCluster::LowHigh => Color32::from_rgba_unmultiplied(20, 200, 220, opacity),
+        };
+        let pos = viewport.world_to_screen(p[0], p[1], rect);
+        painter.circle_filled(pos, 5.0, color);
     }
 }
 
