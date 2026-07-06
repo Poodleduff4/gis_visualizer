@@ -1,31 +1,31 @@
 mod loader;
 mod ui;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use futures_channel::oneshot;
 use egui::Rect;
+use futures_channel::oneshot;
 
 use crate::basemap::BasemapCache;
 use crate::filter::LayerAttributeFilter;
-use crate::gis_layer::{BatchMessage, LayerEntry};
+use crate::gis_layer::{BatchMessage, LayerEntry, LayerKind};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::FgbReaderCache;
 use crate::gis_reader::{GisFilePath, LayerDescriptor};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::snapshot::{
-    filter_snapshot_to_filter, filter_to_snapshot, filter_logic_to_str, str_to_filter_logic,
-    AppSnapshot, LayerSnapshot, PendingSnapshotRestore, ViewportSnapshot, DisplaySnapshot,
-    AnalysisSnapshot,
-};
 use crate::globe::{GlobeCamera, GlobePipeline, GlobePoint};
 use crate::histogram::{BivariateStats, FieldStats, HistogramState, LisaPoint};
 use crate::map_view::Viewport;
 use crate::point_cloud::{GpuPoint, PointCloudPipeline};
 use crate::raster_reader::RasterDescriptor;
 use crate::sidebar::AddAttributeForm;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::snapshot::{
+    filter_logic_to_str, filter_snapshot_to_filter, filter_to_snapshot, str_to_filter_logic,
+    AnalysisSnapshot, AppSnapshot, DisplaySnapshot, LayerSnapshot, PendingSnapshotRestore,
+    ViewportSnapshot,
+};
 use crate::spatial_index::IndexKind;
 use crate::uncertainty_quadtree::{MeasurementType, UncertaintyMeasure};
 
@@ -225,7 +225,7 @@ impl GisEditorApp {
             last_canvas_rect: None,
             selected_uncertainty_attribute: None,
             selected_index_cell_data: None,
-            uncertainty_split_threshold: 0.5,
+            uncertainty_split_threshold: 1.0,
             viewport_culling: false,
             selected_split_measurement_type: MeasurementType::Variance,
             file_pick_rx: None,
@@ -286,17 +286,21 @@ impl GisEditorApp {
 #[cfg(not(target_arch = "wasm32"))]
 impl GisEditorApp {
     pub(super) fn capture_snapshot(&self) -> AppSnapshot {
-        let layers: Vec<LayerSnapshot> = self.layers.iter().map(|le| {
-            LayerSnapshot {
+        let layers: Vec<LayerSnapshot> = self
+            .layers
+            .iter()
+            .map(|le| LayerSnapshot {
                 file_path: le.descriptor.location.to_string(),
+                is_raster: matches!(le.data, LayerKind::Raster(_)),
+                selected_attributes: le.data.field_names(),
                 name: le.name.clone(),
                 visible: le.visible,
                 color: le.color,
                 opacity: le.opacity,
                 filter_logic: filter_logic_to_str(le.filter_logic),
                 filters: le.filters.iter().filter_map(filter_to_snapshot).collect(),
-            }
-        }).collect();
+            })
+            .collect();
 
         AppSnapshot {
             viewport: ViewportSnapshot {
@@ -331,14 +335,24 @@ impl GisEditorApp {
         }
 
         // Apply settings from the layer we just finished loading.
-        if let Some(layer_snap) = self.snapshot_restore.as_mut().unwrap().pending_layer_settings.take() {
+        if let Some(layer_snap) = self
+            .snapshot_restore
+            .as_mut()
+            .unwrap()
+            .pending_layer_settings
+            .take()
+        {
             let has_filters = !layer_snap.filters.is_empty();
             if let Some(layer) = self.layers.last_mut() {
                 layer.visible = layer_snap.visible;
                 layer.color = layer_snap.color;
                 layer.opacity = layer_snap.opacity;
                 layer.filter_logic = str_to_filter_logic(&layer_snap.filter_logic);
-                layer.filters = layer_snap.filters.iter().map(filter_snapshot_to_filter).collect();
+                layer.filters = layer_snap
+                    .filters
+                    .iter()
+                    .map(filter_snapshot_to_filter)
+                    .collect();
             }
             if has_filters {
                 self.updated_filters = true;
@@ -374,9 +388,38 @@ impl GisEditorApp {
             self.map_render_ttl = 10;
             self.status = "Snapshot loaded.".to_string();
         } else {
-            let next = self.snapshot_restore.as_mut().unwrap().queue.pop_front().unwrap();
-            let path_str = next.file_path.clone();
-            self.snapshot_restore.as_mut().unwrap().pending_layer_settings = Some(next);
+            let next = self
+                .snapshot_restore
+                .as_mut()
+                .unwrap()
+                .queue
+                .pop_front()
+                .unwrap();
+            self.open_snapshot_layer(next);
+        }
+    }
+
+    pub(super) fn open_snapshot_layer(&mut self, next: LayerSnapshot) {
+        let path_str = next.file_path.clone();
+        if next.is_raster {
+            self.snapshot_restore
+                .as_mut()
+                .unwrap()
+                .pending_layer_settings = Some(next);
+            let (tx, rx) = mpsc::channel::<LayerEntry>();
+            self.raster_load_rx = Some(rx);
+            std::thread::spawn(move || {
+                if let Ok(layer) =
+                    crate::raster_reader::load_raster_sync(std::path::Path::new(&path_str))
+                {
+                    let _ = tx.send(layer);
+                }
+            });
+        } else {
+            self.snapshot_restore
+                .as_mut()
+                .unwrap()
+                .pending_layer_settings = Some(next);
             self.open_file(GisFilePath::LocalFile(path_str));
         }
     }

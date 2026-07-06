@@ -44,6 +44,10 @@ pub struct AnalysisSnapshot {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LayerSnapshot {
     pub file_path: String,
+    #[serde(default)]
+    pub is_raster: bool,
+    #[serde(default)]
+    pub selected_attributes: Vec<String>,
     pub name: String,
     pub visible: bool,
     pub color: [u8; 3],

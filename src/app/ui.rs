@@ -357,6 +357,10 @@ impl eframe::App for GisEditorApp {
             self.flat_raster_dirty = true;
             self.map_render_ttl = 3;
             self.status = "Raster loaded.".to_string();
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.snapshot_restore.is_some() {
+                self.apply_snapshot_progress();
+            }
         }
 
         // ── Snapshot file pick ────────────────────────────────────────────────
@@ -369,7 +373,6 @@ impl eframe::App for GisEditorApp {
                         let mut queue: std::collections::VecDeque<_> =
                             snap.layers.into_iter().collect();
                         if let Some(first) = queue.pop_front() {
-                            let first_path = first.file_path.clone();
                             // Cancel any in-progress load so its messages don't land on the new layer.
                             self.load_rx = None;
                             self.streaming_features = true;
@@ -388,12 +391,12 @@ impl eframe::App for GisEditorApp {
                             self.show_local_variance = false;
                             self.snapshot_restore = Some(crate::snapshot::PendingSnapshotRestore {
                                 queue,
-                                pending_layer_settings: Some(first),
+                                pending_layer_settings: None,
                                 viewport: snap.viewport,
                                 display: snap.display,
                                 analysis: snap.analysis,
                             });
-                            self.open_file(GisFilePath::LocalFile(first_path));
+                            self.open_snapshot_layer(first);
                         } else {
                             self.status = "Snapshot has no layers.".to_string();
                         }
@@ -412,8 +415,14 @@ impl eframe::App for GisEditorApp {
         #[cfg(not(target_arch = "wasm32"))]
         if self.snapshot_restore.is_some() && self.pending_file.is_some() {
             self.pending_load_mode = super::LoadMode::WithAttributes;
-            for (_, sel) in &mut self.pending_field_selection {
-                *sel = true;
+            let selected_attrs = self
+                .snapshot_restore
+                .as_ref()
+                .and_then(|r| r.pending_layer_settings.as_ref())
+                .map(|s| s.selected_attributes.clone())
+                .unwrap_or_default();
+            for (name, sel) in &mut self.pending_field_selection {
+                *sel = selected_attrs.is_empty() || selected_attrs.contains(name);
             }
             load_indices = Some(
                 self.pending_layers.iter().enumerate().map(|(i, _)| i).collect(),
