@@ -268,15 +268,116 @@ pub enum BatchMessage {
     Vector(usize, Vec<GisFeature>),
 }
 
+// ── Raster (GeoTIFF) data model ────────────────────────────────────────────────
+
+/// One channel of a (possibly multi-band) raster — same width×height grid as
+/// its parent `RasterData`, row-major, `f32::NAN` marks cells with no data.
+#[derive(Debug, Clone)]
+pub struct RasterBand {
+    pub name: String,
+    pub values: Vec<f32>,
+    pub data_min: f64,
+    pub data_max: f64,
+    /// Colormap range for single-band display — defaults to (data_min, data_max).
+    pub display_min: f64,
+    pub display_max: f64,
+}
+
+/// How a multi-band raster's bands are combined into the overlay texture.
+#[derive(Debug, Clone)]
+pub enum RasterDisplayMode {
+    /// Single band through the blue→red ramp, using that band's display range.
+    Single(usize),
+    /// Three bands sampled straight into RGB channels (true/false color composite).
+    Rgb { r: usize, g: usize, b: usize },
+}
+
+/// A dense lon/lat grid. Canonical layout: full -180..180 / -90..90 canvas,
+/// row 0 = lat +90 (north), col 0 = lon -180, row-major.
+#[derive(Debug, Clone)]
+pub struct RasterData {
+    pub width: usize,
+    pub height: usize,
+    pub bands: Vec<RasterBand>,
+    /// Unit label parsed from the source file, e.g. "K" — empty if unknown.
+    pub units: String,
+    pub display_mode: RasterDisplayMode,
+}
+
+impl RasterData {
+    pub fn variable(&self) -> &str {
+        match &self.display_mode {
+            RasterDisplayMode::Single(i) => self.bands[*i].name.as_str(),
+            RasterDisplayMode::Rgb { .. } => "RGB composite",
+        }
+    }
+}
+
+/// Blue→red heatmap colormap over normalized `t` in [0, 1].
+pub fn ramp_rgba(t: f64) -> [u8; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let r = (t * 255.0) as u8;
+    let g = (4.0 * t * (1.0 - t) * 200.0).min(255.0) as u8;
+    let b = ((1.0 - t) * 255.0) as u8;
+    [r, g, b, 255]
+}
+
+fn norm_channel(v: f32, lo: f64, hi: f64) -> Option<u8> {
+    if v.is_nan() {
+        return None;
+    }
+    let t = if hi > lo { (v as f64 - lo) / (hi - lo) } else { 0.0 };
+    Some((t.clamp(0.0, 1.0) * 255.0) as u8)
+}
+
+/// Bake a raster's active display mode into an RGBA8 byte buffer (row-major,
+/// same width×height as `data`). Shared by the flat CPU texture overlay and
+/// the globe's GPU texture upload.
+pub fn bake_raster_rgba(data: &RasterData) -> Vec<u8> {
+    let px = data.width * data.height;
+    let mut out = Vec::with_capacity(px * 4);
+
+    match &data.display_mode {
+        RasterDisplayMode::Single(i) => {
+            let band = &data.bands[*i];
+            let (lo, hi) = (band.display_min, band.display_max);
+            for &v in &band.values {
+                if v.is_nan() {
+                    out.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    let t = if hi > lo { (v as f64 - lo) / (hi - lo) } else { 0.0 };
+                    out.extend_from_slice(&ramp_rgba(t));
+                }
+            }
+        }
+        RasterDisplayMode::Rgb { r, g, b } => {
+            let (rb, gb, bb) = (&data.bands[*r], &data.bands[*g], &data.bands[*b]);
+            for i in 0..px {
+                let rv = norm_channel(rb.values[i], rb.display_min, rb.display_max);
+                let gv = norm_channel(gb.values[i], gb.display_min, gb.display_max);
+                let bv = norm_channel(bb.values[i], bb.display_min, bb.display_max);
+                if rv.is_none() && gv.is_none() && bv.is_none() {
+                    out.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    out.extend_from_slice(&[rv.unwrap_or(0), gv.unwrap_or(0), bv.unwrap_or(0), 255]);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub enum LayerKind {
     Points(PointCloudLayer),
     Vector(GisLayer),
+    Raster(RasterData),
 }
 impl LayerKind {
     pub fn reset_filter_mask(&mut self) {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.filter_mask.fill(true),
             LayerKind::Vector(gis_layer) => {}
+            LayerKind::Raster(_) => {}
         }
     }
     pub fn clear_layer(&mut self) {
@@ -289,6 +390,7 @@ impl LayerKind {
             LayerKind::Vector(gis_layer) => {
                 gis_layer.features.clear();
             }
+            LayerKind::Raster(_) => {}
         }
     }
     pub fn features_in_bbox(&self, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Vec<usize> {
@@ -300,30 +402,35 @@ impl LayerKind {
         match self {
             LayerKind::Vector(gis_layer) => gis_layer.features.len(),
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.points.len(),
+            LayerKind::Raster(r) => r.width * r.height,
         }
     }
     pub fn filtered_count(&self) -> usize {
         match self {
             LayerKind::Points(pc) => pc.filter_mask.count_ones(),
             LayerKind::Vector(gl) => gl.features.len(),
+            LayerKind::Raster(r) => r.width * r.height,
         }
     }
     pub fn feature(&self, idx: usize) -> Option<&GisFeature> {
         match self {
             LayerKind::Vector(gis_layer) => Some(&gis_layer.features[idx]),
             LayerKind::Points(point_cloud_layer) => None,
+            LayerKind::Raster(_) => None,
         }
     }
     pub fn field_names(&self) -> Vec<String> {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.field_names.clone(),
             LayerKind::Vector(gis_layer) => gis_layer.field_names.clone(),
+            LayerKind::Raster(_) => Vec::new(),
         }
     }
     pub fn numeric_field_names(&self) -> Vec<String> {
         match self {
             LayerKind::Points(pc) => pc.numeric_field_names(),
             LayerKind::Vector(gl) => gl.field_names.clone(),
+            LayerKind::Raster(_) => Vec::new(),
         }
     }
     pub fn column_type_for(&self, name: &str) -> Option<AttributeType> {
@@ -347,24 +454,28 @@ impl LayerKind {
                     AttributeValue::Integer(_) => AttributeType::Integer,
                     AttributeValue::Text(_) => AttributeType::Text,
                 }),
+            LayerKind::Raster(_) => None,
         }
     }
     pub fn index(&self, kind: IndexKind) -> Option<&SpatialIndex> {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.index.as_deref(),
             LayerKind::Vector(gis_layer) => gis_layer.index(kind),
+            LayerKind::Raster(_) => None,
         }
     }
     pub fn extent(&self) -> Option<[f64; 4]> {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.bbox,
             LayerKind::Vector(gis_layer) => Some(gis_layer.world_bbox),
+            LayerKind::Raster(_) => Some([-180.0, -90.0, 180.0, 90.0]),
         }
     }
     pub fn hit_test(&self, x: f64, y: f64, tolerance: f64) -> Option<usize> {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.hit_test(x, y, tolerance),
             LayerKind::Vector(gis_layer) => gis_layer.hit_test(x, y, tolerance),
+            LayerKind::Raster(_) => None,
         }
     }
     pub fn point_attrs_display(&self, idx: usize) -> Option<Vec<String>> {

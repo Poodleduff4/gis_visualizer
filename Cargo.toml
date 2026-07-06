@@ -13,6 +13,8 @@ egui = "0.34"
 egui-wgpu = "0.34"
 egui_plot = "0.35"
 wgpu = "29"
+glam = "0.29"
+tiff = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 geo = "0.33"
 geo-types = "0.7"

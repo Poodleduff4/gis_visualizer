@@ -20,14 +20,23 @@ use crate::snapshot::{
     AppSnapshot, LayerSnapshot, PendingSnapshotRestore, ViewportSnapshot, DisplaySnapshot,
     AnalysisSnapshot,
 };
+use crate::globe::{GlobeCamera, GlobePipeline, GlobePoint};
 use crate::histogram::{BivariateStats, FieldStats, HistogramState, LisaPoint};
 use crate::map_view::Viewport;
 use crate::point_cloud::{GpuPoint, PointCloudPipeline};
+use crate::raster_reader::RasterDescriptor;
 use crate::sidebar::AddAttributeForm;
 use crate::spatial_index::IndexKind;
 use crate::uncertainty_quadtree::{MeasurementType, UncertaintyMeasure};
 
 pub const LAYER_PANEL_WIDTH: f32 = 180.0;
+
+#[derive(Clone, PartialEq, Default)]
+pub enum MapView {
+    #[default]
+    Flat,
+    Globe,
+}
 
 #[derive(Default, PartialEq)]
 pub(super) enum LoadMode {
@@ -140,6 +149,22 @@ pub struct GisEditorApp {
     pub(super) show_lisa: bool,
     pub(super) lisa_rx: Option<oneshot::Receiver<Option<Vec<Option<LisaPoint>>>>>,
 
+    // ── Globe view + raster ──────────────────────────────────────────────
+    pub(super) map_view: MapView,
+    pub(super) globe_camera: GlobeCamera,
+    pub(super) globe_points_buf: Vec<GlobePoint>,
+    pub(super) globe_points_dirty: bool,
+    /// Consumed by the globe's GPU raster texture upload.
+    pub(super) raster_dirty: bool,
+    /// Consumed independently by the flat map's CPU raster texture cache —
+    /// separate from `raster_dirty` so switching views doesn't miss a rebake
+    /// that the other view already consumed this frame.
+    pub(super) flat_raster_dirty: bool,
+    pub(super) raster_texture: Option<egui::TextureHandle>,
+    pub(super) raster_descriptor_rx: Option<mpsc::Receiver<RasterDescriptor>>,
+    pub(super) pending_raster_descriptor: Option<RasterDescriptor>,
+    pub(super) raster_load_rx: Option<mpsc::Receiver<LayerEntry>>,
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) snapshot_restore: Option<PendingSnapshotRestore>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -150,7 +175,10 @@ impl GisEditorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let has_gpu = if let Some(wrs) = cc.wgpu_render_state.as_ref() {
             let pipeline = PointCloudPipeline::new(&wrs.device, wrs.target_format);
-            wrs.renderer.write().callback_resources.insert(pipeline);
+            let globe_pipeline = GlobePipeline::new(&wrs.device, &wrs.queue, wrs.target_format);
+            let mut renderer = wrs.renderer.write();
+            renderer.callback_resources.insert(pipeline);
+            renderer.callback_resources.insert(globe_pipeline);
             true
         } else {
             false
@@ -237,6 +265,16 @@ impl GisEditorApp {
             lisa_results: None,
             show_lisa: false,
             lisa_rx: None,
+            map_view: MapView::default(),
+            globe_camera: GlobeCamera::default(),
+            globe_points_buf: Vec::new(),
+            globe_points_dirty: false,
+            raster_dirty: false,
+            flat_raster_dirty: false,
+            raster_texture: None,
+            raster_descriptor_rx: None,
+            pending_raster_descriptor: None,
+            raster_load_rx: None,
             #[cfg(not(target_arch = "wasm32"))]
             snapshot_restore: None,
             #[cfg(not(target_arch = "wasm32"))]

@@ -16,6 +16,8 @@ mod parquet;
 mod point_cloud;
 mod point_cloud_layer;
 mod quadtree;
+mod raster_reader;
+mod globe;
 mod sidebar;
 mod spatial_index;
 mod rtree_index;

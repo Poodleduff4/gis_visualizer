@@ -24,7 +24,7 @@ pub fn collect_gpu_points(
         if !entry.visible
             || match &entry.data {
                 LayerKind::Points(_) => false,
-                LayerKind::Vector(_) => true,
+                LayerKind::Vector(_) | LayerKind::Raster(_) => true,
             }
         {
             continue;
@@ -32,7 +32,9 @@ pub fn collect_gpu_points(
         let is_active = active_idx == Some(i);
         let point_cloud_layer = match &entry.data {
             LayerKind::Points(pc) => pc,
-            LayerKind::Vector(_) => panic!("Unexpected layer kind in collect_gpu_points!"),
+            LayerKind::Vector(_) | LayerKind::Raster(_) => {
+                panic!("Unexpected layer kind in collect_gpu_points!")
+            }
         };
         let visible_points = point_cloud_layer
             .points

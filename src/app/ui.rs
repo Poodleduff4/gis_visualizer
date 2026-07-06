@@ -11,22 +11,27 @@ use wasm_bindgen_futures::spawn_local;
 use egui::{CentralPanel, UiKind};
 
 use crate::filter::{FilterLogic, FilterOperation, LayerAttributeFilter};
-use crate::gis_layer::{AttributeValue, BatchMessage, LayerKind};
+use crate::gis_layer::{ramp_rgba, AttributeValue, BatchMessage, LayerKind, RasterDisplayMode};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::GeoParquetReader;
 use crate::gis_reader::{GisFilePath, GisReader};
+use crate::globe::{collect_globe_points, GlobeCallback, GlobePipeline};
 use crate::gpu_collect::collect_gpu_points;
 use crate::heatmap::HeatmapLayer;
 use crate::histogram::{compute_bivariate, compute_field_stats, compute_histogram, extract_field_values, lisa_inner, local_variance_inner};
-use crate::map_view::{draw_lisa_overlay, draw_local_variance_overlay, show_map, show_quadtree_heatmap, show_spatial_index_grid};
+use crate::map_view::{draw_lisa_overlay, draw_local_variance_overlay, render_raster_overlay, show_map, show_quadtree_heatmap, show_spatial_index_grid};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::parquet::{extract_batch_as_u32, query_parquet};
 use crate::point_cloud::{PointCloudCallback, PointCloudPipeline};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::raster_reader::{load_raster_sync, read_raster_descriptor_sync};
+#[cfg(target_arch = "wasm32")]
+use crate::raster_reader::{load_raster_bytes, read_raster_descriptor_bytes};
 use crate::sidebar::{show_sidebar, SidebarAction};
 use crate::spatial_index::IndexKind;
 use crate::uncertainty_quadtree::MeasurementType;
 
-use super::{ClickTarget, GisEditorApp, LoadMode, LAYER_PANEL_WIDTH};
+use super::{ClickTarget, GisEditorApp, LoadMode, MapView, LAYER_PANEL_WIDTH};
 
 impl eframe::App for GisEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -98,6 +103,20 @@ impl eframe::App for GisEditorApp {
                     ui.label("Click target:");
                     ui.radio_value(&mut self.click_target, ClickTarget::Feature, "Feature");
                     ui.radio_value(&mut self.click_target, ClickTarget::GridCell, "Grid Cell");
+                    if self.has_gpu {
+                        ui.separator();
+                        ui.label("Map view:");
+                        if ui.radio(self.map_view == MapView::Flat, "Flat").clicked() {
+                            self.map_view = MapView::Flat;
+                            self.map_render_ttl = 3;
+                        }
+                        if ui.radio(self.map_view == MapView::Globe, "Globe").clicked() {
+                            self.map_view = MapView::Globe;
+                            self.globe_points_dirty = true;
+                            self.raster_dirty = true;
+                            self.map_render_ttl = 3;
+                        }
+                    }
                 });
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
@@ -144,6 +163,39 @@ impl eframe::App for GisEditorApp {
                                 }
                             });
                         }
+                    }
+                    if ui.button("Open Raster (GeoTIFF)…").clicked() {
+                        ui.close_kind(UiKind::Menu);
+                        let (tx, rx) = mpsc::channel::<crate::raster_reader::RasterDescriptor>();
+                        self.raster_descriptor_rx = Some(rx);
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        std::thread::spawn(move || {
+                            if let Some(f) = pollster::block_on(
+                                rfd::AsyncFileDialog::new()
+                                    .add_filter("GeoTIFF", &["tif", "tiff"])
+                                    .pick_file(),
+                            ) {
+                                if let Ok(desc) = read_raster_descriptor_sync(&f.path().to_path_buf()) {
+                                    let _ = tx.send(desc);
+                                }
+                            }
+                        });
+
+                        #[cfg(target_arch = "wasm32")]
+                        spawn_local(async move {
+                            if let Some(f) = rfd::AsyncFileDialog::new()
+                                .add_filter("GeoTIFF", &["tif", "tiff"])
+                                .pick_file()
+                                .await
+                            {
+                                let name = f.file_name();
+                                let bytes = f.read().await;
+                                if let Ok(desc) = read_raster_descriptor_bytes(bytes, &name) {
+                                    let _ = tx.send(desc);
+                                }
+                            }
+                        });
                     }
                     ui.separator();
                     #[cfg(not(target_arch = "wasm32"))]
@@ -195,6 +247,116 @@ impl eframe::App for GisEditorApp {
             self.open_file(file);
             #[cfg(target_arch = "wasm32")]
             self.open_file(file, self.load_layer_descriptor_tx.clone());
+        }
+
+        // ── Raster descriptor pick → preview window ───────────────────────────
+        if let Some(desc) = self.raster_descriptor_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.raster_descriptor_rx = None;
+            self.pending_raster_descriptor = Some(desc);
+        }
+        if let Some(desc) = &self.pending_raster_descriptor {
+            let mut do_load = false;
+            let mut do_cancel = false;
+
+            egui::Window::new("Raster Info")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.strong(&desc.name);
+                    ui.separator();
+                    egui::Grid::new("raster_info_grid").num_columns(2).show(ui, |ui| {
+                        ui.label("Variable:");
+                        ui.label(&desc.variable);
+                        ui.end_row();
+                        if !desc.date.is_empty() {
+                            ui.label("Date:");
+                            ui.label(&desc.date);
+                            ui.end_row();
+                        }
+                        ui.label("Dimensions:");
+                        ui.label(format!("{} × {} px", desc.width, desc.height));
+                        ui.end_row();
+                        ui.label("Pixel count:");
+                        ui.label(format!("{}", desc.width as u64 * desc.height as u64));
+                        ui.end_row();
+                        if !desc.units.is_empty() {
+                            ui.label("Units:");
+                            ui.label(&desc.units);
+                            ui.end_row();
+                        }
+                        ui.label("Sample format:");
+                        ui.label(if desc.is_f32 {
+                            "32-bit float".to_string()
+                        } else {
+                            format!("{}-bit (unsupported)", desc.bits_per_sample)
+                        });
+                        ui.end_row();
+                        ui.label("File size:");
+                        ui.label(format_bytes(desc.file_size));
+                        ui.end_row();
+                    });
+                    ui.separator();
+                    if !desc.is_f32 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 80, 80),
+                            "Expected a 32-bit float TIFF — load may fail.",
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Load").clicked() {
+                            do_load = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_load {
+                let desc = self.pending_raster_descriptor.take().unwrap();
+                let (tx, rx) = mpsc::channel::<crate::gis_layer::LayerEntry>();
+                self.raster_load_rx = Some(rx);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let path = desc.path.unwrap();
+                    std::thread::spawn(move || {
+                        if let Ok(layer) = load_raster_sync(&path) {
+                            let _ = tx.send(layer);
+                        }
+                    });
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let (bytes, name) = desc.bytes.unwrap();
+                    if let Ok(layer) = load_raster_bytes(bytes, &name) {
+                        let _ = tx.send(layer);
+                    }
+                }
+            } else if do_cancel {
+                self.pending_raster_descriptor = None;
+            }
+        }
+        if let Some(layer) = self
+            .raster_load_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.raster_load_rx = None;
+            if let Some(extent) = layer.data.extent() {
+                if let Some(rect) = self.last_canvas_rect {
+                    self.viewport.fit_to(extent, rect);
+                    self.fitted = true;
+                }
+            }
+            self.layers.push(layer);
+            self.active_layer_idx = Some(self.layers.len() - 1);
+            self.points_dirty = true;
+            self.globe_points_dirty = true;
+            self.raster_dirty = true;
+            self.flat_raster_dirty = true;
+            self.map_render_ttl = 3;
+            self.status = "Raster loaded.".to_string();
         }
 
         // ── Snapshot file pick ────────────────────────────────────────────────
@@ -777,6 +939,8 @@ impl eframe::App for GisEditorApp {
                 if color_changed {
                     self.layers[layer_idx].color = color;
                     self.points_dirty = true;
+                    self.globe_points_dirty = true;
+                    self.map_render_ttl = 3;
                 }
                 if !open {
                     self.color_picker_layer = None;
@@ -912,11 +1076,15 @@ impl eframe::App for GisEditorApp {
                         };
                         self.selected_id = None;
                         self.points_dirty = true;
+                        self.globe_points_dirty = true;
+                        self.raster_dirty = true;
+                        self.flat_raster_dirty = true;
+                        self.map_render_ttl = 3;
                     }
                     if let Some(idx) = rebuild_rtree_idx {
                         match &mut self.layers[idx].data {
                             LayerKind::Points(pc) => pc.rebuild_rtree(),
-                            LayerKind::Vector(_) => {}
+                            LayerKind::Vector(_) | LayerKind::Raster(_) => {}
                         }
                         self.fitted = true;
                         self.viewport_load_pending = true;
@@ -927,6 +1095,7 @@ impl eframe::App for GisEditorApp {
                         match &mut self.layers[idx].data {
                             LayerKind::Points(pc) => pc.rebuild_quadtree(capacity),
                             LayerKind::Vector(gl) => gl.rebuild_quadtree(capacity),
+                            LayerKind::Raster(_) => {}
                         }
                         self.fitted = true;
                         self.viewport_load_pending = true;
@@ -944,6 +1113,7 @@ impl eframe::App for GisEditorApp {
                                 }
                             }
                             LayerKind::Vector(_gl) => {}
+                            LayerKind::Raster(_) => {}
                         }
                     }
                     if let Some(idx) = rebuild_hilbert_idx {
@@ -951,6 +1121,7 @@ impl eframe::App for GisEditorApp {
                         match &mut self.layers[idx].data {
                             LayerKind::Points(pc) => pc.rebuild_hilbert_tree(order),
                             LayerKind::Vector(gl) => gl.rebuild_hilbert_tree(order),
+                            LayerKind::Raster(_) => {}
                         }
                         self.fitted = true;
                         self.viewport_load_pending = true;
@@ -958,6 +1129,10 @@ impl eframe::App for GisEditorApp {
                     }
                     if visibility_changed {
                         self.points_dirty = true;
+                        self.globe_points_dirty = true;
+                        self.raster_dirty = true;
+                        self.flat_raster_dirty = true;
+                        self.map_render_ttl = 3;
                     }
                 }
             });
@@ -979,6 +1154,143 @@ impl eframe::App for GisEditorApp {
                             }
                         });
                         self.last_stats_field = self.histogram_field.clone();
+                    }
+
+                    // ── Raster controls (band/range/legend) ────────────────────
+                    if let Some(idx) = self.active_layer_idx {
+                        if let LayerKind::Raster(raster) = &mut self.layers[idx].data {
+                            ui.heading("Raster");
+                            ui.label(format!("Variable: {}", raster.variable()));
+                            ui.label(format!("Grid: {}×{}", raster.width, raster.height));
+
+                            let mut changed = false;
+
+                            if raster.bands.len() > 1 {
+                                let is_rgb = matches!(raster.display_mode, RasterDisplayMode::Rgb { .. });
+                                ui.horizontal(|ui| {
+                                    if ui.selectable_label(!is_rgb, "Single band").clicked() && is_rgb {
+                                        raster.display_mode = RasterDisplayMode::Single(0);
+                                        changed = true;
+                                    }
+                                    if ui.selectable_label(is_rgb, "RGB composite").clicked() && !is_rgb {
+                                        let n = raster.bands.len();
+                                        raster.display_mode = RasterDisplayMode::Rgb {
+                                            r: 0,
+                                            g: 1.min(n - 1),
+                                            b: 2.min(n - 1),
+                                        };
+                                        changed = true;
+                                    }
+                                });
+                            }
+
+                            match &mut raster.display_mode {
+                                RasterDisplayMode::Single(band_idx) => {
+                                    if raster.bands.len() > 1 {
+                                        let names: Vec<String> =
+                                            raster.bands.iter().map(|b| b.name.clone()).collect();
+                                        egui::ComboBox::from_label("Band")
+                                            .selected_text(names[*band_idx].clone())
+                                            .show_ui(ui, |ui| {
+                                                for (i, name) in names.iter().enumerate() {
+                                                    if ui.selectable_value(band_idx, i, name).clicked() {
+                                                        changed = true;
+                                                    }
+                                                }
+                                            });
+                                    }
+                                    let band = &mut raster.bands[*band_idx];
+                                    ui.label(format!(
+                                        "Data range: {:.2} .. {:.2}",
+                                        band.data_min, band.data_max
+                                    ));
+                                    ui.horizontal(|ui| {
+                                        ui.label("Min:");
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut band.display_min)
+                                                    .speed((band.data_max - band.data_min) / 200.0),
+                                            )
+                                            .changed()
+                                        {
+                                            changed = true;
+                                        }
+                                        ui.label("Max:");
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut band.display_max)
+                                                    .speed((band.data_max - band.data_min) / 200.0),
+                                            )
+                                            .changed()
+                                        {
+                                            changed = true;
+                                        }
+                                        if ui.small_button("Reset range").clicked() {
+                                            band.display_min = band.data_min;
+                                            band.display_max = band.data_max;
+                                            changed = true;
+                                        }
+                                    });
+
+                                    // Gradient legend
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 16.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let steps = 32;
+                                    let w = rect.width() / steps as f32;
+                                    for i in 0..steps {
+                                        let t = i as f64 / (steps - 1) as f64;
+                                        let [r, g, b, a] = ramp_rgba(t);
+                                        let seg = egui::Rect::from_min_size(
+                                            egui::pos2(rect.left() + i as f32 * w, rect.top()),
+                                            egui::vec2(w + 1.0, rect.height()),
+                                        );
+                                        ui.painter().rect_filled(
+                                            seg,
+                                            0.0,
+                                            egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+                                        );
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(format!("{:.1}", band.display_min)).small());
+                                        let units = if raster.units.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" ({})", raster.units)
+                                        };
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("{:.1}{units}", band.display_max))
+                                                    .small(),
+                                            );
+                                        });
+                                    });
+                                }
+                                RasterDisplayMode::Rgb { r, g, b } => {
+                                    let names: Vec<String> =
+                                        raster.bands.iter().map(|bd| bd.name.clone()).collect();
+                                    for (label, idx) in [("Red", r), ("Green", g), ("Blue", b)] {
+                                        egui::ComboBox::from_label(label)
+                                            .selected_text(names[*idx].clone())
+                                            .show_ui(ui, |ui| {
+                                                for (i, name) in names.iter().enumerate() {
+                                                    if ui.selectable_value(idx, i, name).clicked() {
+                                                        changed = true;
+                                                    }
+                                                }
+                                            });
+                                    }
+                                }
+                            }
+
+                            if changed {
+                                self.raster_dirty = true;
+                                self.flat_raster_dirty = true;
+                                self.map_render_ttl = 3;
+                            }
+                            ui.separator();
+                        }
                     }
 
                     let action = show_sidebar(
@@ -1297,7 +1609,7 @@ impl eframe::App for GisEditorApp {
                                 self.points_dirty = true;
                                 ui.request_repaint();
                             }
-                            LayerKind::Vector(_) => {}
+                            LayerKind::Vector(_) | LayerKind::Raster(_) => {}
                         }
                     }
                 }
@@ -1355,6 +1667,7 @@ impl eframe::App for GisEditorApp {
                     LayerKind::Vector(vector_layer) => {
                         vector_layer.rebuild_quadtree(capacity);
                     }
+                    LayerKind::Raster(_) => {}
                 }
             }
             self.last_split_density = capacity;
@@ -1372,6 +1685,7 @@ impl eframe::App for GisEditorApp {
                     LayerKind::Vector(vector_layer) => {
                         vector_layer.rebuild_hilbert_tree(order);
                     }
+                    LayerKind::Raster(_) => {}
                 }
             }
             self.last_hilbert_order = order;
@@ -1515,9 +1829,13 @@ impl eframe::App for GisEditorApp {
             }
         }
 
-        let active_layer = self.active_layer_idx.and_then(|i| self.layers.get(i));
         // ── Map (central panel) ───────────────────────────────────────────────
         CentralPanel::default().show_inside(ui, |ui| {
+            if self.map_view == MapView::Globe {
+                self.show_globe(ui, frame);
+                return;
+            }
+            let active_layer = self.active_layer_idx.and_then(|i| self.layers.get(i));
             if !self.fitted {
                 if let Some(entry) = active_layer {
                     if let Some(extent) = entry.data.extent() {
@@ -1575,6 +1893,29 @@ impl eframe::App for GisEditorApp {
                         },
                     ),
                 ));
+            }
+
+            let visible_raster = self.layers.iter().find_map(|l| {
+                if !l.visible {
+                    return None;
+                }
+                if let LayerKind::Raster(r) = &l.data {
+                    Some(r)
+                } else {
+                    None
+                }
+            });
+            if let Some(raster) = visible_raster {
+                render_raster_overlay(
+                    ui,
+                    &painter,
+                    raster,
+                    &self.viewport,
+                    response.rect,
+                    &mut self.raster_texture,
+                    self.flat_raster_dirty,
+                );
+                self.flat_raster_dirty = false;
             }
 
             if self.selected_id != self.last_selected_id {
@@ -1711,5 +2052,97 @@ impl eframe::App for GisEditorApp {
                 }
             }
         });
+    }
+}
+
+impl GisEditorApp {
+    fn show_globe(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let rect = ui.available_rect_before_wrap();
+        self.last_canvas_rect = Some(rect);
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+        if response.dragged() {
+            let delta = response.drag_delta();
+            self.globe_camera.orbit(delta.x, delta.y);
+            self.map_render_ttl = 3;
+        }
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            self.globe_camera.zoom(scroll);
+            self.map_render_ttl = 3;
+        }
+
+        if !self.has_gpu {
+            return;
+        }
+
+        let render_dirty = self.map_render_ttl > 0;
+        if self.map_render_ttl > 0 {
+            self.map_render_ttl -= 1;
+        }
+
+        if self.globe_points_dirty {
+            if let Some(wrs) = frame.wgpu_render_state() {
+                let device = &wrs.device;
+                let queue = &wrs.queue;
+                let mut renderer = wrs.renderer.write();
+                if let Some(pipeline) = renderer.callback_resources.get_mut::<GlobePipeline>() {
+                    collect_globe_points(&self.layers, self.point_size, &mut self.globe_points_buf);
+                    pipeline.upload_points(device, queue, &self.globe_points_buf);
+                }
+            }
+            self.globe_points_dirty = false;
+        }
+
+        if self.raster_dirty {
+            if let Some(wrs) = frame.wgpu_render_state() {
+                let device = &wrs.device;
+                let queue = &wrs.queue;
+                let mut renderer = wrs.renderer.write();
+                if let Some(pipeline) = renderer.callback_resources.get_mut::<GlobePipeline>() {
+                    let raster = self.layers.iter().find_map(|l| {
+                        if !l.visible {
+                            return None;
+                        }
+                        if let LayerKind::Raster(r) = &l.data {
+                            Some(r)
+                        } else {
+                            None
+                        }
+                    });
+                    pipeline.update_raster(device, queue, raster);
+                }
+            }
+            self.raster_dirty = false;
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.add(egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(
+            rect,
+            GlobeCallback {
+                camera: self.globe_camera.clone(),
+                screen_size: [rect.width(), rect.height()],
+                render_dirty,
+            },
+        )));
+
+        if render_dirty {
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
     }
 }

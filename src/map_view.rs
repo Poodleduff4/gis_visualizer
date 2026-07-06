@@ -2,7 +2,7 @@ use bitvec::vec::BitVec;
 
 use crate::app::ClickTarget;
 use crate::basemap::BasemapCache;
-use crate::gis_layer::{LayerEntry, LayerKind, TessellatedGeom};
+use crate::gis_layer::{bake_raster_rgba, LayerEntry, LayerKind, RasterData, TessellatedGeom};
 use crate::heatmap::HeatmapLayer;
 use crate::histogram::{LisaCluster, LisaPoint};
 use crate::spatial_index::{IndexKind, LineSegment, SpatialIndex};
@@ -168,8 +168,8 @@ pub fn show_map(
         // When GPU handles points, skip layers that have no polygons or lines.
         if !render_points
             && match &entry.data {
-                LayerKind::Points(point_cloud_layer) => true,
-                LayerKind::Vector(gis_layer) => false,
+                LayerKind::Points(_) => true,
+                LayerKind::Vector(_) | LayerKind::Raster(_) => false,
             }
         {
             continue;
@@ -396,4 +396,38 @@ fn render_tessellated(
             painter.rect(r, 0.0, fill, stroke, egui::StrokeKind::Outside);
         }
     }
+}
+
+/// Draw a GeoTIFF raster as a single textured rect spanning its full-globe
+/// bbox [-180,-90,180,90]. `texture_cache` is re-baked only when `dirty` (or
+/// empty) — baking + uploading a fresh texture every frame isn't free.
+pub fn render_raster_overlay(
+    ui: &Ui,
+    painter: &Painter,
+    raster: &RasterData,
+    viewport: &Viewport,
+    rect: Rect,
+    texture_cache: &mut Option<egui::TextureHandle>,
+    dirty: bool,
+) {
+    if dirty || texture_cache.is_none() {
+        let rgba = bake_raster_rgba(raster);
+        let image = egui::ColorImage::from_rgba_unmultiplied([raster.width, raster.height], &rgba);
+        *texture_cache = Some(ui.ctx().load_texture(
+            "raster_overlay",
+            image,
+            egui::TextureOptions::LINEAR,
+        ));
+    }
+    let Some(texture) = texture_cache else { return };
+
+    let top_left = viewport.world_to_screen(-180.0, 90.0, rect);
+    let bottom_right = viewport.world_to_screen(180.0, -90.0, rect);
+    let screen_rect = Rect::from_two_pos(top_left, bottom_right);
+    painter.image(
+        texture.id(),
+        screen_rect,
+        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
