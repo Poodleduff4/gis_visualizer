@@ -1,5 +1,6 @@
 mod app;
 mod basemap;
+mod snapshot;
 mod exporter;
 mod filter;
 mod gpu_collect;

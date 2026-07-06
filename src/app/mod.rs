@@ -14,7 +14,13 @@ use crate::gis_layer::{BatchMessage, LayerEntry};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::FgbReaderCache;
 use crate::gis_reader::{GisFilePath, LayerDescriptor};
-use crate::histogram::{BivariateStats, FieldStats, HistogramState};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::snapshot::{
+    filter_snapshot_to_filter, filter_to_snapshot, filter_logic_to_str, str_to_filter_logic,
+    AppSnapshot, LayerSnapshot, PendingSnapshotRestore, ViewportSnapshot, DisplaySnapshot,
+    AnalysisSnapshot,
+};
+use crate::histogram::{BivariateStats, FieldStats, HistogramState, LisaPoint};
 use crate::map_view::Viewport;
 use crate::point_cloud::{GpuPoint, PointCloudPipeline};
 use crate::sidebar::AddAttributeForm;
@@ -124,6 +130,20 @@ pub struct GisEditorApp {
     /// Counts down from N after any map-relevant change; GPU callback runs while > 0 or cursor is in map.
     pub(super) map_render_ttl: u32,
     pub(super) color_picker_layer: Option<usize>,
+
+    pub(super) spatial_field: String,
+    pub(super) spatial_radius: f64,
+    pub(super) local_variance_results: Option<Vec<Option<f64>>>,
+    pub(super) show_local_variance: bool,
+    pub(super) local_variance_rx: Option<oneshot::Receiver<Vec<Option<f64>>>>,
+    pub(super) lisa_results: Option<Vec<Option<LisaPoint>>>,
+    pub(super) show_lisa: bool,
+    pub(super) lisa_rx: Option<oneshot::Receiver<Option<Vec<Option<LisaPoint>>>>>,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) snapshot_restore: Option<PendingSnapshotRestore>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) snapshot_pick_rx: Option<std::sync::mpsc::Receiver<std::path::PathBuf>>,
 }
 
 impl GisEditorApp {
@@ -209,6 +229,117 @@ impl GisEditorApp {
             bivariate_y_field: String::new(),
             map_render_ttl: 0,
             color_picker_layer: None,
+            spatial_field: String::new(),
+            spatial_radius: 0.01,
+            local_variance_results: None,
+            show_local_variance: false,
+            local_variance_rx: None,
+            lisa_results: None,
+            show_lisa: false,
+            lisa_rx: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            snapshot_restore: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            snapshot_pick_rx: None,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GisEditorApp {
+    pub(super) fn capture_snapshot(&self) -> AppSnapshot {
+        let layers: Vec<LayerSnapshot> = self.layers.iter().map(|le| {
+            LayerSnapshot {
+                file_path: le.descriptor.location.to_string(),
+                name: le.name.clone(),
+                visible: le.visible,
+                color: le.color,
+                opacity: le.opacity,
+                filter_logic: filter_logic_to_str(le.filter_logic),
+                filters: le.filters.iter().filter_map(filter_to_snapshot).collect(),
+            }
+        }).collect();
+
+        AppSnapshot {
+            viewport: ViewportSnapshot {
+                center: self.viewport.center,
+                pixels_per_unit: self.viewport.pixels_per_unit,
+            },
+            display: DisplaySnapshot {
+                show_basemap: self.show_basemap,
+                show_heatmap: self.show_heatmap,
+                show_index: self.show_index,
+                point_size: self.point_size,
+                heatmap_opacity: self.heatmap_opacity,
+            },
+            analysis: AnalysisSnapshot {
+                active_layer_idx: self.active_layer_idx,
+                histogram_field: self.histogram_field.clone(),
+                show_histogram: self.show_histogram,
+                bivariate_y_field: self.bivariate_y_field.clone(),
+                show_bivariate: self.show_bivariate,
+                spatial_field: self.spatial_field.clone(),
+                spatial_radius: self.spatial_radius,
+                show_lisa: self.show_lisa,
+                show_local_variance: self.show_local_variance,
+            },
+            layers,
+        }
+    }
+
+    pub(super) fn apply_snapshot_progress(&mut self) {
+        if self.snapshot_restore.is_none() {
+            return;
+        }
+
+        // Apply settings from the layer we just finished loading.
+        if let Some(layer_snap) = self.snapshot_restore.as_mut().unwrap().pending_layer_settings.take() {
+            let has_filters = !layer_snap.filters.is_empty();
+            if let Some(layer) = self.layers.last_mut() {
+                layer.visible = layer_snap.visible;
+                layer.color = layer_snap.color;
+                layer.opacity = layer_snap.opacity;
+                layer.filter_logic = str_to_filter_logic(&layer_snap.filter_logic);
+                layer.filters = layer_snap.filters.iter().map(filter_snapshot_to_filter).collect();
+            }
+            if has_filters {
+                self.updated_filters = true;
+            }
+        }
+
+        let queue_empty = self.snapshot_restore.as_ref().unwrap().queue.is_empty();
+
+        if queue_empty {
+            let r = self.snapshot_restore.take().unwrap();
+            self.viewport.center = r.viewport.center;
+            self.viewport.pixels_per_unit = r.viewport.pixels_per_unit;
+            self.show_basemap = r.display.show_basemap;
+            self.show_heatmap = r.display.show_heatmap;
+            self.show_index = r.display.show_index;
+            self.point_size = r.display.point_size;
+            self.heatmap_opacity = r.display.heatmap_opacity;
+            self.histogram_field = r.analysis.histogram_field;
+            self.show_histogram = r.analysis.show_histogram;
+            self.bivariate_y_field = r.analysis.bivariate_y_field;
+            self.show_bivariate = r.analysis.show_bivariate;
+            self.spatial_field = r.analysis.spatial_field;
+            self.spatial_radius = r.analysis.spatial_radius;
+            self.show_lisa = r.analysis.show_lisa;
+            self.show_local_variance = r.analysis.show_local_variance;
+            if let Some(idx) = r.analysis.active_layer_idx {
+                if idx < self.layers.len() {
+                    self.active_layer_idx = Some(idx);
+                }
+            }
+            self.points_dirty = true;
+            self.fitted = true; // viewport already restored above — block auto-fit
+            self.map_render_ttl = 10;
+            self.status = "Snapshot loaded.".to_string();
+        } else {
+            let next = self.snapshot_restore.as_mut().unwrap().queue.pop_front().unwrap();
+            let path_str = next.file_path.clone();
+            self.snapshot_restore.as_mut().unwrap().pending_layer_settings = Some(next);
+            self.open_file(GisFilePath::LocalFile(path_str));
         }
     }
 }

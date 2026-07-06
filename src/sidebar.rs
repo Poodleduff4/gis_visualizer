@@ -30,6 +30,8 @@ pub enum SidebarAction {
     OpenHistogram(String),
     OpenBivariate(String, String),
     ExportFiltered,
+    ComputeLocalVariance(String, f64),
+    ComputeLisa(String, f64),
 }
 
 // ── Main sidebar widget ───────────────────────────────────────────────────────
@@ -47,6 +49,8 @@ pub fn show_sidebar(
     histogram_field: &mut String,
     bivariate_y_field: &mut String,
     field_stats: Option<&FieldStats>,
+    spatial_field: &mut String,
+    spatial_radius: &mut f64,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
 
@@ -294,6 +298,55 @@ pub fn show_sidebar(
                     });
             }
         }
+    }
+
+    ui.separator();
+
+    // ── Spatial Analysis ─────────────────────────────────────────────────────
+    ui.label(RichText::new("Spatial Analysis").strong());
+    let numeric_fields = layer.data.numeric_field_names();
+    if !numeric_fields.is_empty() {
+        ui.label("Field:");
+        ComboBox::from_id_salt("spatial_field_combo")
+            .selected_text(if spatial_field.is_empty() {
+                "<select field>"
+            } else {
+                spatial_field.as_str()
+            })
+            .show_ui(ui, |ui| {
+                for name in &numeric_fields {
+                    ui.selectable_value(spatial_field, name.clone(), name.as_str());
+                }
+            });
+
+        ui.horizontal(|ui| {
+            ui.label("Radius:");
+            ui.add(
+                egui::DragValue::new(spatial_radius)
+                    .speed(0.0001)
+                    .range(1e-9..=1e6)
+                    .max_decimals(6),
+            );
+        });
+
+        if !spatial_field.is_empty() {
+            ui.horizontal(|ui| {
+                if ui.button("Local Variance").clicked() {
+                    action = SidebarAction::ComputeLocalVariance(
+                        spatial_field.clone(),
+                        *spatial_radius,
+                    );
+                }
+                if ui.button("LISA").clicked() {
+                    action = SidebarAction::ComputeLisa(
+                        spatial_field.clone(),
+                        *spatial_radius,
+                    );
+                }
+            });
+        }
+    } else {
+        ui.label("No numeric fields.");
     }
 
     ui.separator();

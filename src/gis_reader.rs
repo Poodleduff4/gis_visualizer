@@ -331,21 +331,24 @@ impl GeoParquetReader {
         selected_fields: Option<&[String]>,
         schema: &datafusion::arrow::datatypes::Schema,
     ) -> String {
+        // DataFusion normalises unquoted identifiers to lowercase, so any mixed-case
+        // column name (e.g. "RateCodeID") must be double-quoted to preserve its case.
+        let q = |s: &str| format!("\"{}\"", s);
         let mut cols: Vec<String> = Vec::new();
         if schema.field_with_name("idx").is_ok() {
-            cols.push("idx".to_string());
+            cols.push(q("idx"));
         }
         match geom_src {
             GeometrySource::XYColumns { x_col, y_col } => {
-                cols.push(x_col.clone());
-                cols.push(y_col.clone());
+                cols.push(q(x_col));
+                cols.push(q(y_col));
             }
-            GeometrySource::WkbColumn => cols.push("geometry".to_string()),
+            GeometrySource::WkbColumn => cols.push(q("geometry")),
         }
         if let Some(fields) = selected_fields {
             for f in fields {
                 if schema.field_with_name(f).is_ok() {
-                    cols.push(f.clone());
+                    cols.push(q(f));
                 }
             }
         }

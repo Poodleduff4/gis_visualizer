@@ -17,8 +17,8 @@ use crate::gis_reader::GeoParquetReader;
 use crate::gis_reader::{GisFilePath, GisReader};
 use crate::gpu_collect::collect_gpu_points;
 use crate::heatmap::HeatmapLayer;
-use crate::histogram::{compute_bivariate, compute_field_stats, compute_histogram};
-use crate::map_view::{show_map, show_quadtree_heatmap, show_spatial_index_grid};
+use crate::histogram::{compute_bivariate, compute_field_stats, compute_histogram, extract_field_values, lisa_inner, local_variance_inner};
+use crate::map_view::{draw_lisa_overlay, draw_local_variance_overlay, show_map, show_quadtree_heatmap, show_spatial_index_grid};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::parquet::{extract_batch_as_u32, query_parquet};
 use crate::point_cloud::{PointCloudCallback, PointCloudPipeline};
@@ -145,6 +145,42 @@ impl eframe::App for GisEditorApp {
                             });
                         }
                     }
+                    ui.separator();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if ui.button("Save Snapshot…").clicked() {
+                        ui.close_kind(UiKind::Menu);
+                        let snap = self.capture_snapshot();
+                        match toml::to_string_pretty(&snap) {
+                            Ok(toml_str) => {
+                                std::thread::spawn(move || {
+                                    if let Some(f) = pollster::block_on(
+                                        rfd::AsyncFileDialog::new()
+                                            .set_file_name("snapshot.toml")
+                                            .add_filter("Snapshot", &["toml"])
+                                            .save_file(),
+                                    ) {
+                                        let _ = std::fs::write(f.path(), toml_str);
+                                    }
+                                });
+                            }
+                            Err(e) => self.status = format!("Snapshot error: {e}"),
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if ui.button("Load Snapshot…").clicked() {
+                        ui.close_kind(UiKind::Menu);
+                        let (tx, rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
+                        self.snapshot_pick_rx = Some(rx);
+                        std::thread::spawn(move || {
+                            if let Some(f) = pollster::block_on(
+                                rfd::AsyncFileDialog::new()
+                                    .add_filter("Snapshot", &["toml"])
+                                    .pick_file(),
+                            ) {
+                                let _ = tx.send(f.path().to_path_buf());
+                            }
+                        });
+                    }
                     if ui.button("Quit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -161,10 +197,68 @@ impl eframe::App for GisEditorApp {
             self.open_file(file, self.load_layer_descriptor_tx.clone());
         }
 
+        // ── Snapshot file pick ────────────────────────────────────────────────
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = self.snapshot_pick_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.snapshot_pick_rx = None;
+            match std::fs::read_to_string(&path) {
+                Ok(toml_str) => match toml::from_str::<crate::snapshot::AppSnapshot>(&toml_str) {
+                    Ok(snap) => {
+                        let mut queue: std::collections::VecDeque<_> =
+                            snap.layers.into_iter().collect();
+                        if let Some(first) = queue.pop_front() {
+                            let first_path = first.file_path.clone();
+                            // Cancel any in-progress load so its messages don't land on the new layer.
+                            self.load_rx = None;
+                            self.streaming_features = true;
+                            self.layers.clear();
+                            self.fitted = true; // prevent auto-fit from overriding restored viewport
+                            self.histogram = None;
+                            self.bivariate = None;
+                            self.lisa_results = None;
+                            self.local_variance_results = None;
+                            self.field_stats = None;
+                            self.active_layer_idx = None;
+                            self.selected_id = None;
+                            self.show_histogram = false;
+                            self.show_bivariate = false;
+                            self.show_lisa = false;
+                            self.show_local_variance = false;
+                            self.snapshot_restore = Some(crate::snapshot::PendingSnapshotRestore {
+                                queue,
+                                pending_layer_settings: Some(first),
+                                viewport: snap.viewport,
+                                display: snap.display,
+                                analysis: snap.analysis,
+                            });
+                            self.open_file(GisFilePath::LocalFile(first_path));
+                        } else {
+                            self.status = "Snapshot has no layers.".to_string();
+                        }
+                    }
+                    Err(e) => self.status = format!("Snapshot parse error: {e}"),
+                },
+                Err(e) => self.status = format!("Snapshot read error: {e}"),
+            }
+        }
+
         // ── Layer selector (shown after file pick) ────────────────────────────
         let mut load_indices: Option<Vec<usize>> = None;
         let mut cancel_pending = false;
-        if self.pending_file.is_some() {
+
+        // Auto-confirm layer dialog for snapshot loading.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.snapshot_restore.is_some() && self.pending_file.is_some() {
+            self.pending_load_mode = super::LoadMode::WithAttributes;
+            for (_, sel) in &mut self.pending_field_selection {
+                *sel = true;
+            }
+            load_indices = Some(
+                self.pending_layers.iter().enumerate().map(|(i, _)| i).collect(),
+            );
+        }
+
+        if self.pending_file.is_some() && load_indices.is_none() {
             egui::Window::new("Select Layers")
                 .collapsible(false)
                 .resizable(true)
@@ -449,6 +543,8 @@ impl eframe::App for GisEditorApp {
                 self.status = "Ready".to_string();
                 self.load_rx = None;
                 self.streaming_features = false;
+                #[cfg(not(target_arch = "wasm32"))]
+                self.apply_snapshot_progress();
             }
         }
 
@@ -694,6 +790,9 @@ impl eframe::App for GisEditorApp {
         egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
+                if self.local_variance_rx.is_some() || self.lisa_rx.is_some() {
+                    ui.spinner();
+                }
             });
         });
 
@@ -895,6 +994,8 @@ impl eframe::App for GisEditorApp {
                         &mut self.histogram_field,
                         &mut self.bivariate_y_field,
                         self.field_stats.as_ref(),
+                        &mut self.spatial_field,
+                        &mut self.spatial_radius,
                     );
 
                     match action {
@@ -962,6 +1063,60 @@ impl eframe::App for GisEditorApp {
                                 }
                             }
                         }
+                        SidebarAction::ComputeLocalVariance(field, radius) => {
+                            if let Some(idx) = self.active_layer_idx {
+                                if let LayerKind::Points(pc) = &self.layers[idx].data {
+                                    if let Some(values) = extract_field_values(pc, &field) {
+                                        let points = pc.points.clone();
+                                        let filter_mask = pc.filter_mask.clone();
+                                        let index = pc.index.clone();
+                                        let (tx, rx) = oneshot::channel();
+                                        self.local_variance_rx = Some(rx);
+                                        self.show_local_variance = false;
+                                        self.show_lisa = false;
+                                        self.status = format!("Computing local variance ({} pts)…", pc.filter_mask.count_ones());
+                                        ui.ctx().request_repaint();
+                                        std::thread::spawn(move || {
+                                            let result = local_variance_inner(
+                                                &points,
+                                                &filter_mask,
+                                                &values,
+                                                radius,
+                                                index.as_deref(),
+                                            );
+                                            tx.send(result).ok();
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        SidebarAction::ComputeLisa(field, radius) => {
+                            if let Some(idx) = self.active_layer_idx {
+                                if let LayerKind::Points(pc) = &self.layers[idx].data {
+                                    if let Some(values) = extract_field_values(pc, &field) {
+                                        let points = pc.points.clone();
+                                        let filter_mask = pc.filter_mask.clone();
+                                        let index = pc.index.clone();
+                                        let (tx, rx) = oneshot::channel();
+                                        self.lisa_rx = Some(rx);
+                                        self.show_lisa = false;
+                                        self.show_local_variance = false;
+                                        self.status = format!("Computing LISA ({} pts)…", pc.filter_mask.count_ones());
+                                        ui.ctx().request_repaint();
+                                        std::thread::spawn(move || {
+                                            let result = lisa_inner(
+                                                &points,
+                                                &filter_mask,
+                                                &values,
+                                                radius,
+                                                index.as_deref(),
+                                            );
+                                            tx.send(result).ok();
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         SidebarAction::None => {}
                     }
                 });
@@ -983,45 +1138,42 @@ impl eframe::App for GisEditorApp {
                             FilterLogic::And => " AND ",
                             FilterLogic::Or => " OR ",
                         };
-                        let query = format!(
-                            "SELECT idx,{} from layer WHERE {}",
-                            layer.data.field_names().join(","),
-                            layer
-                                .filters
-                                .iter()
-                                .map(|f| {
-                                    format!(
-                                        "{} {} {}",
-                                        f.attribute.clone().unwrap(),
-                                        f.operation.clone().unwrap().to_string(),
-                                        f.comparitor_raw
-                                    )
-                                })
-                                .collect::<Vec<String>>()
-                                .join(join_op)
-                        );
-                        println!("{}", query);
+                        let where_clause = layer
+                            .filters
+                            .iter()
+                            .map(|f| {
+                                let attr = f.attribute.as_deref().unwrap_or("");
+                                let op = f.operation.clone().unwrap().to_string();
+                                let val = match &f.comparitor {
+                                    AttributeValue::Text(s) => {
+                                        format!("'{}'", s.replace('\'', "''"))
+                                    }
+                                    AttributeValue::Integer(n) => n.to_string(),
+                                    AttributeValue::Float(v) => v.to_string(),
+                                };
+                                format!("\"{}\" {} {}", attr, op, val)
+                            })
+                            .collect::<Vec<String>>()
+                            .join(join_op);
+                        let query = format!("SELECT \"idx\" FROM layer WHERE {}", where_clause);
+                        let file_path = layer.descriptor.location.to_string();
                         let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
                         self.filtered_idx_rx = Some(rx);
                         std::thread::spawn(move || {
                             let rt = tokio::runtime::Runtime::new().unwrap();
                             rt.block_on(async {
                                 let matching_ids =
-                                    match query_parquet("./assets/output.parquet", query).await {
-                                        Ok(batch_vec) => {
-                                            println!("Ok Query!");
-                                            batch_vec
-                                                .iter()
-                                                .filter_map(|b| extract_batch_as_u32(b, "idx"))
-                                                .flatten()
-                                                .collect::<Vec<u32>>()
-                                        }
+                                    match query_parquet(&file_path, query).await {
+                                        Ok(batch_vec) => batch_vec
+                                            .iter()
+                                            .filter_map(|b| extract_batch_as_u32(b, "idx"))
+                                            .flatten()
+                                            .collect::<Vec<u32>>(),
                                         Err(e) => {
-                                            println!("{:?}", e);
+                                            eprintln!("[filter] {e:#}");
                                             Vec::new()
                                         }
                                     };
-                                println!("Thread DOne!");
                                 let _ = tx.send((idx, matching_ids));
                             });
                         });
@@ -1153,6 +1305,42 @@ impl eframe::App for GisEditorApp {
                     println!("Not Ready Yet")
                 }
                 Err(_e) => self.filtered_idx_rx = None,
+            }
+        }
+
+        // ── Poll spatial analysis background results ──────────────────────────
+        if let Some(rx) = &mut self.local_variance_rx {
+            match rx.try_recv() {
+                Ok(Some(result)) => {
+                    self.local_variance_results = Some(result);
+                    self.show_local_variance = true;
+                    self.local_variance_rx = None;
+                    self.status = "Local variance done.".to_string();
+                }
+                Ok(None) => {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(_) => {
+                    self.local_variance_rx = None;
+                    self.status = "Local variance failed.".to_string();
+                }
+            }
+        }
+        if let Some(rx) = &mut self.lisa_rx {
+            match rx.try_recv() {
+                Ok(Some(result)) => {
+                    self.lisa_results = result;
+                    self.show_lisa = self.lisa_results.is_some();
+                    self.lisa_rx = None;
+                    self.status = "LISA done.".to_string();
+                }
+                Ok(None) => {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(_) => {
+                    self.lisa_rx = None;
+                    self.status = "LISA failed.".to_string();
+                }
             }
         }
 
@@ -1416,6 +1604,111 @@ impl eframe::App for GisEditorApp {
                     .map(|e| e.data.index(self.index_kind))
                     .flatten();
                 show_spatial_index_grid(&painter, index, &mut self.viewport, response.rect);
+            }
+
+            if self.show_local_variance {
+                if let (Some(variances), Some(idx)) =
+                    (&self.local_variance_results, self.active_layer_idx)
+                {
+                    if let LayerKind::Points(pc) = &self.layers[idx].data {
+                        draw_local_variance_overlay(
+                            &painter,
+                            &pc.points,
+                            &pc.filter_mask,
+                            variances,
+                            &self.viewport,
+                            response.rect,
+                            200,
+                        );
+                        // legend
+                        let r = response.rect;
+                        let x = r.min.x + 10.0;
+                        let mut y = r.max.y - 80.0;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x - 4.0, y - 4.0),
+                                egui::vec2(140.0, 72.0),
+                            ),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                        );
+                        painter.text(
+                            egui::pos2(x, y),
+                            egui::Align2::LEFT_TOP,
+                            "Local Variance",
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        y += 16.0;
+                        for (label, color) in [
+                            ("Low", egui::Color32::from_rgb(0, 0, 255)),
+                            ("Medium", egui::Color32::from_rgb(0, 200, 0)),
+                            ("High", egui::Color32::from_rgb(255, 0, 0)),
+                        ] {
+                            painter.circle_filled(egui::pos2(x + 6.0, y + 6.0), 5.0, color);
+                            painter.text(
+                                egui::pos2(x + 16.0, y),
+                                egui::Align2::LEFT_TOP,
+                                label,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+                            y += 16.0;
+                        }
+                    }
+                }
+            }
+
+            if self.show_lisa {
+                if let (Some(lisa), Some(idx)) = (&self.lisa_results, self.active_layer_idx) {
+                    if let LayerKind::Points(pc) = &self.layers[idx].data {
+                        draw_lisa_overlay(
+                            &painter,
+                            &pc.points,
+                            &pc.filter_mask,
+                            lisa,
+                            &self.viewport,
+                            response.rect,
+                            200,
+                        );
+                        // legend
+                        let r = response.rect;
+                        let x = r.min.x + 10.0;
+                        let mut y = r.max.y - 96.0;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x - 4.0, y - 4.0),
+                                egui::vec2(170.0, 88.0),
+                            ),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                        );
+                        painter.text(
+                            egui::pos2(x, y),
+                            egui::Align2::LEFT_TOP,
+                            "LISA Clusters",
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        y += 16.0;
+                        for (label, color) in [
+                            ("HH — high cluster", egui::Color32::from_rgb(220, 30, 30)),
+                            ("LL — low cluster", egui::Color32::from_rgb(30, 80, 220)),
+                            ("HL — high outlier", egui::Color32::from_rgb(240, 140, 20)),
+                            ("LH — low outlier", egui::Color32::from_rgb(20, 200, 220)),
+                        ] {
+                            painter.circle_filled(egui::pos2(x + 6.0, y + 6.0), 5.0, color);
+                            painter.text(
+                                egui::pos2(x + 16.0, y),
+                                egui::Align2::LEFT_TOP,
+                                label,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+                            y += 16.0;
+                        }
+                    }
+                }
             }
         });
     }
