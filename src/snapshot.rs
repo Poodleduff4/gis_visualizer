@@ -54,6 +54,36 @@ pub struct LayerSnapshot {
     pub opacity: u8,
     pub filter_logic: String,
     pub filters: Vec<FilterSnapshot>,
+    #[serde(default)]
+    pub quadtree_capacity: Option<usize>,
+    #[serde(default)]
+    pub hilbert_order: Option<u32>,
+    #[serde(default)]
+    pub built_rtree: bool,
+    #[serde(default)]
+    pub uncertainty: Option<UncertaintySnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UncertaintySnapshot {
+    pub attribute: String,
+    pub threshold: f32,
+    pub measurement_type: String,
+    pub max_depth: usize,
+}
+
+pub fn measurement_type_to_str(mt: &crate::uncertainty_quadtree::MeasurementType) -> String {
+    match mt {
+        crate::uncertainty_quadtree::MeasurementType::Variance => "Variance".to_string(),
+        crate::uncertainty_quadtree::MeasurementType::KernalDensity => "KernalDensity".to_string(),
+    }
+}
+
+pub fn str_to_measurement_type(s: &str) -> crate::uncertainty_quadtree::MeasurementType {
+    match s {
+        "KernalDensity" => crate::uncertainty_quadtree::MeasurementType::KernalDensity,
+        _ => crate::uncertainty_quadtree::MeasurementType::Variance,
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]

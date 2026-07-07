@@ -160,11 +160,18 @@ impl PointCloudLayer {
         attribute: String,
         threshold: f32,
         measurement_type: MeasurementType,
+        max_depth: usize,
     ) {
         self.ensure_bbox();
         let Some(bbox) = self.bbox else { return };
         let field_idx = self.field_names.iter().position(|n| n == &attribute);
-        let mut uq = UncertaintyQuadtree::new(bbox, attribute.clone(), threshold, measurement_type);
+        let mut uq = UncertaintyQuadtree::with_max_depth(
+            bbox,
+            attribute.clone(),
+            threshold,
+            measurement_type,
+            max_depth,
+        );
         uq.insert_batch(self.points.iter().enumerate().filter_map(|(idx, (i, p))| {
             match self.filter_mask[idx] {
                 true => {

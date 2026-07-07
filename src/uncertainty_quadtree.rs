@@ -50,7 +50,7 @@ pub enum UncertaintyMeasure {
     },
 }
 
-const MAX_DEPTH: usize = 24;
+const DEFAULT_MAX_DEPTH: usize = 12;
 
 pub struct UncertaintyQuadtree {
     bbox: [f64; 4],
@@ -61,6 +61,7 @@ pub struct UncertaintyQuadtree {
     pub uncertainty: Option<UncertaintyMeasure>,
     uncertainty_threshold: f32,
     depth: usize,
+    max_depth: usize,
     split_measure: MeasurementType,
 }
 
@@ -136,6 +137,22 @@ impl UncertaintyQuadtree {
         self.collect_cells_inner(0)
     }
 
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+
+    pub fn threshold(&self) -> f32 {
+        self.uncertainty_threshold
+    }
+
+    pub fn measurement_type(&self) -> MeasurementType {
+        self.split_measure.clone()
+    }
+
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
     pub fn pos_to_node(&self, pos: [f64; 2]) -> Option<&UncertaintyQuadtree> {
         if self.intersects(&[pos[0], pos[1], pos[0], pos[1]]) && !self.divided {
             return Some(&self);
@@ -157,11 +174,21 @@ impl UncertaintyQuadtree {
         threshold: f32,
         measurement_type: MeasurementType,
     ) -> Self {
+        Self::with_max_depth(bbox, attribute, threshold, measurement_type, DEFAULT_MAX_DEPTH)
+    }
+
+    pub fn with_max_depth(
+        bbox: [f64; 4],
+        attribute: String,
+        threshold: f32,
+        measurement_type: MeasurementType,
+        max_depth: usize,
+    ) -> Self {
         println!(
-            "New UncertaintyQuadtree with split type: {:?}",
-            measurement_type
+            "New UncertaintyQuadtree with split type: {:?}, max_depth: {}",
+            measurement_type, max_depth
         );
-        Self::new_at_depth(bbox, attribute, 0, threshold, measurement_type)
+        Self::new_at_depth(bbox, attribute, 0, threshold, measurement_type, max_depth)
     }
 
     fn new_at_depth(
@@ -170,6 +197,7 @@ impl UncertaintyQuadtree {
         depth: usize,
         threshold: f32,
         measurement_type: MeasurementType,
+        max_depth: usize,
     ) -> Self {
         UncertaintyQuadtree {
             bbox,
@@ -180,6 +208,7 @@ impl UncertaintyQuadtree {
             uncertainty: None,
             uncertainty_threshold: threshold,
             depth,
+            max_depth,
             split_measure: measurement_type,
         }
     }
@@ -199,7 +228,7 @@ impl UncertaintyQuadtree {
     }
 
     pub fn should_split(&self) -> bool {
-        self.depth < MAX_DEPTH
+        self.depth < self.max_depth
             && self.uncertainty.as_ref().map_or(false, |u| match u {
                 UncertaintyMeasure::Variance {
                     variance,
@@ -366,6 +395,7 @@ impl UncertaintyQuadtree {
                 next_depth,
                 self.uncertainty_threshold,
                 self.split_measure.clone(),
+                self.max_depth,
             )));
         self.children
             .push(Box::new(UncertaintyQuadtree::new_at_depth(
@@ -374,6 +404,7 @@ impl UncertaintyQuadtree {
                 next_depth,
                 self.uncertainty_threshold,
                 self.split_measure.clone(),
+                self.max_depth,
             )));
         self.children
             .push(Box::new(UncertaintyQuadtree::new_at_depth(
@@ -382,6 +413,7 @@ impl UncertaintyQuadtree {
                 next_depth,
                 self.uncertainty_threshold,
                 self.split_measure.clone(),
+                self.max_depth,
             )));
         self.children
             .push(Box::new(UncertaintyQuadtree::new_at_depth(
@@ -390,6 +422,7 @@ impl UncertaintyQuadtree {
                 next_depth,
                 self.uncertainty_threshold,
                 self.split_measure.clone(),
+                self.max_depth,
             )));
 
         self.divided = true;

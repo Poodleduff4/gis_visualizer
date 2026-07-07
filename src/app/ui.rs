@@ -18,15 +18,21 @@ use crate::gis_reader::{GisFilePath, GisReader};
 use crate::globe::{collect_globe_points, GlobeCallback, GlobePipeline};
 use crate::gpu_collect::collect_gpu_points;
 use crate::heatmap::HeatmapLayer;
-use crate::histogram::{compute_bivariate, compute_field_stats, compute_histogram, extract_field_values, lisa_inner, local_variance_inner};
-use crate::map_view::{draw_lisa_overlay, draw_local_variance_overlay, render_raster_overlay, show_map, show_quadtree_heatmap, show_spatial_index_grid};
+use crate::histogram::{
+    compute_bivariate, compute_field_stats, compute_histogram, extract_field_values, lisa_inner,
+    local_variance_inner,
+};
+use crate::map_view::{
+    draw_lisa_overlay, draw_local_variance_overlay, render_raster_overlay, show_map,
+    show_quadtree_heatmap, show_spatial_index_grid,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::parquet::{extract_batch_as_u32, query_parquet};
 use crate::point_cloud::{PointCloudCallback, PointCloudPipeline};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::raster_reader::{load_raster_sync, read_raster_descriptor_sync};
 #[cfg(target_arch = "wasm32")]
 use crate::raster_reader::{load_raster_bytes, read_raster_descriptor_bytes};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::raster_reader::{load_raster_sync, read_raster_descriptor_sync};
 use crate::sidebar::{show_sidebar, SidebarAction};
 use crate::spatial_index::IndexKind;
 use crate::uncertainty_quadtree::MeasurementType;
@@ -74,6 +80,12 @@ impl eframe::App for GisEditorApp {
                         ui.add(
                             egui::Slider::new(&mut self.uncertainty_split_threshold, 0_f32..=2.)
                                 .step_by(0.01),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Uncertainty Quadtree Max Depth:");
+                        ui.add(
+                            egui::Slider::new(&mut self.uncertainty_max_depth, 1..=20).step_by(1.0),
                         );
                     });
                     ui.horizontal(|ui| {
@@ -144,9 +156,9 @@ impl eframe::App for GisEditorApp {
                             let mut base_url = self.fgb_file_url.clone();
                             spawn_local(async move {
                                 if let Some(f) = rfd::AsyncFileDialog::new()
+                                    .add_filter("All Supported", &["fgb", "parquet"])
                                     .add_filter("FlatGeobuf", &["fgb"])
                                     .add_filter("GeoParquet", &["parquet"])
-                                    .add_filter("All Supported", &["fgb", "parquet"])
                                     .pick_file()
                                     .await
                                 {
@@ -176,7 +188,9 @@ impl eframe::App for GisEditorApp {
                                     .add_filter("GeoTIFF", &["tif", "tiff"])
                                     .pick_file(),
                             ) {
-                                if let Ok(desc) = read_raster_descriptor_sync(&f.path().to_path_buf()) {
+                                if let Ok(desc) =
+                                    read_raster_descriptor_sync(&f.path().to_path_buf())
+                                {
                                     let _ = tx.send(desc);
                                 }
                             }
@@ -250,7 +264,11 @@ impl eframe::App for GisEditorApp {
         }
 
         // ── Raster descriptor pick → preview window ───────────────────────────
-        if let Some(desc) = self.raster_descriptor_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        if let Some(desc) = self
+            .raster_descriptor_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
             self.raster_descriptor_rx = None;
             self.pending_raster_descriptor = Some(desc);
         }
@@ -265,37 +283,39 @@ impl eframe::App for GisEditorApp {
                 .show(ui.ctx(), |ui| {
                     ui.strong(&desc.name);
                     ui.separator();
-                    egui::Grid::new("raster_info_grid").num_columns(2).show(ui, |ui| {
-                        ui.label("Variable:");
-                        ui.label(&desc.variable);
-                        ui.end_row();
-                        if !desc.date.is_empty() {
-                            ui.label("Date:");
-                            ui.label(&desc.date);
+                    egui::Grid::new("raster_info_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Variable:");
+                            ui.label(&desc.variable);
                             ui.end_row();
-                        }
-                        ui.label("Dimensions:");
-                        ui.label(format!("{} × {} px", desc.width, desc.height));
-                        ui.end_row();
-                        ui.label("Pixel count:");
-                        ui.label(format!("{}", desc.width as u64 * desc.height as u64));
-                        ui.end_row();
-                        if !desc.units.is_empty() {
-                            ui.label("Units:");
-                            ui.label(&desc.units);
+                            if !desc.date.is_empty() {
+                                ui.label("Date:");
+                                ui.label(&desc.date);
+                                ui.end_row();
+                            }
+                            ui.label("Dimensions:");
+                            ui.label(format!("{} × {} px", desc.width, desc.height));
                             ui.end_row();
-                        }
-                        ui.label("Sample format:");
-                        ui.label(if desc.is_f32 {
-                            "32-bit float".to_string()
-                        } else {
-                            format!("{}-bit (unsupported)", desc.bits_per_sample)
+                            ui.label("Pixel count:");
+                            ui.label(format!("{}", desc.width as u64 * desc.height as u64));
+                            ui.end_row();
+                            if !desc.units.is_empty() {
+                                ui.label("Units:");
+                                ui.label(&desc.units);
+                                ui.end_row();
+                            }
+                            ui.label("Sample format:");
+                            ui.label(if desc.is_f32 {
+                                "32-bit float".to_string()
+                            } else {
+                                format!("{}-bit (unsupported)", desc.bits_per_sample)
+                            });
+                            ui.end_row();
+                            ui.label("File size:");
+                            ui.label(format_bytes(desc.file_size));
+                            ui.end_row();
                         });
-                        ui.end_row();
-                        ui.label("File size:");
-                        ui.label(format_bytes(desc.file_size));
-                        ui.end_row();
-                    });
                     ui.separator();
                     if !desc.is_f32 {
                         ui.colored_label(
@@ -365,7 +385,11 @@ impl eframe::App for GisEditorApp {
 
         // ── Snapshot file pick ────────────────────────────────────────────────
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(path) = self.snapshot_pick_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        if let Some(path) = self
+            .snapshot_pick_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
             self.snapshot_pick_rx = None;
             match std::fs::read_to_string(&path) {
                 Ok(toml_str) => match toml::from_str::<crate::snapshot::AppSnapshot>(&toml_str) {
@@ -425,7 +449,11 @@ impl eframe::App for GisEditorApp {
                 *sel = selected_attrs.is_empty() || selected_attrs.contains(name);
             }
             load_indices = Some(
-                self.pending_layers.iter().enumerate().map(|(i, _)| i).collect(),
+                self.pending_layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| i)
+                    .collect(),
             );
         }
 
@@ -709,7 +737,8 @@ impl eframe::App for GisEditorApp {
             self.map_render_ttl = 10;
             // Keep polling so the bounded channel doesn't fill and block the stream future.
             // 16 ms cap is fast enough to drain without pinning the UI at full vsync rate.
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
             if let Err(TryRecvError::Disconnected) = load_rx.try_recv() {
                 self.status = "Ready".to_string();
                 self.load_rx = None;
@@ -852,10 +881,19 @@ impl eframe::App for GisEditorApp {
                 .show(ui.ctx(), |ui| {
                     if let Some(bv) = &self.bivariate {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("X: {}   Y: {}", bv.x_field, bv.y_field)).strong());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(format!("n = {}", bv.n));
-                            });
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "X: {}   Y: {}",
+                                    bv.x_field, bv.y_field
+                                ))
+                                .strong(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(format!("n = {}", bv.n));
+                                },
+                            );
                         });
 
                         let points = bv.scatter_points.clone();
@@ -864,11 +902,12 @@ impl eframe::App for GisEditorApp {
                             .x_axis_label(&bv.x_field)
                             .y_axis_label(&bv.y_field)
                             .show(ui, |plot_ui| {
-                                let pts: egui_plot::PlotPoints = points.into_iter().map(|[x, y]| [x, y]).collect();
+                                let pts: egui_plot::PlotPoints =
+                                    points.into_iter().map(|[x, y]| [x, y]).collect();
                                 plot_ui.points(
-                                    egui_plot::Points::new("pts", pts)
-                                        .radius(2.0)
-                                        .color(egui::Color32::from_rgba_unmultiplied(80, 160, 220, 160)),
+                                    egui_plot::Points::new("pts", pts).radius(2.0).color(
+                                        egui::Color32::from_rgba_unmultiplied(80, 160, 220, 160),
+                                    ),
                                 );
                             });
 
@@ -917,7 +956,11 @@ impl eframe::App for GisEditorApp {
                             r if r >= 0.2 => "weak",
                             _ => "negligible",
                         };
-                        let direction = if bv.pearson_r >= 0.0 { "positive" } else { "negative" };
+                        let direction = if bv.pearson_r >= 0.0 {
+                            "positive"
+                        } else {
+                            "negative"
+                        };
                         ui.label(format!("{} {} correlation", strength, direction));
                     }
                 });
@@ -1118,6 +1161,7 @@ impl eframe::App for GisEditorApp {
                                         attr.clone(),
                                         self.uncertainty_split_threshold,
                                         self.selected_split_measurement_type.clone(),
+                                        self.uncertainty_max_depth,
                                     );
                                 }
                             }
@@ -1175,13 +1219,18 @@ impl eframe::App for GisEditorApp {
                             let mut changed = false;
 
                             if raster.bands.len() > 1 {
-                                let is_rgb = matches!(raster.display_mode, RasterDisplayMode::Rgb { .. });
+                                let is_rgb =
+                                    matches!(raster.display_mode, RasterDisplayMode::Rgb { .. });
                                 ui.horizontal(|ui| {
-                                    if ui.selectable_label(!is_rgb, "Single band").clicked() && is_rgb {
+                                    if ui.selectable_label(!is_rgb, "Single band").clicked()
+                                        && is_rgb
+                                    {
                                         raster.display_mode = RasterDisplayMode::Single(0);
                                         changed = true;
                                     }
-                                    if ui.selectable_label(is_rgb, "RGB composite").clicked() && !is_rgb {
+                                    if ui.selectable_label(is_rgb, "RGB composite").clicked()
+                                        && !is_rgb
+                                    {
                                         let n = raster.bands.len();
                                         raster.display_mode = RasterDisplayMode::Rgb {
                                             r: 0,
@@ -1202,7 +1251,10 @@ impl eframe::App for GisEditorApp {
                                             .selected_text(names[*band_idx].clone())
                                             .show_ui(ui, |ui| {
                                                 for (i, name) in names.iter().enumerate() {
-                                                    if ui.selectable_value(band_idx, i, name).clicked() {
+                                                    if ui
+                                                        .selectable_value(band_idx, i, name)
+                                                        .clicked()
+                                                    {
                                                         changed = true;
                                                     }
                                                 }
@@ -1262,18 +1314,27 @@ impl eframe::App for GisEditorApp {
                                         );
                                     }
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(format!("{:.1}", band.display_min)).small());
+                                        ui.label(
+                                            egui::RichText::new(format!("{:.1}", band.display_min))
+                                                .small(),
+                                        );
                                         let units = if raster.units.is_empty() {
                                             String::new()
                                         } else {
                                             format!(" ({})", raster.units)
                                         };
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("{:.1}{units}", band.display_max))
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{:.1}{units}",
+                                                        band.display_max
+                                                    ))
                                                     .small(),
-                                            );
-                                        });
+                                                );
+                                            },
+                                        );
                                     });
                                 }
                                 RasterDisplayMode::Rgb { r, g, b } => {
@@ -1337,26 +1398,39 @@ impl eframe::App for GisEditorApp {
                         SidebarAction::OpenBivariate(x_field, y_field) => {
                             if let Some(idx) = self.active_layer_idx {
                                 if let LayerKind::Points(pc) = &self.layers[idx].data {
-                                    self.bivariate = compute_bivariate(pc, &x_field, &y_field, true, 5000);
+                                    self.bivariate =
+                                        compute_bivariate(pc, &x_field, &y_field, true, 5000);
                                     self.show_bivariate = self.bivariate.is_some();
                                 }
                             }
                         }
-                        SidebarAction::ExportFiltered => {
+                        SidebarAction::ExportFiltered =>
+                        {
                             #[cfg(not(target_arch = "wasm32"))]
                             if let Some(idx) = self.active_layer_idx {
                                 if let LayerKind::Points(pc) = &self.layers[idx].data {
-                                    let points: Vec<(u32, [f64; 2])> = pc.points.iter().cloned().collect();
+                                    let points: Vec<(u32, [f64; 2])> =
+                                        pc.points.iter().cloned().collect();
                                     let field_names = pc.field_names.clone();
                                     let filter_mask = pc.filter_mask.clone();
-                                    let attrs: Vec<_> = pc.attributes.iter().map(|col| {
-                                        use crate::point_cloud_layer::AttributeColumn;
-                                        match col {
-                                            AttributeColumn::Float(v) => AttributeColumn::Float(v.clone()),
-                                            AttributeColumn::Integer(v) => AttributeColumn::Integer(v.clone()),
-                                            AttributeColumn::Text(v) => AttributeColumn::Text(v.clone()),
-                                        }
-                                    }).collect();
+                                    let attrs: Vec<_> = pc
+                                        .attributes
+                                        .iter()
+                                        .map(|col| {
+                                            use crate::point_cloud_layer::AttributeColumn;
+                                            match col {
+                                                AttributeColumn::Float(v) => {
+                                                    AttributeColumn::Float(v.clone())
+                                                }
+                                                AttributeColumn::Integer(v) => {
+                                                    AttributeColumn::Integer(v.clone())
+                                                }
+                                                AttributeColumn::Text(v) => {
+                                                    AttributeColumn::Text(v.clone())
+                                                }
+                                            }
+                                        })
+                                        .collect();
                                     let name = self.layers[idx].name.clone();
                                     std::thread::spawn(move || {
                                         if let Some(path) = pollster::block_on(
@@ -1395,7 +1469,10 @@ impl eframe::App for GisEditorApp {
                                         self.local_variance_rx = Some(rx);
                                         self.show_local_variance = false;
                                         self.show_lisa = false;
-                                        self.status = format!("Computing local variance ({} pts)…", pc.filter_mask.count_ones());
+                                        self.status = format!(
+                                            "Computing local variance ({} pts)…",
+                                            pc.filter_mask.count_ones()
+                                        );
                                         ui.ctx().request_repaint();
                                         std::thread::spawn(move || {
                                             let result = local_variance_inner(
@@ -1422,7 +1499,10 @@ impl eframe::App for GisEditorApp {
                                         self.lisa_rx = Some(rx);
                                         self.show_lisa = false;
                                         self.show_local_variance = false;
-                                        self.status = format!("Computing LISA ({} pts)…", pc.filter_mask.count_ones());
+                                        self.status = format!(
+                                            "Computing LISA ({} pts)…",
+                                            pc.filter_mask.count_ones()
+                                        );
                                         ui.ctx().request_repaint();
                                         std::thread::spawn(move || {
                                             let result = lisa_inner(
@@ -1483,18 +1563,17 @@ impl eframe::App for GisEditorApp {
                         std::thread::spawn(move || {
                             let rt = tokio::runtime::Runtime::new().unwrap();
                             rt.block_on(async {
-                                let matching_ids =
-                                    match query_parquet(&file_path, query).await {
-                                        Ok(batch_vec) => batch_vec
-                                            .iter()
-                                            .filter_map(|b| extract_batch_as_u32(b, "idx"))
-                                            .flatten()
-                                            .collect::<Vec<u32>>(),
-                                        Err(e) => {
-                                            eprintln!("[filter] {e:#}");
-                                            Vec::new()
-                                        }
-                                    };
+                                let matching_ids = match query_parquet(&file_path, query).await {
+                                    Ok(batch_vec) => batch_vec
+                                        .iter()
+                                        .filter_map(|b| extract_batch_as_u32(b, "idx"))
+                                        .flatten()
+                                        .collect::<Vec<u32>>(),
+                                    Err(e) => {
+                                        eprintln!("[filter] {e:#}");
+                                        Vec::new()
+                                    }
+                                };
                                 let _ = tx.send((idx, matching_ids));
                             });
                         });
@@ -1639,7 +1718,8 @@ impl eframe::App for GisEditorApp {
                     self.status = "Local variance done.".to_string();
                 }
                 Ok(None) => {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
                 }
                 Err(_) => {
                     self.local_variance_rx = None;
@@ -1656,7 +1736,8 @@ impl eframe::App for GisEditorApp {
                     self.status = "LISA done.".to_string();
                 }
                 Ok(None) => {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
                 }
                 Err(_) => {
                     self.lisa_rx = None;
@@ -1720,7 +1801,8 @@ impl eframe::App for GisEditorApp {
                 self.viewport_stable_frames += 1;
             }
             if self.viewport_load_pending {
-                let cursor_in_map = self.last_canvas_rect
+                let cursor_in_map = self
+                    .last_canvas_rect
                     .and_then(|rect| ui.ctx().pointer_latest_pos().map(|p| rect.contains(p)))
                     .unwrap_or(false);
                 if cursor_in_map {
@@ -1728,10 +1810,7 @@ impl eframe::App for GisEditorApp {
                 }
             }
 
-            if (self.points_dirty
-                || layer_changed
-                || selection_changed
-                || size_changed)
+            if (self.points_dirty || layer_changed || selection_changed || size_changed)
                 && !self.streaming_features
             {
                 if let Some(wrs) = frame.wgpu_render_state() {
@@ -2126,14 +2205,16 @@ impl GisEditorApp {
         }
 
         let painter = ui.painter_at(rect);
-        painter.add(egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(
-            rect,
-            GlobeCallback {
-                camera: self.globe_camera.clone(),
-                screen_size: [rect.width(), rect.height()],
-                render_dirty,
-            },
-        )));
+        painter.add(egui::Shape::Callback(
+            egui_wgpu::Callback::new_paint_callback(
+                rect,
+                GlobeCallback {
+                    camera: self.globe_camera.clone(),
+                    screen_size: [rect.width(), rect.height()],
+                    render_dirty,
+                },
+            ),
+        ));
 
         if render_dirty {
             ui.ctx().request_repaint();

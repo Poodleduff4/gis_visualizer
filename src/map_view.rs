@@ -209,6 +209,8 @@ pub fn show_map(
     }
 }
 
+const MAX_INDEX_LINES: usize = 100_000;
+
 pub fn show_spatial_index_grid(
     painter: &Painter,
     index: Option<&SpatialIndex>,
@@ -219,7 +221,7 @@ pub fn show_spatial_index_grid(
         return;
     };
     let stroke = Stroke::new(2.0, Color32::from_rgb(0, 0, 255));
-    for LineSegment { start, end } in index.shapes().iter() {
+    for LineSegment { start, end } in index.shapes().iter().take(MAX_INDEX_LINES) {
         let p1 = viewport.world_to_screen(start[0], start[1], rect);
         let p2 = viewport.world_to_screen(end[0], end[1], rect);
         painter.line_segment([p1, p2], stroke);

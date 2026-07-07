@@ -117,6 +117,7 @@ pub struct GisEditorApp {
     pub(super) selected_uncertainty_attribute: Option<String>,
     pub(super) selected_index_cell_data: Option<UncertaintyMeasure>,
     pub(super) uncertainty_split_threshold: f32,
+    pub(super) uncertainty_max_depth: usize,
     pub(super) viewport_culling: bool,
     pub(super) selected_split_measurement_type: MeasurementType,
     pub(super) fgb_file_url: String,
@@ -226,6 +227,7 @@ impl GisEditorApp {
             selected_uncertainty_attribute: None,
             selected_index_cell_data: None,
             uncertainty_split_threshold: 1.0,
+            uncertainty_max_depth: 12,
             viewport_culling: false,
             selected_split_measurement_type: MeasurementType::Variance,
             file_pick_rx: None,
@@ -289,16 +291,61 @@ impl GisEditorApp {
         let layers: Vec<LayerSnapshot> = self
             .layers
             .iter()
-            .map(|le| LayerSnapshot {
-                file_path: le.descriptor.location.to_string(),
-                is_raster: matches!(le.data, LayerKind::Raster(_)),
-                selected_attributes: le.data.field_names(),
-                name: le.name.clone(),
-                visible: le.visible,
-                color: le.color,
-                opacity: le.opacity,
-                filter_logic: filter_logic_to_str(le.filter_logic),
-                filters: le.filters.iter().filter_map(filter_to_snapshot).collect(),
+            .map(|le| {
+                let (quadtree_capacity, hilbert_order, built_rtree, uncertainty) = match &le.data {
+                    LayerKind::Vector(gl) => {
+                        let quadtree_capacity =
+                            gl.quadtree.as_ref().and_then(|si| si.get_capacity());
+                        let hilbert_order = match &gl.hilbert {
+                            Some(crate::spatial_index::SpatialIndex::HilbertCurve(ht)) => {
+                                Some(ht.get_order())
+                            }
+                            _ => None,
+                        };
+                        (quadtree_capacity, hilbert_order, false, None)
+                    }
+                    LayerKind::Points(pc) => match pc.index.as_deref() {
+                        Some(crate::spatial_index::SpatialIndex::Quadtree(qt)) => {
+                            (qt.get_capacity(), None, false, None)
+                        }
+                        Some(crate::spatial_index::SpatialIndex::HilbertCurve(ht)) => {
+                            (None, Some(ht.get_order()), false, None)
+                        }
+                        Some(crate::spatial_index::SpatialIndex::RTree(_)) => {
+                            (None, None, true, None)
+                        }
+                        Some(crate::spatial_index::SpatialIndex::UncertaintyQuadtree(uq)) => (
+                            None,
+                            None,
+                            false,
+                            Some(crate::snapshot::UncertaintySnapshot {
+                                attribute: uq.attribute().to_string(),
+                                threshold: uq.threshold(),
+                                measurement_type: crate::snapshot::measurement_type_to_str(
+                                    &uq.measurement_type(),
+                                ),
+                                max_depth: uq.max_depth(),
+                            }),
+                        ),
+                        None => (None, None, false, None),
+                    },
+                    LayerKind::Raster(_) => (None, None, false, None),
+                };
+                LayerSnapshot {
+                    file_path: le.descriptor.location.to_string(),
+                    is_raster: matches!(le.data, LayerKind::Raster(_)),
+                    selected_attributes: le.data.field_names(),
+                    name: le.name.clone(),
+                    visible: le.visible,
+                    color: le.color,
+                    opacity: le.opacity,
+                    filter_logic: filter_logic_to_str(le.filter_logic),
+                    filters: le.filters.iter().filter_map(filter_to_snapshot).collect(),
+                    quadtree_capacity,
+                    hilbert_order,
+                    built_rtree,
+                    uncertainty,
+                }
             })
             .collect();
 
@@ -353,6 +400,33 @@ impl GisEditorApp {
                     .iter()
                     .map(filter_snapshot_to_filter)
                     .collect();
+                match &mut layer.data {
+                    LayerKind::Vector(gl) => {
+                        if let Some(cap) = layer_snap.quadtree_capacity {
+                            gl.rebuild_quadtree(cap);
+                        }
+                        if let Some(order) = layer_snap.hilbert_order {
+                            gl.rebuild_hilbert_tree(order);
+                        }
+                    }
+                    LayerKind::Points(pc) => {
+                        if let Some(cap) = layer_snap.quadtree_capacity {
+                            pc.rebuild_quadtree(cap);
+                        } else if let Some(order) = layer_snap.hilbert_order {
+                            pc.rebuild_hilbert_tree(order);
+                        } else if layer_snap.built_rtree {
+                            pc.rebuild_rtree();
+                        } else if let Some(u) = &layer_snap.uncertainty {
+                            pc.rebuild_uncertainty_quadtree(
+                                u.attribute.clone(),
+                                u.threshold,
+                                crate::snapshot::str_to_measurement_type(&u.measurement_type),
+                                u.max_depth,
+                            );
+                        }
+                    }
+                    LayerKind::Raster(_) => {}
+                }
             }
             if has_filters {
                 self.updated_filters = true;
