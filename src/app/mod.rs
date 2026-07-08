@@ -164,7 +164,13 @@ pub struct GisEditorApp {
     pub(super) raster_texture: Option<egui::TextureHandle>,
     pub(super) raster_descriptor_rx: Option<mpsc::Receiver<RasterDescriptor>>,
     pub(super) pending_raster_descriptor: Option<RasterDescriptor>,
-    pub(super) raster_load_rx: Option<mpsc::Receiver<LayerEntry>>,
+    pub(super) raster_load_rx: Option<mpsc::Receiver<Result<LayerEntry, String>>>,
+
+    /// Auto-cycles the active raster layer's `Single` band on a timer, like
+    /// repeatedly picking the next entry in the band dropdown.
+    pub(super) raster_playback_enabled: bool,
+    pub(super) raster_playback_interval_secs: f32,
+    pub(super) raster_playback_last_tick_ms: f64,
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) snapshot_restore: Option<PendingSnapshotRestore>,
@@ -277,6 +283,9 @@ impl GisEditorApp {
             raster_descriptor_rx: None,
             pending_raster_descriptor: None,
             raster_load_rx: None,
+            raster_playback_enabled: false,
+            raster_playback_interval_secs: 1.0,
+            raster_playback_last_tick_ms: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
             snapshot_restore: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -480,14 +489,12 @@ impl GisEditorApp {
                 .as_mut()
                 .unwrap()
                 .pending_layer_settings = Some(next);
-            let (tx, rx) = mpsc::channel::<LayerEntry>();
+            let (tx, rx) = mpsc::channel::<Result<LayerEntry, String>>();
             self.raster_load_rx = Some(rx);
             std::thread::spawn(move || {
-                if let Ok(layer) =
-                    crate::raster_reader::load_raster_sync(std::path::Path::new(&path_str))
-                {
-                    let _ = tx.send(layer);
-                }
+                let result = crate::raster_reader::load_raster_sync(std::path::Path::new(&path_str))
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
             });
         } else {
             self.snapshot_restore

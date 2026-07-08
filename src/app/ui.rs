@@ -37,7 +37,7 @@ use crate::sidebar::{show_sidebar, SidebarAction};
 use crate::spatial_index::IndexKind;
 use crate::uncertainty_quadtree::MeasurementType;
 
-use super::{ClickTarget, GisEditorApp, LoadMode, MapView, LAYER_PANEL_WIDTH};
+use super::{now_ms, ClickTarget, GisEditorApp, LoadMode, MapView, LAYER_PANEL_WIDTH};
 
 impl eframe::App for GisEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -335,51 +335,56 @@ impl eframe::App for GisEditorApp {
 
             if do_load {
                 let desc = self.pending_raster_descriptor.take().unwrap();
-                let (tx, rx) = mpsc::channel::<crate::gis_layer::LayerEntry>();
+                let (tx, rx) = mpsc::channel::<Result<crate::gis_layer::LayerEntry, String>>();
                 self.raster_load_rx = Some(rx);
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let path = desc.path.unwrap();
                     std::thread::spawn(move || {
-                        if let Ok(layer) = load_raster_sync(&path) {
-                            let _ = tx.send(layer);
-                        }
+                        let result = load_raster_sync(&path).map_err(|e| e.to_string());
+                        let _ = tx.send(result);
                     });
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
                     let (bytes, name) = desc.bytes.unwrap();
-                    if let Ok(layer) = load_raster_bytes(bytes, &name) {
-                        let _ = tx.send(layer);
-                    }
+                    let result = load_raster_bytes(bytes, &name).map_err(|e| e.to_string());
+                    let _ = tx.send(result);
                 }
             } else if do_cancel {
                 self.pending_raster_descriptor = None;
             }
         }
-        if let Some(layer) = self
+        if let Some(result) = self
             .raster_load_rx
             .as_ref()
             .and_then(|rx| rx.try_recv().ok())
         {
             self.raster_load_rx = None;
-            if let Some(extent) = layer.data.extent() {
-                if let Some(rect) = self.last_canvas_rect {
-                    self.viewport.fit_to(extent, rect);
-                    self.fitted = true;
+            match result {
+                Ok(layer) => {
+                    if let Some(extent) = layer.data.extent() {
+                        if let Some(rect) = self.last_canvas_rect {
+                            self.viewport.fit_to(extent, rect);
+                            self.fitted = true;
+                        }
+                    }
+                    self.layers.push(layer);
+                    self.active_layer_idx = Some(self.layers.len() - 1);
+                    self.points_dirty = true;
+                    self.globe_points_dirty = true;
+                    self.raster_dirty = true;
+                    self.flat_raster_dirty = true;
+                    self.map_render_ttl = 3;
+                    self.status = "Raster loaded.".to_string();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.snapshot_restore.is_some() {
+                        self.apply_snapshot_progress();
+                    }
                 }
-            }
-            self.layers.push(layer);
-            self.active_layer_idx = Some(self.layers.len() - 1);
-            self.points_dirty = true;
-            self.globe_points_dirty = true;
-            self.raster_dirty = true;
-            self.flat_raster_dirty = true;
-            self.map_render_ttl = 3;
-            self.status = "Raster loaded.".to_string();
-            #[cfg(not(target_arch = "wasm32"))]
-            if self.snapshot_restore.is_some() {
-                self.apply_snapshot_progress();
+                Err(e) => {
+                    self.status = format!("Raster load failed: {e}");
+                }
             }
         }
 
@@ -1260,38 +1265,90 @@ impl eframe::App for GisEditorApp {
                                                 }
                                             });
                                     }
-                                    let band = &mut raster.bands[*band_idx];
+                                    if raster.bands.len() > 1 {
+                                        ui.horizontal(|ui| {
+                                            let label = if self.raster_playback_enabled {
+                                                "⏸ Pause"
+                                            } else {
+                                                "▶ Play"
+                                            };
+                                            if ui.button(label).clicked() {
+                                                self.raster_playback_enabled =
+                                                    !self.raster_playback_enabled;
+                                                self.raster_playback_last_tick_ms = now_ms();
+                                            }
+                                            ui.label("Interval (s):");
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut self.raster_playback_interval_secs,
+                                                )
+                                                .speed(0.1)
+                                                .range(0.05..=30.0),
+                                            );
+                                        });
+                                        if self.raster_playback_enabled {
+                                            let now = now_ms();
+                                            let elapsed_secs =
+                                                (now - self.raster_playback_last_tick_ms) / 1000.0;
+                                            if elapsed_secs
+                                                >= self.raster_playback_interval_secs as f64
+                                            {
+                                                *band_idx = (*band_idx + 1) % raster.bands.len();
+                                                changed = true;
+                                                self.raster_playback_last_tick_ms = now;
+                                            }
+                                            ui.ctx().request_repaint_after(
+                                                std::time::Duration::from_millis(100),
+                                            );
+                                        }
+                                    }
+                                    let band = &raster.bands[*band_idx];
+                                    let (data_min, data_max) = (band.data_min, band.data_max);
+                                    let mut display_min = band.display_min;
+                                    let mut display_max = band.display_max;
+                                    let mut range_changed = false;
                                     ui.label(format!(
                                         "Data range: {:.2} .. {:.2}",
-                                        band.data_min, band.data_max
+                                        data_min, data_max
                                     ));
                                     ui.horizontal(|ui| {
                                         ui.label("Min:");
                                         if ui
                                             .add(
-                                                egui::DragValue::new(&mut band.display_min)
-                                                    .speed((band.data_max - band.data_min) / 200.0),
+                                                egui::DragValue::new(&mut display_min)
+                                                    .speed((data_max - data_min) / 200.0),
                                             )
                                             .changed()
                                         {
-                                            changed = true;
+                                            range_changed = true;
                                         }
                                         ui.label("Max:");
                                         if ui
                                             .add(
-                                                egui::DragValue::new(&mut band.display_max)
-                                                    .speed((band.data_max - band.data_min) / 200.0),
+                                                egui::DragValue::new(&mut display_max)
+                                                    .speed((data_max - data_min) / 200.0),
                                             )
                                             .changed()
                                         {
-                                            changed = true;
+                                            range_changed = true;
                                         }
                                         if ui.small_button("Reset range").clicked() {
-                                            band.display_min = band.data_min;
-                                            band.display_max = band.data_max;
-                                            changed = true;
+                                            display_min = data_min;
+                                            display_max = data_max;
+                                            range_changed = true;
                                         }
                                     });
+                                    // Color range is shared across all bands of this layer
+                                    // (not per-band) so playback doesn't jump contrast frame
+                                    // to frame.
+                                    if range_changed {
+                                        for b in raster.bands.iter_mut() {
+                                            b.display_min = display_min;
+                                            b.display_max = display_max;
+                                        }
+                                        changed = true;
+                                    }
+                                    let band = &mut raster.bands[*band_idx];
 
                                     // Gradient legend
                                     let (rect, _) = ui.allocate_exact_size(

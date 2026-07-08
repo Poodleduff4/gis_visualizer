@@ -14,6 +14,20 @@ use crate::gis_reader::{GisFilePath, LayerDescriptor};
 /// code path (only vector/point layers dispatch on `geometry_type.0`).
 const RASTER_GEOMETRY_TYPE: GeometryType = GeometryType(255);
 
+/// Reads a tag that TIFF stores as one value per sample (e.g. `BitsPerSample`,
+/// `SampleFormat`). For single-band files it's a scalar; for interleaved
+/// multi-band files (`SamplesPerPixel` > 1) it's a list with one entry per
+/// sample — all bands share the same format, so the first entry suffices.
+fn first_per_sample_tag<R: std::io::Read + std::io::Seek>(
+    decoder: &mut Decoder<R>,
+    tag: Tag,
+) -> Option<u32> {
+    decoder
+        .get_tag_u32(tag)
+        .ok()
+        .or_else(|| decoder.get_tag_u32_vec(tag).ok().and_then(|v| v.first().copied()))
+}
+
 fn parse_name(stem: &str) -> (String, String) {
     match stem.split_once('_') {
         Some((var, date)) => (var.to_string(), date.to_string()),
@@ -47,8 +61,8 @@ pub fn read_raster_descriptor_sync(path: &std::path::Path) -> Result<RasterDescr
     let mut decoder = Decoder::new(std::io::BufReader::new(file))?;
     let (width, height) = decoder.dimensions()?;
     let units = decoder.get_tag_ascii_string(Tag::ImageDescription).unwrap_or_default();
-    let bits_per_sample = decoder.get_tag_u32(Tag::BitsPerSample).unwrap_or(0) as u16;
-    let sample_format = decoder.get_tag_u32(Tag::SampleFormat).unwrap_or(3);
+    let bits_per_sample = first_per_sample_tag(&mut decoder, Tag::BitsPerSample).unwrap_or(0) as u16;
+    let sample_format = first_per_sample_tag(&mut decoder, Tag::SampleFormat).unwrap_or(3);
     let is_f32 = sample_format == 3 && bits_per_sample == 32;
 
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
@@ -68,8 +82,8 @@ pub fn read_raster_descriptor_bytes(bytes: Vec<u8>, filename: &str) -> Result<Ra
     let mut decoder = Decoder::new(std::io::Cursor::new(&bytes))?;
     let (width, height) = decoder.dimensions()?;
     let units = decoder.get_tag_ascii_string(Tag::ImageDescription).unwrap_or_default();
-    let bits_per_sample = decoder.get_tag_u32(Tag::BitsPerSample).unwrap_or(0) as u16;
-    let sample_format = decoder.get_tag_u32(Tag::SampleFormat).unwrap_or(3);
+    let bits_per_sample = first_per_sample_tag(&mut decoder, Tag::BitsPerSample).unwrap_or(0) as u16;
+    let sample_format = first_per_sample_tag(&mut decoder, Tag::SampleFormat).unwrap_or(3);
     let is_f32 = sample_format == 3 && bits_per_sample == 32;
 
     let stem = filename.strip_suffix(".tif").or_else(|| filename.strip_suffix(".tiff")).unwrap_or(filename);
