@@ -500,6 +500,10 @@ pub struct LayerEntry {
     pub descriptor: LayerDescriptor,
     pub filters: Vec<LayerAttributeFilter>,
     pub filter_logic: FilterLogic,
+    /// Heatmap-cell regions of interest selected by the user to progressively
+    /// narrow the analysis area. Empty means no spatial restriction. Multiple
+    /// entries are unioned (OR) with each other, then ANDed with `filters`.
+    pub roi_bboxes: Vec<[f64; 4]>,
 }
 impl LayerEntry {}
 

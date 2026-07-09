@@ -1415,6 +1415,7 @@ impl GisReader {
             descriptor: descriptor.clone(),
             filters: Vec::new(),
             filter_logic: FilterLogic::default(),
+            roi_bboxes: Vec::new(),
         }
     }
 

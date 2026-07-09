@@ -50,6 +50,38 @@ pub enum UncertaintyMeasure {
     },
 }
 
+pub fn variance(sample: &[f64]) -> UncertaintyMeasure {
+    let n = sample.len() as f64;
+    let mean = sample.iter().sum::<f64>() / n;
+    let variance = sample.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+
+    UncertaintyMeasure::Variance {
+        std_dev: variance.sqrt(),
+        variance,
+        mean,
+    }
+}
+
+pub fn kernal_density(sample: Vec<f64>) -> UncertaintyMeasure {
+    let n = sample.len();
+    if n < 2 {
+        return UncertaintyMeasure::KernalDensity { entropy: 0.0 };
+    }
+    let silverman = Box::new(Silverman);
+    let bandwidth = Box::new(|data: &[f64]| silverman.bandwidth(data));
+    let estimator = KernelDensityEstimator::new(sample.clone(), &bandwidth, Normal);
+    let pdf = estimator.pdf(&sample);
+
+    let entropy = -pdf
+        .iter()
+        .filter(|&&p| p > 0.0) // guard against log(0)
+        .map(|&p| p.ln())
+        .sum::<f64>()
+        / n as f64;
+
+    UncertaintyMeasure::KernalDensity { entropy }
+}
+
 const DEFAULT_MAX_DEPTH: usize = 12;
 
 pub struct UncertaintyQuadtree {
@@ -164,6 +196,10 @@ impl UncertaintyQuadtree {
             }
         }
         return None;
+    }
+
+    pub fn leaf_bbox_at(&self, pos: [f64; 2]) -> Option<[f64; 4]> {
+        self.pos_to_node(pos).map(|n| n.bbox)
     }
 }
 
@@ -331,7 +367,9 @@ impl UncertaintyQuadtree {
             return;
         }
         let total = self.entries.len();
-        let sample_size = ((total as f64 / 10.).min(5.) as usize).max(1).min(total);
+        // Cap at 200 for stable variance/entropy on large nodes; take everything
+        // below that (was capped at 5, far too noisy for a per-node estimate).
+        let sample_size = total.min(200);
         let mut rng = rand::rng();
         let sample: Vec<f64> = self
             .entries
@@ -342,45 +380,13 @@ impl UncertaintyQuadtree {
             .collect();
         if sample.len() > 0 {
             let uncertainty = match measurement_type {
-                MeasurementType::Variance => self.variance(&sample),
-                MeasurementType::KernalDensity => self.kernal_density(sample.clone()),
+                MeasurementType::Variance => variance(&sample),
+                MeasurementType::KernalDensity => kernal_density(sample.clone()),
             };
             self.uncertainty = Some(uncertainty);
         } else {
             self.uncertainty = None;
         }
-    }
-
-    pub fn variance(&self, sample: &Vec<f64>) -> UncertaintyMeasure {
-        let n = sample.len() as f64;
-        let mean = sample.iter().sum::<f64>() / n;
-        let variance = sample.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
-
-        UncertaintyMeasure::Variance {
-            std_dev: variance.sqrt(),
-            variance,
-            mean,
-        }
-    }
-
-    pub fn kernal_density(&self, sample: Vec<f64>) -> UncertaintyMeasure {
-        let n = sample.len();
-        if n < 2 {
-            return UncertaintyMeasure::KernalDensity { entropy: 0.0 };
-        }
-        let silverman = Box::new(Silverman);
-        let bandwidth = Box::new(|data: &[f64]| silverman.bandwidth(data));
-        let estimator = KernelDensityEstimator::new(sample.clone(), &bandwidth, Normal);
-        let pdf = estimator.pdf(&sample);
-
-        let entropy = -pdf
-            .iter()
-            .filter(|&&p| p > 0.0) // guard against log(0)
-            .map(|&p| p.ln())
-            .sum::<f64>()
-            / n as f64;
-
-        UncertaintyMeasure::KernalDensity { entropy }
     }
 
     fn subdivide(&mut self) {
@@ -434,6 +440,8 @@ impl UncertaintyQuadtree {
             vec![HeatmapCell {
                 bbox: self.bbox,
                 depth,
+                point_ids: self.entries.iter().map(|e| e.id).collect(),
+                uncertainty: self.uncertainty.clone(),
             }]
         } else {
             self.children

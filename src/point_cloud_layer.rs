@@ -75,14 +75,21 @@ impl PointCloudLayer {
     pub fn rebuild_quadtree(&mut self, capacity: usize) {
         self.ensure_bbox();
         if let Some(bbox) = self.bbox {
-            let mut qt = SpatialIndex::Quadtree(Quadtree::new(bbox, capacity));
-            for (pos, (_, p)) in self.points.iter().enumerate() {
-                if self.filter_mask[pos] {
-                    qt.insert(pos, [p[0], p[1], p[0], p[1]]);
-                }
-            }
-            self.index = Some(Arc::new(qt));
+            self.rebuild_quadtree_bounded(capacity, bbox);
         }
+    }
+
+    /// Rebuilds the quadtree scoped to `bbox`, only inserting points inside
+    /// it (and passing the current filter mask). Used for progressive
+    /// drill-down: narrower `bbox` -> finer subdivision within the region.
+    pub fn rebuild_quadtree_bounded(&mut self, capacity: usize, bbox: [f64; 4]) {
+        let mut qt = SpatialIndex::Quadtree(Quadtree::new(bbox, capacity));
+        for (pos, (_, p)) in self.points.iter().enumerate() {
+            if self.filter_mask[pos] {
+                qt.insert(pos, [p[0], p[1], p[0], p[1]]);
+            }
+        }
+        self.index = Some(Arc::new(qt));
     }
 
     pub fn rebuild_rtree(&mut self) {
@@ -146,6 +153,13 @@ impl PointCloudLayer {
         }
     }
 
+    pub fn point_in_any_roi(p: [f64; 2], roi_bboxes: &[[f64; 4]]) -> bool {
+        roi_bboxes.is_empty()
+            || roi_bboxes
+                .iter()
+                .any(|b| p[0] >= b[0] && p[0] <= b[2] && p[1] >= b[1] && p[1] <= b[3])
+    }
+
     pub fn numeric_field_names(&self) -> Vec<String> {
         self.field_names
             .iter()
@@ -164,6 +178,20 @@ impl PointCloudLayer {
     ) {
         self.ensure_bbox();
         let Some(bbox) = self.bbox else { return };
+        self.rebuild_uncertainty_quadtree_bounded(attribute, threshold, measurement_type, max_depth, bbox);
+    }
+
+    /// Rebuilds the uncertainty quadtree scoped to `bbox`, only inserting
+    /// points inside it. Used for progressive drill-down: narrower `bbox` ->
+    /// finer variance/entropy detail within the region.
+    pub fn rebuild_uncertainty_quadtree_bounded(
+        &mut self,
+        attribute: String,
+        threshold: f32,
+        measurement_type: MeasurementType,
+        max_depth: usize,
+        bbox: [f64; 4],
+    ) {
         let field_idx = self.field_names.iter().position(|n| n == &attribute);
         let mut uq = UncertaintyQuadtree::with_max_depth(
             bbox,

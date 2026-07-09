@@ -203,6 +203,7 @@ fn build_layer_entry(
         },
         filters: Vec::new(),
         filter_logic: FilterLogic::default(),
+        roi_bboxes: Vec::new(),
     }
 }
 

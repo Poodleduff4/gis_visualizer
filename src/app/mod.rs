@@ -15,6 +15,7 @@ use crate::gis_layer::{BatchMessage, LayerEntry, LayerKind};
 use crate::gis_reader::FgbReaderCache;
 use crate::gis_reader::{GisFilePath, LayerDescriptor};
 use crate::globe::{GlobeCamera, GlobePipeline, GlobePoint};
+use crate::heatmap::HeatmapMetric;
 use crate::histogram::{BivariateStats, FieldStats, HistogramState, LisaPoint};
 use crate::map_view::Viewport;
 use crate::point_cloud::{GpuPoint, PointCloudPipeline};
@@ -49,6 +50,7 @@ pub(super) enum LoadMode {
 pub enum ClickTarget {
     Feature,
     GridCell,
+    HeatmapRoi,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -86,6 +88,11 @@ pub struct GisEditorApp {
     pub(super) show_index: bool,
     pub(super) index_kind: IndexKind,
     pub(super) show_heatmap: bool,
+    pub(super) heatmap_metric: HeatmapMetric,
+    pub(super) roi_rebuild_pending: bool,
+    pub(super) heatmap_cache: Option<crate::heatmap::HeatmapLayer>,
+    pub(super) heatmap_dirty: bool,
+    pub(super) last_heatmap_layer_idx: Option<usize>,
     pub(super) click_target: ClickTarget,
 
     pub(super) pending_file: Option<GisFilePath>,
@@ -211,6 +218,11 @@ impl GisEditorApp {
             show_index: false,
             index_kind: IndexKind::Quadtree,
             show_heatmap: false,
+            heatmap_metric: HeatmapMetric::Density,
+            roi_rebuild_pending: false,
+            heatmap_cache: None,
+            heatmap_dirty: true,
+            last_heatmap_layer_idx: None,
             click_target: ClickTarget::GridCell,
             has_gpu,
             point_size: 5.0,

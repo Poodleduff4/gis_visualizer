@@ -17,7 +17,7 @@ use crate::gis_reader::GeoParquetReader;
 use crate::gis_reader::{GisFilePath, GisReader};
 use crate::globe::{collect_globe_points, GlobeCallback, GlobePipeline};
 use crate::gpu_collect::collect_gpu_points;
-use crate::heatmap::HeatmapLayer;
+use crate::heatmap::{HeatmapLayer, HeatmapMetric};
 use crate::histogram::{
     compute_bivariate, compute_field_stats, compute_histogram, extract_field_values, lisa_inner,
     local_variance_inner,
@@ -34,10 +34,25 @@ use crate::raster_reader::{load_raster_bytes, read_raster_descriptor_bytes};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::raster_reader::{load_raster_sync, read_raster_descriptor_sync};
 use crate::sidebar::{show_sidebar, SidebarAction};
-use crate::spatial_index::IndexKind;
+use crate::spatial_index::{IndexKind, SpatialIndex};
 use crate::uncertainty_quadtree::MeasurementType;
 
 use super::{now_ms, ClickTarget, GisEditorApp, LoadMode, MapView, LAYER_PANEL_WIDTH};
+
+fn bbox_contains(outer: &[f64; 4], inner: &[f64; 4]) -> bool {
+    outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3]
+}
+
+fn union_bboxes(bboxes: &[[f64; 4]]) -> Option<[f64; 4]> {
+    bboxes.iter().copied().reduce(|a, b| {
+        [
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ]
+    })
+}
 
 impl eframe::App for GisEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -67,11 +82,13 @@ impl eframe::App for GisEditorApp {
                         ui.label("Uncertainty Quadtree Split Type:");
                         ui.horizontal(|ui| {
                             if ui.button("Variance").clicked() {
-                                self.selected_split_measurement_type = MeasurementType::Variance
+                                self.selected_split_measurement_type = MeasurementType::Variance;
+                                self.heatmap_dirty = true;
                             }
                             if ui.button("Kernel-Density Entropy").clicked() {
                                 self.selected_split_measurement_type =
-                                    MeasurementType::KernalDensity
+                                    MeasurementType::KernalDensity;
+                                self.heatmap_dirty = true;
                             }
                         })
                     });
@@ -92,10 +109,45 @@ impl eframe::App for GisEditorApp {
                         ui.label("Heatmap Opacity:");
                         ui.add(egui::Slider::new(&mut self.hilbert_order, 1..=12).step_by(1.0));
                     });
-                    ui.checkbox(&mut self.show_heatmap, "Quadtree Heatmap");
+                    if ui
+                        .checkbox(&mut self.show_heatmap, "Quadtree Heatmap")
+                        .changed()
+                        && self.show_heatmap
+                    {
+                        self.heatmap_dirty = true;
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Heatmap Opacity:");
                         ui.add(egui::Slider::new(&mut self.heatmap_opacity, 0..=255).step_by(1.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Heatmap Metric:");
+                        ui.radio_value(
+                            &mut self.heatmap_metric,
+                            HeatmapMetric::Density,
+                            "Density",
+                        );
+                        ui.radio_value(
+                            &mut self.heatmap_metric,
+                            HeatmapMetric::Unpredictability,
+                            "Unpredictability",
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if let Some(idx) = self.active_layer_idx {
+                            if !self.layers[idx].roi_bboxes.is_empty() {
+                                ui.label(format!(
+                                    "ROI regions: {}",
+                                    self.layers[idx].roi_bboxes.len()
+                                ));
+                                if ui.button("Clear ROI").clicked() {
+                                    self.layers[idx].roi_bboxes.clear();
+                                    self.updated_filters = true;
+                                    self.roi_rebuild_pending = true;
+                                    self.heatmap_dirty = true;
+                                }
+                            }
+                        }
                     });
                     if self.has_gpu {
                         ui.horizontal(|ui| {
@@ -115,6 +167,11 @@ impl eframe::App for GisEditorApp {
                     ui.label("Click target:");
                     ui.radio_value(&mut self.click_target, ClickTarget::Feature, "Feature");
                     ui.radio_value(&mut self.click_target, ClickTarget::GridCell, "Grid Cell");
+                    ui.radio_value(
+                        &mut self.click_target,
+                        ClickTarget::HeatmapRoi,
+                        "Heatmap ROI",
+                    );
                     if self.has_gpu {
                         ui.separator();
                         ui.label("Map view:");
@@ -1084,6 +1141,7 @@ impl eframe::App for GisEditorApp {
                                                     .clicked()
                                                 {
                                                     ui.close_kind(UiKind::Menu);
+                                                    self.heatmap_dirty = true;
                                                 }
                                             }
                                         });
@@ -1157,6 +1215,7 @@ impl eframe::App for GisEditorApp {
                         self.fitted = true;
                         self.viewport_load_pending = true;
                         self.viewport_stable_frames = 0;
+                        self.heatmap_dirty = true;
                     }
                     if let Some(idx) = rebuild_uncertainty_quadtree_idx {
                         match &mut self.layers[idx].data {
@@ -1173,6 +1232,7 @@ impl eframe::App for GisEditorApp {
                             LayerKind::Vector(_gl) => {}
                             LayerKind::Raster(_) => {}
                         }
+                        self.heatmap_dirty = true;
                     }
                     if let Some(idx) = rebuild_hilbert_idx {
                         let order = self.hilbert_order;
@@ -1585,9 +1645,21 @@ impl eframe::App for GisEditorApp {
             let idx = self.active_layer_idx.unwrap();
             match layer.filters.len() {
                 0 => {
+                    use crate::point_cloud_layer::PointCloudLayer;
                     layer.data.reset_filter_mask();
+                    if !layer.roi_bboxes.is_empty() {
+                        let roi_bboxes = layer.roi_bboxes.clone();
+                        if let LayerKind::Points(pc) = &mut layer.data {
+                            for (pos, (_, p)) in pc.points.iter().enumerate() {
+                                if !PointCloudLayer::point_in_any_roi(*p, &roi_bboxes) {
+                                    pc.filter_mask.set(pos, false);
+                                }
+                            }
+                        }
+                    }
                     self.points_dirty = true;
                     self.updated_filters = false;
+                    self.roi_rebuild_pending = true;
                 }
                 _ => {
                     #[cfg(not(target_arch = "wasm32"))]
@@ -1736,22 +1808,27 @@ impl eframe::App for GisEditorApp {
         if let Some(rx) = &mut self.filtered_idx_rx {
             match rx.try_recv() {
                 Ok(Some((layer_idx, idx_vec))) => {
+                    use crate::point_cloud_layer::PointCloudLayer;
                     println!("{}", idx_vec.len());
                     if let Some(l) = self.layers.get_mut(layer_idx) {
+                        let roi_bboxes = l.roi_bboxes.clone();
                         match &mut l.data {
                             LayerKind::Points(point_cloud_layer) => {
                                 let matching: std::collections::HashSet<u32> =
                                     idx_vec.into_iter().collect();
                                 let mut mask: BitVec = bitvec![0;point_cloud_layer.points.len()];
-                                for (pos, (parquet_id, _)) in
+                                for (pos, (parquet_id, p)) in
                                     point_cloud_layer.points.iter().enumerate()
                                 {
-                                    if matching.contains(parquet_id) {
+                                    if matching.contains(parquet_id)
+                                        && PointCloudLayer::point_in_any_roi(*p, &roi_bboxes)
+                                    {
                                         mask.set(pos, true);
                                     }
                                 }
                                 point_cloud_layer.filter_mask &= mask;
                                 self.points_dirty = true;
+                                self.roi_rebuild_pending = true;
                                 ui.request_repaint();
                             }
                             LayerKind::Vector(_) | LayerKind::Raster(_) => {}
@@ -1763,6 +1840,42 @@ impl eframe::App for GisEditorApp {
                 }
                 Err(_e) => self.filtered_idx_rx = None,
             }
+        }
+
+        // ── Progressive drill-down: rebuild finer index scoped to ROI ─────────
+        if self.roi_rebuild_pending {
+            self.roi_rebuild_pending = false;
+            if let Some(idx) = self.active_layer_idx {
+                let roi_bboxes = self.layers[idx].roi_bboxes.clone();
+                let was_uncertainty = matches!(
+                    self.layers[idx].data.index(IndexKind::Quadtree),
+                    Some(SpatialIndex::UncertaintyQuadtree(_))
+                );
+                if let LayerKind::Points(pc) = &mut self.layers[idx].data {
+                    pc.ensure_bbox();
+                    let bbox = union_bboxes(&roi_bboxes).or(pc.bbox);
+                    if let Some(bbox) = bbox {
+                        if was_uncertainty {
+                            if let Some(attr) = &self.selected_uncertainty_attribute {
+                                pc.rebuild_uncertainty_quadtree_bounded(
+                                    attr.clone(),
+                                    self.uncertainty_split_threshold,
+                                    self.selected_split_measurement_type.clone(),
+                                    self.uncertainty_max_depth,
+                                    bbox,
+                                );
+                            }
+                        } else {
+                            pc.rebuild_quadtree_bounded(
+                                self.spatial_index_split_density,
+                                bbox,
+                            );
+                        }
+                    }
+                }
+            }
+            self.points_dirty = true;
+            self.heatmap_dirty = true;
         }
 
         // ── Poll spatial analysis background results ──────────────────────────
@@ -2002,6 +2115,7 @@ impl eframe::App for GisEditorApp {
             self.last_canvas_rect = Some(response.rect);
 
             let render_points = !self.has_gpu;
+            let mut roi_toggle: Option<[f64; 4]> = None;
             show_map(
                 ui,
                 &response,
@@ -2014,7 +2128,30 @@ impl eframe::App for GisEditorApp {
                 render_points,
                 &self.click_target,
                 &mut self.selected_index_cell_data,
+                &mut roi_toggle,
             );
+            if let Some(bbox) = roi_toggle {
+                if let Some(idx) = self.active_layer_idx {
+                    let roi = &mut self.layers[idx].roi_bboxes;
+                    if let Some(pos) = roi.iter().position(|b| *b == bbox) {
+                        // Exact same cell clicked again -> toggle off.
+                        roi.remove(pos);
+                    } else if let Some(pos) = roi
+                        .iter()
+                        .position(|b| bbox_contains(b, &bbox) || bbox_contains(&bbox, b))
+                    {
+                        // Nested with an existing selection (drilling into or
+                        // out of it) -> narrow/replace instead of adding a
+                        // second bbox, otherwise the union never shrinks.
+                        roi[pos] = bbox;
+                    } else {
+                        roi.push(bbox);
+                    }
+                    self.updated_filters = true;
+                    self.roi_rebuild_pending = true;
+                }
+            }
+            let active_layer = self.active_layer_idx.and_then(|i| self.layers.get(i));
 
             // GPU point cloud: always blit the cached offscreen texture (cheap).
             // The offscreen re-render only happens when map_render_ttl > 0 (viewport/data changed).
@@ -2068,21 +2205,106 @@ impl eframe::App for GisEditorApp {
             }
 
             if self.show_heatmap {
-                let heatmap = active_layer
-                    .map(|e| {
-                        e.data
-                            .index(IndexKind::Quadtree)
-                            .map(|index| HeatmapLayer::build_from_spatial_index(index))
-                    })
-                    .unwrap_or(Some(HeatmapLayer { cells: vec![] }))
-                    .unwrap_or(HeatmapLayer { cells: vec![] });
-                show_quadtree_heatmap(
-                    &painter,
-                    &heatmap,
-                    &self.viewport,
-                    response.rect,
-                    self.heatmap_opacity,
-                );
+                if self.active_layer_idx != self.last_heatmap_layer_idx {
+                    self.last_heatmap_layer_idx = self.active_layer_idx;
+                    self.heatmap_dirty = true;
+                }
+                if self.heatmap_dirty {
+                    use crate::point_cloud_layer::AttributeColumn;
+                    self.heatmap_cache = active_layer.and_then(|e| {
+                        let LayerKind::Points(pc) = &e.data else {
+                            return None;
+                        };
+                        let index = pc.index.as_deref()?;
+                        let attr = self.selected_uncertainty_attribute.as_ref()?;
+                        let field_idx = pc.field_names.iter().position(|n| n == attr)?;
+                        let values: Vec<f64> = match &pc.attributes[field_idx] {
+                            AttributeColumn::Float(v) => v.clone(),
+                            AttributeColumn::Integer(v) => v.iter().map(|x| *x as f64).collect(),
+                            AttributeColumn::Text(_) => return None,
+                        };
+                        Some(HeatmapLayer::build(
+                            index,
+                            &values,
+                            self.selected_split_measurement_type.clone(),
+                        ))
+                    });
+                    self.heatmap_dirty = false;
+                }
+                if let Some(heatmap) = &self.heatmap_cache {
+                    let roi_bboxes = active_layer.map(|e| e.roi_bboxes.as_slice()).unwrap_or(&[]);
+                    show_quadtree_heatmap(
+                        &painter,
+                        heatmap,
+                        self.heatmap_metric,
+                        roi_bboxes,
+                        &self.viewport,
+                        response.rect,
+                        self.heatmap_opacity,
+                    );
+
+                    // ── Legend: gradient bar + range + meaning ──────────────────
+                    let (title, max_val, unit) = match self.heatmap_metric {
+                        HeatmapMetric::Density => {
+                            ("Density (points/cell)".to_string(), heatmap.max_density, "")
+                        }
+                        HeatmapMetric::Unpredictability => {
+                            let label = match &heatmap.measurement_type {
+                                MeasurementType::Variance => "Unpredictability (variance)",
+                                MeasurementType::KernalDensity => "Unpredictability (entropy)",
+                            };
+                            (label.to_string(), heatmap.max_unpredictability, "")
+                        }
+                    };
+                    let r = response.rect;
+                    let bar_w = 200.0_f32;
+                    let bar_h = 14.0_f32;
+                    let x = r.min.x + 10.0;
+                    let y = r.max.y - 46.0;
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(x - 4.0, y - 18.0),
+                            egui::vec2(bar_w + 8.0, bar_h + 40.0),
+                        ),
+                        4.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                    );
+                    painter.text(
+                        egui::pos2(x, y - 16.0),
+                        egui::Align2::LEFT_TOP,
+                        &title,
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    );
+                    let steps = 40;
+                    for i in 0..steps {
+                        let t0 = i as f32 / steps as f32;
+                        let t1 = (i + 1) as f32 / steps as f32;
+                        let color = crate::map_view::heat_color(t0, 255);
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x + t0 * bar_w, y),
+                                egui::pos2(x + t1 * bar_w, y + bar_h),
+                            ),
+                            0.0,
+                            color,
+                        );
+                    }
+                    painter.text(
+                        egui::pos2(x, y + bar_h + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("0{}", unit),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    );
+                    painter.text(
+                        egui::pos2(x + bar_w, y + bar_h + 2.0),
+                        egui::Align2::RIGHT_TOP,
+                        format!("{:.3}{}", max_val, unit),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    );
+                }
             }
 
             if self.show_index {

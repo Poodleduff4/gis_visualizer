@@ -3,7 +3,7 @@ use bitvec::vec::BitVec;
 use crate::app::ClickTarget;
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{bake_raster_rgba, LayerEntry, LayerKind, RasterData, TessellatedGeom};
-use crate::heatmap::HeatmapLayer;
+use crate::heatmap::{HeatmapLayer, HeatmapMetric};
 use crate::histogram::{LisaCluster, LisaPoint};
 use crate::spatial_index::{IndexKind, LineSegment, SpatialIndex};
 use crate::uncertainty_quadtree::UncertaintyMeasure;
@@ -93,6 +93,7 @@ pub fn show_map(
     render_points: bool,
     click_target: &ClickTarget,
     selected_index_cell_data: &mut Option<UncertaintyMeasure>,
+    roi_toggle: &mut Option<[f64; 4]>,
 ) {
     let ctx = ui.ctx().clone();
     let rect = response.rect;
@@ -153,6 +154,13 @@ pub fn show_map(
                             .flatten();
                             if let Some(c) = selected_cell {
                                 *selected_index_cell_data = Some(c.clone());
+                            }
+                        }
+                    }
+                    ClickTarget::HeatmapRoi => {
+                        if let Some(data) = entry.data.index(IndexKind::Quadtree) {
+                            if let Some(bbox) = data.leaf_bbox_at([wx, wy]) {
+                                *roi_toggle = Some(bbox);
                             }
                         }
                     }
@@ -233,18 +241,13 @@ const MAX_HEATMAP_CELLS: usize = 50_000;
 pub fn show_quadtree_heatmap(
     painter: &Painter,
     heatmap: &HeatmapLayer,
+    metric: HeatmapMetric,
+    roi_bboxes: &[[f64; 4]],
     viewport: &Viewport,
     rect: Rect,
     opacity: u8,
 ) {
     let vp = viewport.viewport_bbox(rect);
-    let max_depth = heatmap
-        .cells
-        .iter()
-        .map(|c| c.depth)
-        .max()
-        .unwrap_or(1)
-        .max(1);
     let visible: Vec<_> = heatmap
         .cells
         .iter()
@@ -254,11 +257,28 @@ pub fn show_quadtree_heatmap(
         .take(MAX_HEATMAP_CELLS)
         .collect();
     for cell in visible {
-        let t = (cell.depth as f32 / max_depth as f32).powf(1.5);
+        let t = match metric {
+            HeatmapMetric::Density => cell.density,
+            HeatmapMetric::Unpredictability => cell.unpredictability,
+        };
         let color = heat_color(t, opacity);
         let p1 = viewport.world_to_screen(cell.bbox[0], cell.bbox[1], rect);
         let p2 = viewport.world_to_screen(cell.bbox[2], cell.bbox[3], rect);
         painter.rect_filled(Rect::from_two_pos(p1, p2), 0.0, color);
+    }
+    let roi_stroke = Stroke::new(2.0, Color32::from_rgb(255, 255, 0));
+    for bbox in roi_bboxes {
+        if bbox[0] > vp[2] || bbox[2] < vp[0] || bbox[1] > vp[3] || bbox[3] < vp[1] {
+            continue;
+        }
+        let p1 = viewport.world_to_screen(bbox[0], bbox[1], rect);
+        let p2 = viewport.world_to_screen(bbox[2], bbox[3], rect);
+        painter.rect_stroke(
+            Rect::from_two_pos(p1, p2),
+            0.0,
+            roi_stroke,
+            egui::StrokeKind::Middle,
+        );
     }
 }
 
@@ -331,7 +351,7 @@ pub fn draw_lisa_overlay(
     }
 }
 
-fn heat_color(t: f32, alpha: u8) -> Color32 {
+pub fn heat_color(t: f32, alpha: u8) -> Color32 {
     let (r, g, b) = if t < 0.33 {
         let s = t / 0.33;
         (0, (s * 255.0) as u8, 255)
