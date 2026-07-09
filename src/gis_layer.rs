@@ -398,6 +398,35 @@ impl LayerKind {
             .map(|i| i.search(&[xmin, ymin, xmax, ymax]))
             .unwrap_or(Vec::new())
     }
+
+    /// Ids of features/points within `bbox`, using the quadtree index when
+    /// built, else a linear scan (mirrors `PointCloudLayer::hit_test`'s
+    /// index-or-scan fallback). Used by box-select and snapshot restore.
+    pub fn ids_in_bbox_with_fallback(&self, bbox: [f64; 4]) -> Vec<usize> {
+        if let Some(idx) = self.index(IndexKind::Quadtree) {
+            return idx.search(&bbox);
+        }
+        let [xmin, ymin, xmax, ymax] = bbox;
+        match self {
+            LayerKind::Vector(gl) => gl
+                .features
+                .iter()
+                .filter(|f| {
+                    let b = f.bbox();
+                    b[0] <= xmax && b[2] >= xmin && b[1] <= ymax && b[3] >= ymin
+                })
+                .map(|f| f.id)
+                .collect(),
+            LayerKind::Points(pc) => pc
+                .points
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, p))| p[0] >= xmin && p[0] <= xmax && p[1] >= ymin && p[1] <= ymax)
+                .map(|(i, _)| i)
+                .collect(),
+            LayerKind::Raster(_) => Vec::new(),
+        }
+    }
     pub fn feature_count(&self) -> usize {
         match self {
             LayerKind::Vector(gis_layer) => gis_layer.features.len(),
@@ -504,8 +533,22 @@ pub struct LayerEntry {
     /// narrow the analysis area. Empty means no spatial restriction. Multiple
     /// entries are unioned (OR) with each other, then ANDed with `filters`.
     pub roi_bboxes: Vec<[f64; 4]>,
+    /// Box-selections saved by the user, listed in the sidebar under this layer.
+    pub selections: Vec<LayerSelection>,
+    /// Index into `selections` currently driving the Selection Stats window.
+    pub active_selection: Option<usize>,
 }
 impl LayerEntry {}
+
+/// A saved box-selection: a bbox plus the ids of features/points it captured.
+/// For `LayerKind::Vector`, `ids` are `GisFeature.id` values (== their index in
+/// `GisLayer.features`); for `LayerKind::Points`, `ids` are row indices into
+/// `PointCloudLayer.points`/`attributes`.
+pub struct LayerSelection {
+    pub name: String,
+    pub bbox: [f64; 4],
+    pub ids: Vec<usize>,
+}
 
 #[derive(Default)]
 pub struct GisLayer {

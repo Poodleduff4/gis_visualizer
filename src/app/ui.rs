@@ -11,7 +11,9 @@ use wasm_bindgen_futures::spawn_local;
 use egui::{CentralPanel, UiKind};
 
 use crate::filter::{FilterLogic, FilterOperation, LayerAttributeFilter};
-use crate::gis_layer::{ramp_rgba, AttributeValue, BatchMessage, LayerKind, RasterDisplayMode};
+use crate::gis_layer::{
+    ramp_rgba, AttributeValue, BatchMessage, LayerKind, LayerSelection, RasterDisplayMode,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::GeoParquetReader;
 use crate::gis_reader::{GisFilePath, GisReader};
@@ -23,8 +25,11 @@ use crate::histogram::{
     local_variance_inner,
 };
 use crate::map_view::{
-    draw_lisa_overlay, draw_local_variance_overlay, render_raster_overlay, show_map,
-    show_quadtree_heatmap, show_spatial_index_grid,
+    draw_lisa_overlay, draw_local_variance_overlay, draw_selection_bboxes, render_raster_overlay,
+    show_map, show_quadtree_heatmap, show_spatial_index_grid,
+};
+use crate::selection_stats::{
+    compute_selection_bivariate, compute_selection_field_stats, compute_selection_histogram,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::parquet::{extract_batch_as_u32, query_parquet};
@@ -308,6 +313,13 @@ impl eframe::App for GisEditorApp {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+                if ui
+                    .toggle_value(&mut self.select_mode, "🔲 Select mode")
+                    .changed()
+                    && self.select_mode
+                {
+                    self.select_drag_start = None;
+                }
             });
         });
 
@@ -1031,6 +1043,7 @@ impl eframe::App for GisEditorApp {
             }
         }
 
+
         // ── Layer color picker window ─────────────────────────────────────────
         if let Some(layer_idx) = self.color_picker_layer {
             if layer_idx < self.layers.len() {
@@ -1077,6 +1090,7 @@ impl eframe::App for GisEditorApp {
         // ── Layer panel (left) ────────────────────────────────────────────────
         egui::Panel::left("layer_panel")
             .exact_size(LAYER_PANEL_WIDTH)
+            .resizable(false)
             .show_inside(ui, |ui| {
                 ui.heading("Layers");
                 ui.separator();
@@ -1089,7 +1103,12 @@ impl eframe::App for GisEditorApp {
                     let mut rebuild_uncertainty_quadtree_idx: Option<usize> = None;
                     let mut rebuild_hilbert_idx: Option<usize> = None;
                     let mut visibility_changed = false;
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    let mut set_active_selection: Option<(usize, usize)> = None;
+                    let mut remove_selection: Option<(usize, usize)> = None;
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                        .show(ui, |ui| {
                         for (i, entry) in self.layers.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut entry.visible, "").changed() {
@@ -1174,6 +1193,38 @@ impl eframe::App for GisEditorApp {
                                     },
                                 );
                             });
+                            if !entry.selections.is_empty() {
+                                egui::CollapsingHeader::new(format!(
+                                    "Selections ({})",
+                                    entry.selections.len()
+                                ))
+                                .id_salt(("selections_hdr", i))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for (sidx, sel) in entry.selections.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            let is_active_sel =
+                                                entry.active_selection == Some(sidx);
+                                            if ui
+                                                .selectable_label(
+                                                    is_active_sel,
+                                                    format!(
+                                                        "{} ({} feat.)",
+                                                        sel.name,
+                                                        sel.ids.len()
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                set_active_selection = Some((i, sidx));
+                                            }
+                                            if ui.small_button("✕").clicked() {
+                                                remove_selection = Some((i, sidx));
+                                            }
+                                        });
+                                    }
+                                });
+                            }
                         }
                     });
                     if let Some(idx) = remove_idx {
@@ -1251,6 +1302,26 @@ impl eframe::App for GisEditorApp {
                         self.raster_dirty = true;
                         self.flat_raster_dirty = true;
                         self.map_render_ttl = 3;
+                    }
+                    if let Some((li, sidx)) = set_active_selection {
+                        let entry = &mut self.layers[li];
+                        entry.active_selection = if entry.active_selection == Some(sidx) {
+                            None
+                        } else {
+                            Some(sidx)
+                        };
+                        self.selection_histogram = None;
+                        self.selection_bivariate = None;
+                        self.selection_field_stats = None;
+                    }
+                    if let Some((li, sidx)) = remove_selection {
+                        self.layers[li].selections.remove(sidx);
+                        let fixup = |sel: &mut Option<usize>| match *sel {
+                            Some(s) if s == sidx => *sel = None,
+                            Some(s) if s > sidx => *sel = Some(s - 1),
+                            _ => {}
+                        };
+                        fixup(&mut self.layers[li].active_selection);
                     }
                 }
             });
@@ -1478,6 +1549,17 @@ impl eframe::App for GisEditorApp {
                             }
                             ui.separator();
                         }
+                    }
+
+                    let selection_ctx = self.active_layer_idx.and_then(|idx| {
+                        self.layers
+                            .get(idx)
+                            .and_then(|e| e.active_selection.map(|sidx| (idx, sidx)))
+                    });
+
+                    if let Some((li, sidx)) = selection_ctx {
+                        self.show_selection_sidebar(ui, li, sidx);
+                        return;
                     }
 
                     let action = show_sidebar(
@@ -2116,6 +2198,7 @@ impl eframe::App for GisEditorApp {
 
             let render_points = !self.has_gpu;
             let mut roi_toggle: Option<[f64; 4]> = None;
+            let mut pending_selection: Option<[f64; 4]> = None;
             show_map(
                 ui,
                 &response,
@@ -2129,7 +2212,34 @@ impl eframe::App for GisEditorApp {
                 &self.click_target,
                 &mut self.selected_index_cell_data,
                 &mut roi_toggle,
+                self.select_mode,
+                &mut self.select_drag_start,
+                &mut pending_selection,
             );
+            if let Some(bbox) = pending_selection {
+                if let Some(idx) = self.active_layer_idx {
+                    let ids = self.layers[idx].data.ids_in_bbox_with_fallback(bbox);
+                    let entry = &mut self.layers[idx];
+                    let name = format!("Selection {}", entry.selections.len() + 1);
+                    entry.selections.push(LayerSelection {
+                        name,
+                        bbox,
+                        ids,
+                    });
+                    entry.active_selection = Some(entry.selections.len() - 1);
+                }
+            }
+            if let Some(idx) = self.active_layer_idx {
+                if let Some(entry) = self.layers.get(idx) {
+                    draw_selection_bboxes(
+                        &painter,
+                        &entry.selections,
+                        entry.active_selection,
+                        &self.viewport,
+                        response.rect,
+                    );
+                }
+            }
             if let Some(bbox) = roi_toggle {
                 if let Some(idx) = self.active_layer_idx {
                     let roi = &mut self.layers[idx].roi_bboxes;
@@ -2423,6 +2533,302 @@ impl eframe::App for GisEditorApp {
 }
 
 impl GisEditorApp {
+    /// Right-sidebar view shown instead of `show_sidebar` while a saved
+    /// box-selection is active: Distribution / Spatial Analysis / Export,
+    /// scoped to just the selection's ids rather than the whole layer.
+    fn show_selection_sidebar(&mut self, ui: &mut egui::Ui, li: usize, sidx: usize) {
+        let layer_name = self.layers[li].name.clone();
+        let (sel_name, sel_ids) = {
+            let sel = &self.layers[li].selections[sidx];
+            (sel.name.clone(), sel.ids.clone())
+        };
+
+        ui.heading("GIS Viewer");
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{layer_name} › {sel_name}")).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✕ Deselect").clicked() {
+                    self.layers[li].active_selection = None;
+                }
+            });
+        });
+        ui.label(format!("{} features selected", sel_ids.len()));
+        ui.separator();
+
+        let numeric_fields = self.layers[li].data.numeric_field_names();
+
+        // ── Distribution ─────────────────────────────────────────────────
+        ui.label(egui::RichText::new("Distribution").strong());
+        if numeric_fields.is_empty() {
+            ui.label("No numeric fields.");
+        } else {
+            if self.selection_field_a.is_empty() {
+                self.selection_field_a = numeric_fields[0].clone();
+            }
+            ui.label("X field:");
+            egui::ComboBox::from_id_salt("sel_dist_field_a")
+                .selected_text(&self.selection_field_a)
+                .show_ui(ui, |ui| {
+                    for f in &numeric_fields {
+                        ui.selectable_value(&mut self.selection_field_a, f.clone(), f);
+                    }
+                });
+
+            {
+                let entry = &self.layers[li];
+                let sel = &entry.selections[sidx];
+                let hist = compute_selection_histogram(&entry.data, sel, &self.selection_field_a, 30);
+                let stats =
+                    compute_selection_field_stats(&entry.data, sel, &self.selection_field_a);
+                self.selection_histogram = hist;
+                self.selection_field_stats = stats;
+            }
+            if let Some(hist) = &self.selection_histogram {
+                let counts = hist.counts.clone();
+                let bin_edges = hist.bin_edges.clone();
+                egui_plot::Plot::new("sel_hist_plot")
+                    .height(160.0)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .show(ui, |plot_ui| {
+                        let bars: Vec<egui_plot::Bar> = counts
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &c)| {
+                                let center = (bin_edges[i] + bin_edges[i + 1]) * 0.5;
+                                let width = bin_edges[i + 1] - bin_edges[i];
+                                egui_plot::Bar::new(center, c as f64).width(width * 0.95)
+                            })
+                            .collect();
+                        plot_ui.bar_chart(egui_plot::BarChart::new("counts", bars));
+                    });
+            } else {
+                ui.label("No numeric data for this field.");
+            }
+            if let Some(stats) = &self.selection_field_stats {
+                egui::Grid::new("sel_stats_grid")
+                    .num_columns(2)
+                    .striped(true)
+                    .min_col_width(60.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Stat").strong());
+                        ui.label(egui::RichText::new("Value").strong());
+                        ui.end_row();
+                        ui.label("Count");
+                        ui.label(stats.count.to_string());
+                        ui.end_row();
+                        ui.label("Min");
+                        ui.label(format!("{:.4}", stats.min));
+                        ui.end_row();
+                        ui.label("Max");
+                        ui.label(format!("{:.4}", stats.max));
+                        ui.end_row();
+                        ui.label("Mean");
+                        ui.label(format!("{:.4}", stats.mean));
+                        ui.end_row();
+                        ui.label("Std Dev");
+                        ui.label(format!("{:.4}", stats.std_dev));
+                        ui.end_row();
+                        ui.label("P25 / P50 / P75");
+                        ui.label(format!("{:.4} / {:.4} / {:.4}", stats.p25, stats.p50, stats.p75));
+                        ui.end_row();
+                    });
+            }
+
+            ui.add_space(4.0);
+            ui.label("Y field (scatter):");
+            egui::ComboBox::from_id_salt("sel_dist_field_b")
+                .selected_text(if self.selection_field_b.is_empty() {
+                    "<select field>"
+                } else {
+                    self.selection_field_b.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for f in &numeric_fields {
+                        ui.selectable_value(&mut self.selection_field_b, f.clone(), f);
+                    }
+                });
+            if !self.selection_field_b.is_empty()
+                && self.selection_field_b != self.selection_field_a
+            {
+                let entry = &self.layers[li];
+                let sel = &entry.selections[sidx];
+                self.selection_bivariate = compute_selection_bivariate(
+                    &entry.data,
+                    sel,
+                    &self.selection_field_a,
+                    &self.selection_field_b,
+                    2000,
+                );
+                if let Some(bv) = &self.selection_bivariate {
+                    ui.label(format!("Pearson r = {:.4}  (n = {})", bv.pearson_r, bv.n));
+                    let points = bv.scatter_points.clone();
+                    egui_plot::Plot::new("sel_scatter_plot")
+                        .height(160.0)
+                        .x_axis_label(&bv.x_field)
+                        .y_axis_label(&bv.y_field)
+                        .show(ui, |plot_ui| {
+                            let pts: egui_plot::PlotPoints =
+                                points.into_iter().map(|[x, y]| [x, y]).collect();
+                            plot_ui.points(
+                                egui_plot::Points::new("pts", pts).radius(2.0).color(
+                                    egui::Color32::from_rgba_unmultiplied(80, 160, 220, 160),
+                                ),
+                            );
+                        });
+                } else {
+                    ui.label("No numeric data for these fields.");
+                }
+            } else {
+                self.selection_bivariate = None;
+            }
+        }
+
+        ui.separator();
+
+        // ── Spatial Analysis (Points layers only — needs a spatial index) ──
+        ui.label(egui::RichText::new("Spatial Analysis").strong());
+        if let LayerKind::Points(pc) = &self.layers[li].data {
+            if numeric_fields.is_empty() {
+                ui.label("No numeric fields.");
+            } else {
+                if self.spatial_field.is_empty() {
+                    self.spatial_field = numeric_fields[0].clone();
+                }
+                ui.label("Field:");
+                egui::ComboBox::from_id_salt("sel_spatial_field")
+                    .selected_text(&self.spatial_field)
+                    .show_ui(ui, |ui| {
+                        for f in &numeric_fields {
+                            ui.selectable_value(&mut self.spatial_field, f.clone(), f);
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Radius:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.spatial_radius)
+                            .speed(0.0001)
+                            .range(1e-9..=1e6)
+                            .max_decimals(6),
+                    );
+                });
+
+                let mut mask = bitvec![0; pc.points.len()];
+                for &id in &sel_ids {
+                    if id < pc.filter_mask.len() && pc.filter_mask[id] {
+                        mask.set(id, true);
+                    }
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Local Variance").clicked() {
+                        if let Some(values) = extract_field_values(pc, &self.spatial_field) {
+                            let points = pc.points.clone();
+                            let index = pc.index.clone();
+                            let radius = self.spatial_radius;
+                            let thread_mask = mask.clone();
+                            let (tx, rx) = oneshot::channel();
+                            self.local_variance_rx = Some(rx);
+                            self.show_local_variance = false;
+                            self.show_lisa = false;
+                            self.status =
+                                format!("Computing local variance ({} pts)…", mask.count_ones());
+                            ui.ctx().request_repaint();
+                            std::thread::spawn(move || {
+                                let result = local_variance_inner(
+                                    &points,
+                                    &thread_mask,
+                                    &values,
+                                    radius,
+                                    index.as_deref(),
+                                );
+                                tx.send(result).ok();
+                            });
+                        }
+                    }
+                    if ui.button("LISA").clicked() {
+                        if let Some(values) = extract_field_values(pc, &self.spatial_field) {
+                            let points = pc.points.clone();
+                            let index = pc.index.clone();
+                            let radius = self.spatial_radius;
+                            let thread_mask = mask.clone();
+                            let (tx, rx) = oneshot::channel();
+                            self.lisa_rx = Some(rx);
+                            self.show_lisa = false;
+                            self.show_local_variance = false;
+                            self.status = format!("Computing LISA ({} pts)…", mask.count_ones());
+                            ui.ctx().request_repaint();
+                            std::thread::spawn(move || {
+                                let result =
+                                    lisa_inner(&points, &thread_mask, &values, radius, index.as_deref());
+                                tx.send(result).ok();
+                            });
+                        }
+                    }
+                });
+            }
+        } else {
+            ui.label("Only available for point-cloud layers.");
+        }
+
+        ui.separator();
+
+        // ── Export ───────────────────────────────────────────────────────
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            ui.label(egui::RichText::new("Export").strong());
+            if let LayerKind::Points(pc) = &self.layers[li].data {
+                let label = format!("Export selection ({} pts)", sel_ids.len());
+                if ui.button(label).clicked() {
+                    let points: Vec<(u32, [f64; 2])> = pc.points.iter().cloned().collect();
+                    let field_names = pc.field_names.clone();
+                    let filter_mask = pc.filter_mask.clone();
+                    let attrs: Vec<_> = pc
+                        .attributes
+                        .iter()
+                        .map(|col| {
+                            use crate::point_cloud_layer::AttributeColumn;
+                            match col {
+                                AttributeColumn::Float(v) => AttributeColumn::Float(v.clone()),
+                                AttributeColumn::Integer(v) => AttributeColumn::Integer(v.clone()),
+                                AttributeColumn::Text(v) => AttributeColumn::Text(v.clone()),
+                            }
+                        })
+                        .collect();
+                    let ids = sel_ids.clone();
+                    let name = format!("{}_{}", layer_name, sel_name);
+                    std::thread::spawn(move || {
+                        if let Some(path) = pollster::block_on(
+                            rfd::AsyncFileDialog::new()
+                                .add_filter("GeoParquet", &["parquet"])
+                                .set_file_name(format!("{}_export.parquet", name))
+                                .save_file(),
+                        ) {
+                            use crate::point_cloud_layer::PointCloudLayer;
+                            let pc_export = PointCloudLayer {
+                                points: std::sync::Arc::new(points),
+                                attributes: attrs,
+                                field_names,
+                                filter_mask,
+                                index: None,
+                                bbox: None,
+                                viewport_mask: bitvec::bitvec![0; 0],
+                            };
+                            let _ = crate::exporter::export_points_by_ids(
+                                &pc_export,
+                                &ids,
+                                path.path().to_string_lossy().as_ref(),
+                            );
+                        }
+                    });
+                }
+            } else {
+                ui.label("Only available for point-cloud layers.");
+            }
+        }
+    }
+
     fn show_globe(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let rect = ui.available_rect_before_wrap();
         self.last_canvas_rect = Some(rect);

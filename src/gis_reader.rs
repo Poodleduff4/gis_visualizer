@@ -1416,6 +1416,8 @@ impl GisReader {
             filters: Vec::new(),
             filter_logic: FilterLogic::default(),
             roi_bboxes: Vec::new(),
+            selections: Vec::new(),
+            active_selection: None,
         }
     }
 

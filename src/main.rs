@@ -21,6 +21,7 @@ mod globe;
 mod sidebar;
 mod spatial_index;
 mod rtree_index;
+mod selection_stats;
 mod uncertainty_quadtree;
 
 #[cfg(not(target_arch = "wasm32"))]

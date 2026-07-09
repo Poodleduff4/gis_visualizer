@@ -2,7 +2,9 @@ use bitvec::vec::BitVec;
 
 use crate::app::ClickTarget;
 use crate::basemap::BasemapCache;
-use crate::gis_layer::{bake_raster_rgba, LayerEntry, LayerKind, RasterData, TessellatedGeom};
+use crate::gis_layer::{
+    bake_raster_rgba, LayerEntry, LayerKind, LayerSelection, RasterData, TessellatedGeom,
+};
 use crate::heatmap::{HeatmapLayer, HeatmapMetric};
 use crate::histogram::{LisaCluster, LisaPoint};
 use crate::spatial_index::{IndexKind, LineSegment, SpatialIndex};
@@ -94,6 +96,9 @@ pub fn show_map(
     click_target: &ClickTarget,
     selected_index_cell_data: &mut Option<UncertaintyMeasure>,
     roi_toggle: &mut Option<[f64; 4]>,
+    select_mode: bool,
+    select_drag_start: &mut Option<Pos2>,
+    selection_result: &mut Option<[f64; 4]>,
 ) {
     let ctx = ui.ctx().clone();
     let rect = response.rect;
@@ -105,11 +110,44 @@ pub fn show_map(
         bm.render(&painter, viewport, rect, &ctx);
     }
 
-    // Pan via primary drag
-    if response.dragged_by(egui::PointerButton::Primary) {
+    // Pan via primary drag (disabled while box-selecting)
+    if !select_mode && response.dragged_by(egui::PointerButton::Primary) {
         let delta: Vec2 = response.drag_delta();
         viewport.center[0] -= delta.x as f64 / viewport.pixels_per_unit;
         viewport.center[1] += delta.y as f64 / viewport.pixels_per_unit;
+    }
+
+    // Box-select: rubber-band drag while select_mode is on.
+    if select_mode {
+        if response.drag_started() {
+            *select_drag_start = response.interact_pointer_pos();
+        }
+        if response.dragged() {
+            if let (Some(start), Some(cur)) = (*select_drag_start, response.interact_pointer_pos())
+            {
+                let band = Rect::from_two_pos(start, cur);
+                painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(255, 255, 0, 40));
+                painter.rect_stroke(
+                    band,
+                    0.0,
+                    Stroke::new(1.5, Color32::YELLOW),
+                    egui::StrokeKind::Middle,
+                );
+            }
+        }
+        if response.drag_stopped() {
+            if let (Some(start), Some(cur)) = (select_drag_start.take(), response.interact_pointer_pos())
+            {
+                let [wx0, wy0] = viewport.screen_to_world(start.x, start.y, rect);
+                let [wx1, wy1] = viewport.screen_to_world(cur.x, cur.y, rect);
+                *selection_result = Some([
+                    wx0.min(wx1),
+                    wy0.min(wy1),
+                    wx0.max(wx1),
+                    wy0.max(wy1),
+                ]);
+            }
+        }
     }
 
     // Zoom via scroll wheel, centred on cursor
@@ -131,8 +169,8 @@ pub fn show_map(
         }
     }
 
-    // Click to select — only tests against the active layer
-    if response.clicked() {
+    // Click to select — only tests against the active layer (disabled while box-selecting)
+    if !select_mode && response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(entry) = active_entry {
                 let [wx, wy] = viewport.screen_to_world(pos.x, pos.y, rect);
@@ -233,6 +271,34 @@ pub fn show_spatial_index_grid(
         let p1 = viewport.world_to_screen(start[0], start[1], rect);
         let p2 = viewport.world_to_screen(end[0], end[1], rect);
         painter.line_segment([p1, p2], stroke);
+    }
+}
+
+/// Draws saved box-selection bboxes for a layer: magenta stroke for saved
+/// ones, a heavier `STROKE_SELECTED`-style stroke for the active selection.
+pub fn draw_selection_bboxes(
+    painter: &Painter,
+    selections: &[LayerSelection],
+    active: Option<usize>,
+    viewport: &Viewport,
+    rect: Rect,
+) {
+    const SELECTION_STROKE: Color32 = Color32::from_rgb(230, 0, 200);
+    for (i, sel) in selections.iter().enumerate() {
+        let is_active = active == Some(i);
+        let stroke = if is_active {
+            Stroke::new(2.5, STROKE_SELECTED)
+        } else {
+            Stroke::new(1.5, SELECTION_STROKE)
+        };
+        let p1 = viewport.world_to_screen(sel.bbox[0], sel.bbox[1], rect);
+        let p2 = viewport.world_to_screen(sel.bbox[2], sel.bbox[3], rect);
+        painter.rect_stroke(
+            Rect::from_two_pos(p1, p2),
+            0.0,
+            stroke,
+            egui::StrokeKind::Middle,
+        );
     }
 }
 

@@ -18,6 +18,9 @@ use crate::globe::{GlobeCamera, GlobePipeline, GlobePoint};
 use crate::heatmap::HeatmapMetric;
 use crate::histogram::{BivariateStats, FieldStats, HistogramState, LisaPoint};
 use crate::map_view::Viewport;
+use crate::selection_stats::{
+    SelectionBivariate, SelectionFieldStats, SelectionHistogram,
+};
 use crate::point_cloud::{GpuPoint, PointCloudPipeline};
 use crate::raster_reader::RasterDescriptor;
 use crate::sidebar::AddAttributeForm;
@@ -94,6 +97,8 @@ pub struct GisEditorApp {
     pub(super) heatmap_dirty: bool,
     pub(super) last_heatmap_layer_idx: Option<usize>,
     pub(super) click_target: ClickTarget,
+    pub(super) select_mode: bool,
+    pub(super) select_drag_start: Option<egui::Pos2>,
 
     pub(super) pending_file: Option<GisFilePath>,
     pub(super) pending_file_descriptor: Option<LayerDescriptor>,
@@ -144,6 +149,11 @@ pub struct GisEditorApp {
     pub(super) bivariate: Option<BivariateStats>,
     pub(super) show_bivariate: bool,
     pub(super) bivariate_y_field: String,
+    pub(super) selection_field_a: String,
+    pub(super) selection_field_b: String,
+    pub(super) selection_bivariate: Option<SelectionBivariate>,
+    pub(super) selection_histogram: Option<SelectionHistogram>,
+    pub(super) selection_field_stats: Option<SelectionFieldStats>,
     /// Counts down from N after any map-relevant change; GPU callback runs while > 0 or cursor is in map.
     pub(super) map_render_ttl: u32,
     pub(super) color_picker_layer: Option<usize>,
@@ -224,6 +234,8 @@ impl GisEditorApp {
             heatmap_dirty: true,
             last_heatmap_layer_idx: None,
             click_target: ClickTarget::GridCell,
+            select_mode: false,
+            select_drag_start: None,
             has_gpu,
             point_size: 5.0,
             points_dirty: false,
@@ -275,6 +287,11 @@ impl GisEditorApp {
             bivariate: None,
             show_bivariate: false,
             bivariate_y_field: String::new(),
+            selection_field_a: String::new(),
+            selection_field_b: String::new(),
+            selection_bivariate: None,
+            selection_histogram: None,
+            selection_field_stats: None,
             map_render_ttl: 0,
             color_picker_layer: None,
             spatial_field: String::new(),
@@ -366,6 +383,15 @@ impl GisEditorApp {
                     hilbert_order,
                     built_rtree,
                     uncertainty,
+                    selections: le
+                        .selections
+                        .iter()
+                        .map(|s| crate::snapshot::SelectionSnapshot {
+                            name: s.name.clone(),
+                            bbox: s.bbox,
+                        })
+                        .collect(),
+                    active_selection: le.active_selection,
                 }
             })
             .collect();
@@ -448,6 +474,15 @@ impl GisEditorApp {
                     }
                     LayerKind::Raster(_) => {}
                 }
+                for s in &layer_snap.selections {
+                    let ids = layer.data.ids_in_bbox_with_fallback(s.bbox);
+                    layer.selections.push(crate::gis_layer::LayerSelection {
+                        name: s.name.clone(),
+                        bbox: s.bbox,
+                        ids,
+                    });
+                }
+                layer.active_selection = layer_snap.active_selection;
             }
             if has_filters {
                 self.updated_filters = true;

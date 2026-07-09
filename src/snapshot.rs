@@ -62,6 +62,16 @@ pub struct LayerSnapshot {
     pub built_rtree: bool,
     #[serde(default)]
     pub uncertainty: Option<UncertaintySnapshot>,
+    #[serde(default)]
+    pub selections: Vec<SelectionSnapshot>,
+    #[serde(default)]
+    pub active_selection: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SelectionSnapshot {
+    pub name: String,
+    pub bbox: [f64; 4],
 }
 
 #[derive(Serialize, Deserialize, Clone)]
