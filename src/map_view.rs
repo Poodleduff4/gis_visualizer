@@ -2,8 +2,10 @@ use bitvec::vec::BitVec;
 
 use crate::app::ClickTarget;
 use crate::basemap::BasemapCache;
-use crate::gis_layer::{LayerEntry, LayerKind, TessellatedGeom};
-use crate::heatmap::HeatmapLayer;
+use crate::gis_layer::{
+    bake_raster_rgba, LayerEntry, LayerKind, LayerSelection, RasterData, TessellatedGeom,
+};
+use crate::heatmap::{HeatmapLayer, HeatmapMetric};
 use crate::histogram::{LisaCluster, LisaPoint};
 use crate::spatial_index::{IndexKind, LineSegment, SpatialIndex};
 use crate::uncertainty_quadtree::UncertaintyMeasure;
@@ -93,6 +95,10 @@ pub fn show_map(
     render_points: bool,
     click_target: &ClickTarget,
     selected_index_cell_data: &mut Option<UncertaintyMeasure>,
+    roi_toggle: &mut Option<[f64; 4]>,
+    select_mode: bool,
+    select_drag_start: &mut Option<Pos2>,
+    selection_result: &mut Option<[f64; 4]>,
 ) {
     let ctx = ui.ctx().clone();
     let rect = response.rect;
@@ -104,11 +110,44 @@ pub fn show_map(
         bm.render(&painter, viewport, rect, &ctx);
     }
 
-    // Pan via primary drag
-    if response.dragged_by(egui::PointerButton::Primary) {
+    // Pan via primary drag (disabled while box-selecting)
+    if !select_mode && response.dragged_by(egui::PointerButton::Primary) {
         let delta: Vec2 = response.drag_delta();
         viewport.center[0] -= delta.x as f64 / viewport.pixels_per_unit;
         viewport.center[1] += delta.y as f64 / viewport.pixels_per_unit;
+    }
+
+    // Box-select: rubber-band drag while select_mode is on.
+    if select_mode {
+        if response.drag_started() {
+            *select_drag_start = response.interact_pointer_pos();
+        }
+        if response.dragged() {
+            if let (Some(start), Some(cur)) = (*select_drag_start, response.interact_pointer_pos())
+            {
+                let band = Rect::from_two_pos(start, cur);
+                painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(255, 255, 0, 40));
+                painter.rect_stroke(
+                    band,
+                    0.0,
+                    Stroke::new(1.5, Color32::YELLOW),
+                    egui::StrokeKind::Middle,
+                );
+            }
+        }
+        if response.drag_stopped() {
+            if let (Some(start), Some(cur)) = (select_drag_start.take(), response.interact_pointer_pos())
+            {
+                let [wx0, wy0] = viewport.screen_to_world(start.x, start.y, rect);
+                let [wx1, wy1] = viewport.screen_to_world(cur.x, cur.y, rect);
+                *selection_result = Some([
+                    wx0.min(wx1),
+                    wy0.min(wy1),
+                    wx0.max(wx1),
+                    wy0.max(wy1),
+                ]);
+            }
+        }
     }
 
     // Zoom via scroll wheel, centred on cursor
@@ -130,8 +169,8 @@ pub fn show_map(
         }
     }
 
-    // Click to select — only tests against the active layer
-    if response.clicked() {
+    // Click to select — only tests against the active layer (disabled while box-selecting)
+    if !select_mode && response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if let Some(entry) = active_entry {
                 let [wx, wy] = viewport.screen_to_world(pos.x, pos.y, rect);
@@ -156,6 +195,13 @@ pub fn show_map(
                             }
                         }
                     }
+                    ClickTarget::HeatmapRoi => {
+                        if let Some(data) = entry.data.index(IndexKind::Quadtree) {
+                            if let Some(bbox) = data.leaf_bbox_at([wx, wy]) {
+                                *roi_toggle = Some(bbox);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -168,8 +214,8 @@ pub fn show_map(
         // When GPU handles points, skip layers that have no polygons or lines.
         if !render_points
             && match &entry.data {
-                LayerKind::Points(point_cloud_layer) => true,
-                LayerKind::Vector(gis_layer) => false,
+                LayerKind::Points(_) => true,
+                LayerKind::Vector(_) | LayerKind::Raster(_) => false,
             }
         {
             continue;
@@ -209,6 +255,8 @@ pub fn show_map(
     }
 }
 
+const MAX_INDEX_LINES: usize = 100_000;
+
 pub fn show_spatial_index_grid(
     painter: &Painter,
     index: Option<&SpatialIndex>,
@@ -219,10 +267,38 @@ pub fn show_spatial_index_grid(
         return;
     };
     let stroke = Stroke::new(2.0, Color32::from_rgb(0, 0, 255));
-    for LineSegment { start, end } in index.shapes().iter() {
+    for LineSegment { start, end } in index.shapes().iter().take(MAX_INDEX_LINES) {
         let p1 = viewport.world_to_screen(start[0], start[1], rect);
         let p2 = viewport.world_to_screen(end[0], end[1], rect);
         painter.line_segment([p1, p2], stroke);
+    }
+}
+
+/// Draws saved box-selection bboxes for a layer: magenta stroke for saved
+/// ones, a heavier `STROKE_SELECTED`-style stroke for the active selection.
+pub fn draw_selection_bboxes(
+    painter: &Painter,
+    selections: &[LayerSelection],
+    active: Option<usize>,
+    viewport: &Viewport,
+    rect: Rect,
+) {
+    const SELECTION_STROKE: Color32 = Color32::from_rgb(230, 0, 200);
+    for (i, sel) in selections.iter().enumerate() {
+        let is_active = active == Some(i);
+        let stroke = if is_active {
+            Stroke::new(2.5, STROKE_SELECTED)
+        } else {
+            Stroke::new(1.5, SELECTION_STROKE)
+        };
+        let p1 = viewport.world_to_screen(sel.bbox[0], sel.bbox[1], rect);
+        let p2 = viewport.world_to_screen(sel.bbox[2], sel.bbox[3], rect);
+        painter.rect_stroke(
+            Rect::from_two_pos(p1, p2),
+            0.0,
+            stroke,
+            egui::StrokeKind::Middle,
+        );
     }
 }
 
@@ -231,18 +307,13 @@ const MAX_HEATMAP_CELLS: usize = 50_000;
 pub fn show_quadtree_heatmap(
     painter: &Painter,
     heatmap: &HeatmapLayer,
+    metric: HeatmapMetric,
+    roi_bboxes: &[[f64; 4]],
     viewport: &Viewport,
     rect: Rect,
     opacity: u8,
 ) {
     let vp = viewport.viewport_bbox(rect);
-    let max_depth = heatmap
-        .cells
-        .iter()
-        .map(|c| c.depth)
-        .max()
-        .unwrap_or(1)
-        .max(1);
     let visible: Vec<_> = heatmap
         .cells
         .iter()
@@ -252,11 +323,28 @@ pub fn show_quadtree_heatmap(
         .take(MAX_HEATMAP_CELLS)
         .collect();
     for cell in visible {
-        let t = (cell.depth as f32 / max_depth as f32).powf(1.5);
+        let t = match metric {
+            HeatmapMetric::Density => cell.density,
+            HeatmapMetric::Unpredictability => cell.unpredictability,
+        };
         let color = heat_color(t, opacity);
         let p1 = viewport.world_to_screen(cell.bbox[0], cell.bbox[1], rect);
         let p2 = viewport.world_to_screen(cell.bbox[2], cell.bbox[3], rect);
         painter.rect_filled(Rect::from_two_pos(p1, p2), 0.0, color);
+    }
+    let roi_stroke = Stroke::new(2.0, Color32::from_rgb(255, 255, 0));
+    for bbox in roi_bboxes {
+        if bbox[0] > vp[2] || bbox[2] < vp[0] || bbox[1] > vp[3] || bbox[3] < vp[1] {
+            continue;
+        }
+        let p1 = viewport.world_to_screen(bbox[0], bbox[1], rect);
+        let p2 = viewport.world_to_screen(bbox[2], bbox[3], rect);
+        painter.rect_stroke(
+            Rect::from_two_pos(p1, p2),
+            0.0,
+            roi_stroke,
+            egui::StrokeKind::Middle,
+        );
     }
 }
 
@@ -329,7 +417,7 @@ pub fn draw_lisa_overlay(
     }
 }
 
-fn heat_color(t: f32, alpha: u8) -> Color32 {
+pub fn heat_color(t: f32, alpha: u8) -> Color32 {
     let (r, g, b) = if t < 0.33 {
         let s = t / 0.33;
         (0, (s * 255.0) as u8, 255)
@@ -396,4 +484,38 @@ fn render_tessellated(
             painter.rect(r, 0.0, fill, stroke, egui::StrokeKind::Outside);
         }
     }
+}
+
+/// Draw a GeoTIFF raster as a single textured rect spanning its full-globe
+/// bbox [-180,-90,180,90]. `texture_cache` is re-baked only when `dirty` (or
+/// empty) — baking + uploading a fresh texture every frame isn't free.
+pub fn render_raster_overlay(
+    ui: &Ui,
+    painter: &Painter,
+    raster: &RasterData,
+    viewport: &Viewport,
+    rect: Rect,
+    texture_cache: &mut Option<egui::TextureHandle>,
+    dirty: bool,
+) {
+    if dirty || texture_cache.is_none() {
+        let rgba = bake_raster_rgba(raster);
+        let image = egui::ColorImage::from_rgba_unmultiplied([raster.width, raster.height], &rgba);
+        *texture_cache = Some(ui.ctx().load_texture(
+            "raster_overlay",
+            image,
+            egui::TextureOptions::LINEAR,
+        ));
+    }
+    let Some(texture) = texture_cache else { return };
+
+    let top_left = viewport.world_to_screen(-180.0, 90.0, rect);
+    let bottom_right = viewport.world_to_screen(180.0, -90.0, rect);
+    let screen_rect = Rect::from_two_pos(top_left, bottom_right);
+    painter.image(
+        texture.id(),
+        screen_rect,
+        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }

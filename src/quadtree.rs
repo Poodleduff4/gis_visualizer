@@ -86,6 +86,23 @@ impl Quadtree {
     pub fn get_capacity(&self) -> Option<usize> {
         Some(self.capacity)
     }
+
+    pub fn pos_to_node(&self, pos: [f64; 2]) -> Option<&Quadtree> {
+        if self.intersects(&[pos[0], pos[1], pos[0], pos[1]]) && !self.divided {
+            return Some(self);
+        }
+
+        for child in &self.children {
+            if let Some(ch) = child.pos_to_node(pos) {
+                return Some(ch);
+            }
+        }
+        None
+    }
+
+    pub fn leaf_bbox_at(&self, pos: [f64; 2]) -> Option<[f64; 4]> {
+        self.pos_to_node(pos).map(|n| n.bbox)
+    }
 }
 
 impl Quadtree {
@@ -191,6 +208,8 @@ impl Quadtree {
             vec![HeatmapCell {
                 bbox: self.bbox,
                 depth,
+                point_ids: self.entries.iter().map(|e| e.id).collect(),
+                uncertainty: None,
             }]
         } else {
             self.children

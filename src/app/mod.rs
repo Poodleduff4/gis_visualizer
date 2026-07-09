@@ -1,33 +1,46 @@
 mod loader;
 mod ui;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use futures_channel::oneshot;
 use egui::Rect;
+use futures_channel::oneshot;
 
 use crate::basemap::BasemapCache;
 use crate::filter::LayerAttributeFilter;
-use crate::gis_layer::{BatchMessage, LayerEntry};
+use crate::gis_layer::{BatchMessage, LayerEntry, LayerKind};
 #[cfg(target_arch = "wasm32")]
 use crate::gis_reader::FgbReaderCache;
 use crate::gis_reader::{GisFilePath, LayerDescriptor};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::snapshot::{
-    filter_snapshot_to_filter, filter_to_snapshot, filter_logic_to_str, str_to_filter_logic,
-    AppSnapshot, LayerSnapshot, PendingSnapshotRestore, ViewportSnapshot, DisplaySnapshot,
-    AnalysisSnapshot,
-};
+use crate::globe::{GlobeCamera, GlobePipeline, GlobePoint};
+use crate::heatmap::HeatmapMetric;
 use crate::histogram::{BivariateStats, FieldStats, HistogramState, LisaPoint};
 use crate::map_view::Viewport;
+use crate::selection_stats::{
+    SelectionBivariate, SelectionFieldStats, SelectionHistogram,
+};
 use crate::point_cloud::{GpuPoint, PointCloudPipeline};
+use crate::raster_reader::RasterDescriptor;
 use crate::sidebar::AddAttributeForm;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::snapshot::{
+    filter_logic_to_str, filter_snapshot_to_filter, filter_to_snapshot, str_to_filter_logic,
+    AnalysisSnapshot, AppSnapshot, DisplaySnapshot, LayerSnapshot, PendingSnapshotRestore,
+    ViewportSnapshot,
+};
 use crate::spatial_index::IndexKind;
 use crate::uncertainty_quadtree::{MeasurementType, UncertaintyMeasure};
 
 pub const LAYER_PANEL_WIDTH: f32 = 180.0;
+
+#[derive(Clone, PartialEq, Default)]
+pub enum MapView {
+    #[default]
+    Flat,
+    Globe,
+}
 
 #[derive(Default, PartialEq)]
 pub(super) enum LoadMode {
@@ -40,6 +53,7 @@ pub(super) enum LoadMode {
 pub enum ClickTarget {
     Feature,
     GridCell,
+    HeatmapRoi,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -77,7 +91,14 @@ pub struct GisEditorApp {
     pub(super) show_index: bool,
     pub(super) index_kind: IndexKind,
     pub(super) show_heatmap: bool,
+    pub(super) heatmap_metric: HeatmapMetric,
+    pub(super) roi_rebuild_pending: bool,
+    pub(super) heatmap_cache: Option<crate::heatmap::HeatmapLayer>,
+    pub(super) heatmap_dirty: bool,
+    pub(super) last_heatmap_layer_idx: Option<usize>,
     pub(super) click_target: ClickTarget,
+    pub(super) select_mode: bool,
+    pub(super) select_drag_start: Option<egui::Pos2>,
 
     pub(super) pending_file: Option<GisFilePath>,
     pub(super) pending_file_descriptor: Option<LayerDescriptor>,
@@ -108,6 +129,7 @@ pub struct GisEditorApp {
     pub(super) selected_uncertainty_attribute: Option<String>,
     pub(super) selected_index_cell_data: Option<UncertaintyMeasure>,
     pub(super) uncertainty_split_threshold: f32,
+    pub(super) uncertainty_max_depth: usize,
     pub(super) viewport_culling: bool,
     pub(super) selected_split_measurement_type: MeasurementType,
     pub(super) fgb_file_url: String,
@@ -127,6 +149,11 @@ pub struct GisEditorApp {
     pub(super) bivariate: Option<BivariateStats>,
     pub(super) show_bivariate: bool,
     pub(super) bivariate_y_field: String,
+    pub(super) selection_field_a: String,
+    pub(super) selection_field_b: String,
+    pub(super) selection_bivariate: Option<SelectionBivariate>,
+    pub(super) selection_histogram: Option<SelectionHistogram>,
+    pub(super) selection_field_stats: Option<SelectionFieldStats>,
     /// Counts down from N after any map-relevant change; GPU callback runs while > 0 or cursor is in map.
     pub(super) map_render_ttl: u32,
     pub(super) color_picker_layer: Option<usize>,
@@ -140,6 +167,28 @@ pub struct GisEditorApp {
     pub(super) show_lisa: bool,
     pub(super) lisa_rx: Option<oneshot::Receiver<Option<Vec<Option<LisaPoint>>>>>,
 
+    // ── Globe view + raster ──────────────────────────────────────────────
+    pub(super) map_view: MapView,
+    pub(super) globe_camera: GlobeCamera,
+    pub(super) globe_points_buf: Vec<GlobePoint>,
+    pub(super) globe_points_dirty: bool,
+    /// Consumed by the globe's GPU raster texture upload.
+    pub(super) raster_dirty: bool,
+    /// Consumed independently by the flat map's CPU raster texture cache —
+    /// separate from `raster_dirty` so switching views doesn't miss a rebake
+    /// that the other view already consumed this frame.
+    pub(super) flat_raster_dirty: bool,
+    pub(super) raster_texture: Option<egui::TextureHandle>,
+    pub(super) raster_descriptor_rx: Option<mpsc::Receiver<RasterDescriptor>>,
+    pub(super) pending_raster_descriptor: Option<RasterDescriptor>,
+    pub(super) raster_load_rx: Option<mpsc::Receiver<Result<LayerEntry, String>>>,
+
+    /// Auto-cycles the active raster layer's `Single` band on a timer, like
+    /// repeatedly picking the next entry in the band dropdown.
+    pub(super) raster_playback_enabled: bool,
+    pub(super) raster_playback_interval_secs: f32,
+    pub(super) raster_playback_last_tick_ms: f64,
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) snapshot_restore: Option<PendingSnapshotRestore>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -150,7 +199,10 @@ impl GisEditorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let has_gpu = if let Some(wrs) = cc.wgpu_render_state.as_ref() {
             let pipeline = PointCloudPipeline::new(&wrs.device, wrs.target_format);
-            wrs.renderer.write().callback_resources.insert(pipeline);
+            let globe_pipeline = GlobePipeline::new(&wrs.device, &wrs.queue, wrs.target_format);
+            let mut renderer = wrs.renderer.write();
+            renderer.callback_resources.insert(pipeline);
+            renderer.callback_resources.insert(globe_pipeline);
             true
         } else {
             false
@@ -176,7 +228,14 @@ impl GisEditorApp {
             show_index: false,
             index_kind: IndexKind::Quadtree,
             show_heatmap: false,
+            heatmap_metric: HeatmapMetric::Density,
+            roi_rebuild_pending: false,
+            heatmap_cache: None,
+            heatmap_dirty: true,
+            last_heatmap_layer_idx: None,
             click_target: ClickTarget::GridCell,
+            select_mode: false,
+            select_drag_start: None,
             has_gpu,
             point_size: 5.0,
             points_dirty: false,
@@ -197,7 +256,8 @@ impl GisEditorApp {
             last_canvas_rect: None,
             selected_uncertainty_attribute: None,
             selected_index_cell_data: None,
-            uncertainty_split_threshold: 0.5,
+            uncertainty_split_threshold: 1.0,
+            uncertainty_max_depth: 12,
             viewport_culling: false,
             selected_split_measurement_type: MeasurementType::Variance,
             file_pick_rx: None,
@@ -227,6 +287,11 @@ impl GisEditorApp {
             bivariate: None,
             show_bivariate: false,
             bivariate_y_field: String::new(),
+            selection_field_a: String::new(),
+            selection_field_b: String::new(),
+            selection_bivariate: None,
+            selection_histogram: None,
+            selection_field_stats: None,
             map_render_ttl: 0,
             color_picker_layer: None,
             spatial_field: String::new(),
@@ -237,6 +302,19 @@ impl GisEditorApp {
             lisa_results: None,
             show_lisa: false,
             lisa_rx: None,
+            map_view: MapView::default(),
+            globe_camera: GlobeCamera::default(),
+            globe_points_buf: Vec::new(),
+            globe_points_dirty: false,
+            raster_dirty: false,
+            flat_raster_dirty: false,
+            raster_texture: None,
+            raster_descriptor_rx: None,
+            pending_raster_descriptor: None,
+            raster_load_rx: None,
+            raster_playback_enabled: false,
+            raster_playback_interval_secs: 1.0,
+            raster_playback_last_tick_ms: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
             snapshot_restore: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -248,17 +326,75 @@ impl GisEditorApp {
 #[cfg(not(target_arch = "wasm32"))]
 impl GisEditorApp {
     pub(super) fn capture_snapshot(&self) -> AppSnapshot {
-        let layers: Vec<LayerSnapshot> = self.layers.iter().map(|le| {
-            LayerSnapshot {
-                file_path: le.descriptor.location.to_string(),
-                name: le.name.clone(),
-                visible: le.visible,
-                color: le.color,
-                opacity: le.opacity,
-                filter_logic: filter_logic_to_str(le.filter_logic),
-                filters: le.filters.iter().filter_map(filter_to_snapshot).collect(),
-            }
-        }).collect();
+        let layers: Vec<LayerSnapshot> = self
+            .layers
+            .iter()
+            .map(|le| {
+                let (quadtree_capacity, hilbert_order, built_rtree, uncertainty) = match &le.data {
+                    LayerKind::Vector(gl) => {
+                        let quadtree_capacity =
+                            gl.quadtree.as_ref().and_then(|si| si.get_capacity());
+                        let hilbert_order = match &gl.hilbert {
+                            Some(crate::spatial_index::SpatialIndex::HilbertCurve(ht)) => {
+                                Some(ht.get_order())
+                            }
+                            _ => None,
+                        };
+                        (quadtree_capacity, hilbert_order, false, None)
+                    }
+                    LayerKind::Points(pc) => match pc.index.as_deref() {
+                        Some(crate::spatial_index::SpatialIndex::Quadtree(qt)) => {
+                            (qt.get_capacity(), None, false, None)
+                        }
+                        Some(crate::spatial_index::SpatialIndex::HilbertCurve(ht)) => {
+                            (None, Some(ht.get_order()), false, None)
+                        }
+                        Some(crate::spatial_index::SpatialIndex::RTree(_)) => {
+                            (None, None, true, None)
+                        }
+                        Some(crate::spatial_index::SpatialIndex::UncertaintyQuadtree(uq)) => (
+                            None,
+                            None,
+                            false,
+                            Some(crate::snapshot::UncertaintySnapshot {
+                                attribute: uq.attribute().to_string(),
+                                threshold: uq.threshold(),
+                                measurement_type: crate::snapshot::measurement_type_to_str(
+                                    &uq.measurement_type(),
+                                ),
+                                max_depth: uq.max_depth(),
+                            }),
+                        ),
+                        None => (None, None, false, None),
+                    },
+                    LayerKind::Raster(_) => (None, None, false, None),
+                };
+                LayerSnapshot {
+                    file_path: le.descriptor.location.to_string(),
+                    is_raster: matches!(le.data, LayerKind::Raster(_)),
+                    selected_attributes: le.data.field_names(),
+                    name: le.name.clone(),
+                    visible: le.visible,
+                    color: le.color,
+                    opacity: le.opacity,
+                    filter_logic: filter_logic_to_str(le.filter_logic),
+                    filters: le.filters.iter().filter_map(filter_to_snapshot).collect(),
+                    quadtree_capacity,
+                    hilbert_order,
+                    built_rtree,
+                    uncertainty,
+                    selections: le
+                        .selections
+                        .iter()
+                        .map(|s| crate::snapshot::SelectionSnapshot {
+                            name: s.name.clone(),
+                            bbox: s.bbox,
+                        })
+                        .collect(),
+                    active_selection: le.active_selection,
+                }
+            })
+            .collect();
 
         AppSnapshot {
             viewport: ViewportSnapshot {
@@ -293,14 +429,60 @@ impl GisEditorApp {
         }
 
         // Apply settings from the layer we just finished loading.
-        if let Some(layer_snap) = self.snapshot_restore.as_mut().unwrap().pending_layer_settings.take() {
+        if let Some(layer_snap) = self
+            .snapshot_restore
+            .as_mut()
+            .unwrap()
+            .pending_layer_settings
+            .take()
+        {
             let has_filters = !layer_snap.filters.is_empty();
             if let Some(layer) = self.layers.last_mut() {
                 layer.visible = layer_snap.visible;
                 layer.color = layer_snap.color;
                 layer.opacity = layer_snap.opacity;
                 layer.filter_logic = str_to_filter_logic(&layer_snap.filter_logic);
-                layer.filters = layer_snap.filters.iter().map(filter_snapshot_to_filter).collect();
+                layer.filters = layer_snap
+                    .filters
+                    .iter()
+                    .map(filter_snapshot_to_filter)
+                    .collect();
+                match &mut layer.data {
+                    LayerKind::Vector(gl) => {
+                        if let Some(cap) = layer_snap.quadtree_capacity {
+                            gl.rebuild_quadtree(cap);
+                        }
+                        if let Some(order) = layer_snap.hilbert_order {
+                            gl.rebuild_hilbert_tree(order);
+                        }
+                    }
+                    LayerKind::Points(pc) => {
+                        if let Some(cap) = layer_snap.quadtree_capacity {
+                            pc.rebuild_quadtree(cap);
+                        } else if let Some(order) = layer_snap.hilbert_order {
+                            pc.rebuild_hilbert_tree(order);
+                        } else if layer_snap.built_rtree {
+                            pc.rebuild_rtree();
+                        } else if let Some(u) = &layer_snap.uncertainty {
+                            pc.rebuild_uncertainty_quadtree(
+                                u.attribute.clone(),
+                                u.threshold,
+                                crate::snapshot::str_to_measurement_type(&u.measurement_type),
+                                u.max_depth,
+                            );
+                        }
+                    }
+                    LayerKind::Raster(_) => {}
+                }
+                for s in &layer_snap.selections {
+                    let ids = layer.data.ids_in_bbox_with_fallback(s.bbox);
+                    layer.selections.push(crate::gis_layer::LayerSelection {
+                        name: s.name.clone(),
+                        bbox: s.bbox,
+                        ids,
+                    });
+                }
+                layer.active_selection = layer_snap.active_selection;
             }
             if has_filters {
                 self.updated_filters = true;
@@ -336,9 +518,36 @@ impl GisEditorApp {
             self.map_render_ttl = 10;
             self.status = "Snapshot loaded.".to_string();
         } else {
-            let next = self.snapshot_restore.as_mut().unwrap().queue.pop_front().unwrap();
-            let path_str = next.file_path.clone();
-            self.snapshot_restore.as_mut().unwrap().pending_layer_settings = Some(next);
+            let next = self
+                .snapshot_restore
+                .as_mut()
+                .unwrap()
+                .queue
+                .pop_front()
+                .unwrap();
+            self.open_snapshot_layer(next);
+        }
+    }
+
+    pub(super) fn open_snapshot_layer(&mut self, next: LayerSnapshot) {
+        let path_str = next.file_path.clone();
+        if next.is_raster {
+            self.snapshot_restore
+                .as_mut()
+                .unwrap()
+                .pending_layer_settings = Some(next);
+            let (tx, rx) = mpsc::channel::<Result<LayerEntry, String>>();
+            self.raster_load_rx = Some(rx);
+            std::thread::spawn(move || {
+                let result = crate::raster_reader::load_raster_sync(std::path::Path::new(&path_str))
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            });
+        } else {
+            self.snapshot_restore
+                .as_mut()
+                .unwrap()
+                .pending_layer_settings = Some(next);
             self.open_file(GisFilePath::LocalFile(path_str));
         }
     }

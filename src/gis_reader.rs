@@ -137,8 +137,20 @@ impl PropertyProcessor for PropertyExtractor<'_> {
     }
 }
 
-fn is_parquet(path: &str) -> bool {
-    path.ends_with(".parquet")
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorFileType {
+    FlatGeobuf,
+    GeoParquet,
+}
+
+fn vector_file_type(path: &str) -> anyhow::Result<VectorFileType> {
+    if path.ends_with(".parquet") {
+        Ok(VectorFileType::GeoParquet)
+    } else if path.ends_with(".fgb") {
+        Ok(VectorFileType::FlatGeobuf)
+    } else {
+        bail!("Unsupported vector file extension: {path}");
+    }
 }
 
 // ── GeoParquetReader shared types and helpers ─────────────────────────────
@@ -745,11 +757,13 @@ pub struct GisReader {}
 impl GisReader {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_layer_descriptor(path: &str) -> anyhow::Result<LayerDescriptor> {
-        if is_parquet(path) {
-            return GeoParquetReader::load_descriptor(path);
+        match vector_file_type(path)? {
+            VectorFileType::GeoParquet => GeoParquetReader::load_descriptor(path),
+            VectorFileType::FlatGeobuf => {
+                let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
+                Self::make_layer_descriptor(reader.header(), GisFilePath::LocalFile(path.to_string()))
+            }
         }
-        let reader = FgbReader::open(BufReader::new(File::open(path)?))?;
-        Self::make_layer_descriptor(reader.header(), GisFilePath::LocalFile(path.to_string()))
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -905,11 +919,15 @@ impl GisReader {
         let GisFilePath::LocalFile(str_path) = path else {
             bail!("Wrong GisFilePath type!");
         };
-        if is_parquet(&str_path) {
-            return GeoParquetReader::load_point_layer_batched(&str_path, dest_idx, tx, selected_fields);
+        match vector_file_type(&str_path)? {
+            VectorFileType::GeoParquet => {
+                GeoParquetReader::load_point_layer_batched(&str_path, dest_idx, tx, selected_fields)
+            }
+            VectorFileType::FlatGeobuf => {
+                let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
+                Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
+            }
         }
-        let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
-        Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1327,11 +1345,12 @@ impl GisReader {
             use anyhow::bail;
             bail!("Wrong GisFilePath type!");
         };
-        let descriptor = if is_parquet(str_path) {
-            GeoParquetReader::load_descriptor(str_path)?
-        } else {
-            let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
-            Self::make_layer_descriptor(reader.header(), path)?
+        let descriptor = match vector_file_type(str_path)? {
+            VectorFileType::GeoParquet => GeoParquetReader::load_descriptor(str_path)?,
+            VectorFileType::FlatGeobuf => {
+                let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
+                Self::make_layer_descriptor(reader.header(), path)?
+            }
         };
         Ok(vec![Self::layer_entry_from_descriptor(
             descriptor,
@@ -1396,6 +1415,9 @@ impl GisReader {
             descriptor: descriptor.clone(),
             filters: Vec::new(),
             filter_logic: FilterLogic::default(),
+            roi_bboxes: Vec::new(),
+            selections: Vec::new(),
+            active_selection: None,
         }
     }
 

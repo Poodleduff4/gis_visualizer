@@ -1,6 +1,6 @@
 use crate::{
     hilbert_r_tree::HilbertRTree, quadtree::Quadtree, rtree_index::SpatialTree,
-    uncertainty_quadtree::UncertaintyQuadtree,
+    uncertainty_quadtree::{UncertaintyMeasure, UncertaintyQuadtree},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,11 +105,25 @@ impl SpatialIndex {
             SpatialIndex::RTree(_) => vec![],
         }
     }
+
+    pub fn leaf_bbox_at(&self, pos: [f64; 2]) -> Option<[f64; 4]> {
+        match self {
+            SpatialIndex::Quadtree(qt) => qt.leaf_bbox_at(pos),
+            SpatialIndex::HilbertCurve(_) => None,
+            SpatialIndex::UncertaintyQuadtree(uq) => uq.leaf_bbox_at(pos),
+            SpatialIndex::RTree(_) => None,
+        }
+    }
 }
 
 pub struct HeatmapCell {
     pub bbox: [f64; 4],
     pub depth: usize,
+    pub point_ids: Vec<usize>,
+    /// Node's already-computed uncertainty (UncertaintyQuadtree only). When
+    /// present, reuse it instead of resampling so a clicked cell's value
+    /// (`ClickTarget::GridCell`) always matches what the heatmap shows.
+    pub uncertainty: Option<UncertaintyMeasure>,
 }
 
 pub struct LineSegment {

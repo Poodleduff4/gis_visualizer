@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-pub use desktop::export_filtered_points;
+pub use desktop::{export_filtered_points, export_points_by_ids};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod desktop {
@@ -21,6 +21,17 @@ mod desktop {
             .filter(|(i, _)| pc.filter_mask[*i])
             .map(|(i, _)| i)
             .collect();
+        export_points_by_ids(pc, &filtered, path)
+    }
+
+    /// Exports an explicit subset of point row indices (e.g. a saved
+    /// box-selection), bypassing `filter_mask` entirely.
+    pub fn export_points_by_ids(
+        pc: &PointCloudLayer,
+        ids: &[usize],
+        path: &str,
+    ) -> anyhow::Result<()> {
+        let filtered: Vec<usize> = ids.to_vec();
 
         // WKB point: byte order (1) + type (1=Point, 4 bytes LE) + x (f64 LE) + y (f64 LE)
         let geom_data: Vec<Vec<u8>> = filtered

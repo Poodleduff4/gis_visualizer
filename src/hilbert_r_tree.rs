@@ -91,6 +91,10 @@ impl HilbertRTree {
     pub fn get_capacity(&self) -> Option<usize> {
         None
     }
+
+    pub fn get_order(&self) -> u32 {
+        self.order
+    }
 }
 
 fn intersects(r1: &[f64; 4], r2: &[f64; 4]) -> bool {
