@@ -1,5 +1,11 @@
 mod loader;
 mod ui;
+mod ui_layer_panel;
+mod ui_loading;
+mod ui_map;
+mod ui_menu;
+mod ui_sidebar;
+mod ui_windows;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;

@@ -12,6 +12,7 @@ use std::sync::{
     mpsc, Arc,
 };
 
+#[derive(Clone)]
 pub enum AttributeColumn {
     Text(Vec<String>),
     Integer(Vec<i64>),

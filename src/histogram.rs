@@ -3,6 +3,7 @@ use rstar::{primitives::GeomWithData, RTree, AABB};
 
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 use crate::spatial_index::SpatialIndex;
+use crate::stats_core;
 
 pub struct BivariateStats {
     pub x_field: String,
@@ -46,41 +47,18 @@ pub fn compute_bivariate(
 ) -> Option<BivariateStats> {
     let xs = col_values(pc, x_field, filtered_only)?;
     let ys = col_values(pc, y_field, filtered_only)?;
-    if xs.len() != ys.len() || xs.is_empty() {
-        return None;
-    }
-    let n = xs.len();
-    let x_mean = xs.iter().sum::<f64>() / n as f64;
-    let y_mean = ys.iter().sum::<f64>() / n as f64;
-    let cov = xs.iter().zip(ys.iter()).map(|(x, y)| (x - x_mean) * (y - y_mean)).sum::<f64>() / n as f64;
-    let x_var = xs.iter().map(|x| (x - x_mean).powi(2)).sum::<f64>() / n as f64;
-    let y_var = ys.iter().map(|y| (y - y_mean).powi(2)).sum::<f64>() / n as f64;
-    let x_std = x_var.sqrt();
-    let y_std = y_var.sqrt();
-    let pearson_r = if x_std > 1e-12 && y_std > 1e-12 {
-        cov / (x_std * y_std)
-    } else {
-        0.0
-    };
-
-    let scatter_points: Vec<[f64; 2]> = if n <= max_plot_points {
-        xs.iter().zip(ys.iter()).map(|(&x, &y)| [x, y]).collect()
-    } else {
-        let step = n / max_plot_points;
-        xs.iter().zip(ys.iter()).step_by(step).map(|(&x, &y)| [x, y]).collect()
-    };
-
+    let b = stats_core::bivariate(&xs, &ys, max_plot_points)?;
     Some(BivariateStats {
         x_field: x_field.to_string(),
         y_field: y_field.to_string(),
-        n,
-        pearson_r,
-        covariance: cov,
-        x_mean,
-        y_mean,
-        x_std,
-        y_std,
-        scatter_points,
+        n: b.n,
+        pearson_r: b.pearson_r,
+        covariance: b.covariance,
+        x_mean: b.x_mean,
+        y_mean: b.y_mean,
+        x_std: b.x_std,
+        y_std: b.y_std,
+        scatter_points: b.scatter_points,
     })
 }
 
@@ -99,31 +77,17 @@ pub struct FieldStats {
 pub fn compute_field_stats(pc: &PointCloudLayer, field: &str, filtered_only: bool) -> Option<FieldStats> {
     let all_count = pc.points.len();
     let values = col_values(pc, field, filtered_only)?;
-    if values.is_empty() {
-        return None;
-    }
-    let n = values.len();
-    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mean = values.iter().sum::<f64>() / n as f64;
-    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-    let std_dev = variance.sqrt();
-    let mut sorted = values.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let percentile = |p: f64| -> f64 {
-        let idx = ((n - 1) as f64 * p) as usize;
-        sorted[idx]
-    };
+    let s = stats_core::basic_stats(&values)?;
     Some(FieldStats {
         count: all_count,
-        filtered_count: n,
-        min,
-        max,
-        mean,
-        std_dev,
-        p25: percentile(0.25),
-        p50: percentile(0.50),
-        p75: percentile(0.75),
+        filtered_count: s.count,
+        min: s.min,
+        max: s.max,
+        mean: s.mean,
+        std_dev: s.std_dev,
+        p25: s.p25,
+        p50: s.p50,
+        p75: s.p75,
     })
 }
 
@@ -145,29 +109,15 @@ pub fn compute_histogram(
     filtered_only: bool,
 ) -> Option<HistogramState> {
     let values = col_values(pc, field, filtered_only)?;
-    if values.is_empty() {
-        return None;
-    }
-    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if (max - min).abs() < 1e-12 {
-        return None;
-    }
-    let mut counts = vec![0u32; bin_count];
-    for v in &values {
-        let idx = ((v - min) / (max - min) * bin_count as f64) as usize;
-        counts[idx.min(bin_count - 1)] += 1;
-    }
-    let bin_width = (max - min) / bin_count as f64;
-    let bin_edges: Vec<f64> = (0..=bin_count).map(|i| min + i as f64 * bin_width).collect();
+    let h = stats_core::histogram(&values, bin_count)?;
     Some(HistogramState {
         field: field.to_string(),
-        counts,
-        bin_edges,
-        min,
-        max,
-        range_lo: min,
-        range_hi: max,
+        counts: h.counts,
+        bin_edges: h.bin_edges,
+        min: h.min,
+        max: h.max,
+        range_lo: h.min,
+        range_hi: h.max,
         filtered_only,
     })
 }

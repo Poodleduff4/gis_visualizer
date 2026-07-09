@@ -32,6 +32,13 @@ pub enum SidebarAction {
     ExportFiltered,
     ComputeLocalVariance(String, f64),
     ComputeLisa(String, f64),
+    /// Selection-scoped counterparts, emitted by `show_selection_sidebar`
+    /// instead of it spawning worker threads itself — keeps a single
+    /// dispatch point (in `ui_sidebar.rs`'s match on `SidebarAction`) for
+    /// both the whole-layer and selection-scoped analysis actions.
+    ExportSelection,
+    ComputeLocalVarianceSelection(String, f64),
+    ComputeLisaSelection(String, f64),
 }
 
 // ── Main sidebar widget ───────────────────────────────────────────────────────
