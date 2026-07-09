@@ -1,5 +1,6 @@
 use crate::gis_layer::{AttributeValue, LayerKind, LayerSelection};
 use crate::point_cloud_layer::AttributeColumn;
+use crate::stats_core;
 
 /// Numeric values of `field` for the ids captured by `sel`, or `None` if the
 /// field doesn't exist / isn't numeric. Dispatches on layer kind since Vector
@@ -76,50 +77,18 @@ pub fn compute_selection_bivariate(
 ) -> Option<SelectionBivariate> {
     let xs = field_values_for_selection(layer, sel, x_field)?;
     let ys = field_values_for_selection(layer, sel, y_field)?;
-    if xs.len() != ys.len() || xs.is_empty() {
-        return None;
-    }
-    let n = xs.len();
-    let x_mean = xs.iter().sum::<f64>() / n as f64;
-    let y_mean = ys.iter().sum::<f64>() / n as f64;
-    let cov = xs
-        .iter()
-        .zip(ys.iter())
-        .map(|(x, y)| (x - x_mean) * (y - y_mean))
-        .sum::<f64>()
-        / n as f64;
-    let x_var = xs.iter().map(|x| (x - x_mean).powi(2)).sum::<f64>() / n as f64;
-    let y_var = ys.iter().map(|y| (y - y_mean).powi(2)).sum::<f64>() / n as f64;
-    let x_std = x_var.sqrt();
-    let y_std = y_var.sqrt();
-    let pearson_r = if x_std > 1e-12 && y_std > 1e-12 {
-        cov / (x_std * y_std)
-    } else {
-        0.0
-    };
-
-    let scatter_points: Vec<[f64; 2]> = if n <= max_plot_points {
-        xs.iter().zip(ys.iter()).map(|(&x, &y)| [x, y]).collect()
-    } else {
-        let step = n / max_plot_points;
-        xs.iter()
-            .zip(ys.iter())
-            .step_by(step)
-            .map(|(&x, &y)| [x, y])
-            .collect()
-    };
-
+    let b = stats_core::bivariate(&xs, &ys, max_plot_points)?;
     Some(SelectionBivariate {
         x_field: x_field.to_string(),
         y_field: y_field.to_string(),
-        n,
-        pearson_r,
-        covariance: cov,
-        x_mean,
-        y_mean,
-        x_std,
-        y_std,
-        scatter_points,
+        n: b.n,
+        pearson_r: b.pearson_r,
+        covariance: b.covariance,
+        x_mean: b.x_mean,
+        y_mean: b.y_mean,
+        x_std: b.x_std,
+        y_std: b.y_std,
+        scatter_points: b.scatter_points,
     })
 }
 
@@ -138,24 +107,13 @@ pub fn compute_selection_histogram(
     bin_count: usize,
 ) -> Option<SelectionHistogram> {
     let values = field_values_for_selection(layer, sel, field)?;
-    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if (max - min).abs() < 1e-12 {
-        return None;
-    }
-    let mut counts = vec![0u32; bin_count];
-    for v in &values {
-        let idx = ((v - min) / (max - min) * bin_count as f64) as usize;
-        counts[idx.min(bin_count - 1)] += 1;
-    }
-    let bin_width = (max - min) / bin_count as f64;
-    let bin_edges: Vec<f64> = (0..=bin_count).map(|i| min + i as f64 * bin_width).collect();
+    let h = stats_core::histogram(&values, bin_count)?;
     Some(SelectionHistogram {
         field: field.to_string(),
-        counts,
-        bin_edges,
-        min,
-        max,
+        counts: h.counts,
+        bin_edges: h.bin_edges,
+        min: h.min,
+        max: h.max,
     })
 }
 
@@ -176,26 +134,15 @@ pub fn compute_selection_field_stats(
     field: &str,
 ) -> Option<SelectionFieldStats> {
     let values = field_values_for_selection(layer, sel, field)?;
-    let n = values.len();
-    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mean = values.iter().sum::<f64>() / n as f64;
-    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-    let std_dev = variance.sqrt();
-    let mut sorted = values.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let percentile = |p: f64| -> f64 {
-        let idx = ((n - 1) as f64 * p) as usize;
-        sorted[idx]
-    };
+    let s = stats_core::basic_stats(&values)?;
     Some(SelectionFieldStats {
-        count: n,
-        min,
-        max,
-        mean,
-        std_dev,
-        p25: percentile(0.25),
-        p50: percentile(0.50),
-        p75: percentile(0.75),
+        count: s.count,
+        min: s.min,
+        max: s.max,
+        mean: s.mean,
+        std_dev: s.std_dev,
+        p25: s.p25,
+        p50: s.p50,
+        p75: s.p75,
     })
 }
