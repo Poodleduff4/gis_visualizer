@@ -373,6 +373,7 @@ impl GeoParquetReader {
         geom_src: &GeometrySource,
         bbox_filter: Option<[f64; 4]>,
         selected_fields: Option<&[String]>,
+        id_base: u32,
     ) -> anyhow::Result<Option<crate::gis_layer::BatchMessage>> {
         use crate::gis_layer::BatchMessage;
         use crate::point_cloud_layer::AttributeColumn;
@@ -382,6 +383,10 @@ impl GeoParquetReader {
             return Ok(None);
         }
 
+        // `id_base` keeps ids unique/stable across a multi-batch file when no
+        // `idx` column is present — without it every batch would restart at
+        // 0, so ids collide and filter/selection lookups by id silently
+        // match the wrong rows past the first batch.
         let ids: Vec<u32> = match batch.column_by_name("idx") {
             Some(c) => {
                 if let Some(a) = c.as_any().downcast_ref::<UInt32Array>() {
@@ -391,10 +396,10 @@ impl GeoParquetReader {
                 } else if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
                     a.values().iter().map(|v| *v as u32).collect()
                 } else {
-                    (0..nrows as u32).collect()
+                    (id_base..id_base + nrows as u32).collect()
                 }
             }
-            None => (0..nrows as u32).collect(),
+            None => (id_base..id_base + nrows as u32).collect(),
         };
 
         let coords: Vec<Option<[f64; 2]>> = match geom_src {
@@ -489,10 +494,13 @@ impl GeoParquetReader {
             .collect()
             .await?;
 
+        let mut id_base: u32 = 0;
         for batch in &batches {
-            if let Some(msg) = Self::extract_points(batch, dest_idx, &geom_src, None, selected_fields.as_deref())? {
+            let nrows = batch.num_rows();
+            if let Some(msg) = Self::extract_points(batch, dest_idx, &geom_src, None, selected_fields.as_deref(), id_base)? {
                 tx.send(msg).ok();
             }
+            id_base += nrows as u32;
         }
         Ok(())
     }
@@ -534,14 +542,17 @@ impl GeoParquetReader {
         };
 
         let batches = ctx.sql(&sql).await?.collect().await?;
+        let mut id_base: u32 = 0;
         for batch in &batches {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            let nrows = batch.num_rows();
             let wkb_bbox = matches!(geom_src, GeometrySource::WkbColumn).then_some(bbox);
-            if let Some(msg) = Self::extract_points(batch, dest_idx, &geom_src, wkb_bbox, selected_fields.as_deref())? {
+            if let Some(msg) = Self::extract_points(batch, dest_idx, &geom_src, wkb_bbox, selected_fields.as_deref(), id_base)? {
                 tx.send(msg).ok();
             }
+            id_base += nrows as u32;
         }
         Ok(())
     }
@@ -594,6 +605,7 @@ impl GeoParquetReader {
         geom_src: &GeometrySource,
         bbox_filter: Option<[f64; 4]>,
         selected_fields: Option<&[String]>,
+        id_base: u32,
     ) -> anyhow::Result<Option<crate::gis_layer::BatchMessage>> {
         use crate::gis_layer::BatchMessage;
         use crate::point_cloud_layer::AttributeColumn;
@@ -602,6 +614,7 @@ impl GeoParquetReader {
         if nrows == 0 {
             return Ok(None);
         }
+        // See extract_points (native side) for why id_base matters across batches.
         let ids: Vec<u32> = match batch.column_by_name("idx") {
             Some(c) => {
                 if let Some(a) = c.as_any().downcast_ref::<UInt32Array>() {
@@ -611,10 +624,10 @@ impl GeoParquetReader {
                 } else if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
                     a.values().iter().map(|v| *v as u32).collect()
                 } else {
-                    (0..nrows as u32).collect()
+                    (id_base..id_base + nrows as u32).collect()
                 }
             }
-            None => (0..nrows as u32).collect(),
+            None => (id_base..id_base + nrows as u32).collect(),
         };
         let coords: Vec<Option<[f64; 2]>> = match geom_src {
             GeometrySource::XYColumns { x_col, y_col } => {
@@ -736,17 +749,21 @@ impl GeoParquetReader {
         let schema = builder.schema().as_ref().clone();
         let geom_src = Self::detect_geometry_source(&schema);
         let reader = builder.build()?;
+        let mut id_base: u32 = 0;
         for result in reader {
             let batch = result?;
+            let nrows = batch.num_rows();
             if let Some(msg) = Self::extract_points_from_batch(
                 &batch,
                 dest_idx,
                 &geom_src,
                 None,
                 selected_fields.as_deref(),
+                id_base,
             )? {
                 tx.send(msg).ok();
             }
+            id_base += nrows as u32;
         }
         Ok(())
     }

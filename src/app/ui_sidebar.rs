@@ -26,7 +26,6 @@ use crate::spatial_index::{IndexKind, SpatialIndex};
 
 use super::{now_ms, GisEditorApp};
 
-#[cfg(not(target_arch = "wasm32"))]
 fn clone_pc_for_export(
     pc: &crate::point_cloud_layer::PointCloudLayer,
 ) -> crate::point_cloud_layer::PointCloudLayer {
@@ -352,6 +351,27 @@ impl GisEditorApp {
                                     });
                                 }
                             }
+                            #[cfg(target_arch = "wasm32")]
+                            if let Some(idx) = self.active_layer_idx {
+                                if let LayerKind::Points(pc) = &self.layers[idx].data {
+                                    let pc_export = clone_pc_for_export(pc);
+                                    let name = self.layers[idx].name.clone();
+                                    spawn_local(async move {
+                                        if let Ok(bytes) =
+                                            crate::exporter::export_filtered_points_bytes(&pc_export)
+                                        {
+                                            if let Some(file) = rfd::AsyncFileDialog::new()
+                                                .add_filter("GeoParquet", &["parquet"])
+                                                .set_file_name(format!("{}_export.parquet", name))
+                                                .save_file()
+                                                .await
+                                            {
+                                                let _ = file.write(&bytes).await;
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                         }
                         #[cfg(not(target_arch = "wasm32"))]
                         SidebarAction::ExportSelection => {
@@ -379,7 +399,137 @@ impl GisEditorApp {
                             }
                         }
                         #[cfg(target_arch = "wasm32")]
-                        SidebarAction::ExportSelection => {}
+                        SidebarAction::ExportSelection => {
+                            if let Some((li, sidx)) = selection_ctx {
+                                if let LayerKind::Points(pc) = &self.layers[li].data {
+                                    let pc_export = clone_pc_for_export(pc);
+                                    let sel = &self.layers[li].selections[sidx];
+                                    let ids = sel.ids.clone();
+                                    let name = format!("{}_{}", self.layers[li].name, sel.name);
+                                    spawn_local(async move {
+                                        if let Ok(bytes) =
+                                            crate::exporter::export_points_by_ids_bytes(&pc_export, &ids)
+                                        {
+                                            if let Some(file) = rfd::AsyncFileDialog::new()
+                                                .add_filter("GeoParquet", &["parquet"])
+                                                .set_file_name(format!("{}_export.parquet", name))
+                                                .save_file()
+                                                .await
+                                            {
+                                                let _ = file.write(&bytes).await;
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        SidebarAction::CreateLayerFromSelection => {
+                            if let Some((li, sidx)) = selection_ctx {
+                                let sel_name = self.layers[li].selections[sidx].name.clone();
+                                let ids = self.layers[li].selections[sidx].ids.clone();
+                                let new_name = format!("{}_{}", self.layers[li].name, sel_name);
+                                let color = self.layers[li].color;
+                                let opacity = self.layers[li].opacity;
+                                let mut descriptor = self.layers[li].descriptor.clone();
+                                descriptor.name = new_name.clone();
+                                descriptor.num_features = ids.len() as u64;
+
+                                let new_data = match &self.layers[li].data {
+                                    LayerKind::Points(pc) => {
+                                        let n = ids.len();
+                                        let new_points: Vec<(u32, [f64; 2])> =
+                                            ids.iter().map(|&id| pc.points[id]).collect();
+                                        let new_attrs: Vec<crate::point_cloud_layer::AttributeColumn> = pc
+                                            .attributes
+                                            .iter()
+                                            .map(|col| match col {
+                                                crate::point_cloud_layer::AttributeColumn::Text(v) => {
+                                                    crate::point_cloud_layer::AttributeColumn::Text(
+                                                        ids.iter().map(|&id| v[id].clone()).collect(),
+                                                    )
+                                                }
+                                                crate::point_cloud_layer::AttributeColumn::Integer(v) => {
+                                                    crate::point_cloud_layer::AttributeColumn::Integer(
+                                                        ids.iter().map(|&id| v[id]).collect(),
+                                                    )
+                                                }
+                                                crate::point_cloud_layer::AttributeColumn::Float(v) => {
+                                                    crate::point_cloud_layer::AttributeColumn::Float(
+                                                        ids.iter().map(|&id| v[id]).collect(),
+                                                    )
+                                                }
+                                            })
+                                            .collect();
+                                        let mut new_pc = crate::point_cloud_layer::PointCloudLayer {
+                                            points: std::sync::Arc::new(new_points),
+                                            attributes: new_attrs,
+                                            field_names: pc.field_names.clone(),
+                                            index: None,
+                                            bbox: None,
+                                            viewport_mask: bitvec![0; n],
+                                            filter_mask: bitvec![1; n],
+                                        };
+                                        new_pc.ensure_bbox();
+                                        Some(LayerKind::Points(new_pc))
+                                    }
+                                    LayerKind::Vector(gl) => {
+                                        let new_features: Vec<crate::gis_layer::GisFeature> = ids
+                                            .iter()
+                                            .enumerate()
+                                            .filter_map(|(new_id, &old_id)| {
+                                                gl.features.get(old_id).map(|f| {
+                                                    crate::gis_layer::GisFeature::new(
+                                                        new_id,
+                                                        f.geometry.clone(),
+                                                        f.attributes.clone(),
+                                                    )
+                                                })
+                                            })
+                                            .collect();
+                                        let world_bbox = new_features.iter().map(|f| f.bbox()).fold(
+                                            [f64::MAX, f64::MAX, f64::MIN, f64::MIN],
+                                            |a, b| {
+                                                [
+                                                    a[0].min(b[0]),
+                                                    a[1].min(b[1]),
+                                                    a[2].max(b[2]),
+                                                    a[3].max(b[3]),
+                                                ]
+                                            },
+                                        );
+                                        Some(LayerKind::Vector(crate::gis_layer::GisLayer {
+                                            name: new_name.clone(),
+                                            file_path: String::new(),
+                                            features: new_features,
+                                            field_names: gl.field_names.clone(),
+                                            extra_field_names: gl.extra_field_names.clone(),
+                                            quadtree: None,
+                                            hilbert: None,
+                                            point_only: gl.point_only,
+                                            world_bbox,
+                                        }))
+                                    }
+                                    LayerKind::Raster(_) => None,
+                                };
+
+                                if let Some(data) = new_data {
+                                    self.layers.push(crate::gis_layer::LayerEntry {
+                                        data,
+                                        visible: true,
+                                        name: new_name,
+                                        color,
+                                        opacity,
+                                        descriptor,
+                                        filters: Vec::new(),
+                                        filter_logic: FilterLogic::default(),
+                                        roi_bboxes: Vec::new(),
+                                        selections: Vec::new(),
+                                        active_selection: None,
+                                    });
+                                    self.active_layer_idx = Some(self.layers.len() - 1);
+                                }
+                            }
+                        }
                         SidebarAction::ComputeLocalVarianceSelection(field, radius) => {
                             if let Some((li, sidx)) = selection_ctx {
                                 if let LayerKind::Points(pc) = &self.layers[li].data {
@@ -1033,10 +1183,22 @@ impl GisEditorApp {
             if let Some(hist) = &self.selection_histogram {
                 let counts = hist.counts.clone();
                 let bin_edges = hist.bin_edges.clone();
-                egui_plot::Plot::new("sel_hist_plot")
-                    .height(160.0)
-                    .allow_drag(false)
-                    .allow_scroll(false)
+                let mean = counts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &c)| ((bin_edges[i] + bin_edges[i + 1]) * 0.5) * c as f64)
+                    .sum::<f64>()
+                    / counts.iter().copied().sum::<u32>().max(1) as f64;
+                super::plot_style::card(ui, |ui| {
+                    let counts_max = counts.iter().copied().max().unwrap_or(0);
+                    super::plot_style::style(
+                        egui_plot::Plot::new("sel_hist_plot")
+                            .height(160.0)
+                            .allow_drag(false)
+                            .allow_scroll(false)
+                            .include_y(0.0),
+                    )
+                    .legend(egui_plot::Legend::default())
                     .show(ui, |plot_ui| {
                         let bars: Vec<egui_plot::Bar> = counts
                             .iter()
@@ -1044,11 +1206,21 @@ impl GisEditorApp {
                             .map(|(i, &c)| {
                                 let center = (bin_edges[i] + bin_edges[i + 1]) * 0.5;
                                 let width = bin_edges[i + 1] - bin_edges[i];
-                                egui_plot::Bar::new(center, c as f64).width(width * 0.95)
+                                egui_plot::Bar::new(center, c as f64)
+                                    .width(width * 0.95)
+                                    .fill(super::plot_style::bar_color(counts_max, c))
+                                    .stroke(egui::Stroke::NONE)
                             })
                             .collect();
                         plot_ui.bar_chart(egui_plot::BarChart::new("counts", bars));
+                        plot_ui.vline(
+                            egui_plot::VLine::new("Mean", mean)
+                                .color(super::plot_style::MEAN)
+                                .style(egui_plot::LineStyle::dashed_loose())
+                                .width(1.5),
+                        );
                     });
+                });
             } else {
                 ui.label("No numeric data for this field.");
             }
@@ -1110,19 +1282,45 @@ impl GisEditorApp {
                 if let Some(bv) = &self.selection_bivariate {
                     ui.label(format!("Pearson r = {:.4}  (n = {})", bv.pearson_r, bv.n));
                     let points = bv.scatter_points.clone();
-                    egui_plot::Plot::new("sel_scatter_plot")
-                        .height(160.0)
-                        .x_axis_label(&bv.x_field)
-                        .y_axis_label(&bv.y_field)
+                    let trend =
+                        super::plot_style::linear_fit(bv.x_mean, bv.y_mean, bv.covariance, bv.x_std);
+                    super::plot_style::card(ui, |ui| {
+                        super::plot_style::style(
+                            egui_plot::Plot::new("sel_scatter_plot")
+                                .height(160.0)
+                                .x_axis_label(&bv.x_field)
+                                .y_axis_label(&bv.y_field),
+                        )
+                        .legend(egui_plot::Legend::default())
                         .show(ui, |plot_ui| {
+                            let x_min = points.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+                            let x_max = points.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
                             let pts: egui_plot::PlotPoints =
                                 points.into_iter().map(|[x, y]| [x, y]).collect();
                             plot_ui.points(
-                                egui_plot::Points::new("pts", pts).radius(2.0).color(
-                                    egui::Color32::from_rgba_unmultiplied(80, 160, 220, 160),
-                                ),
+                                egui_plot::Points::new("Data", pts)
+                                    .radius(2.5)
+                                    .filled(true)
+                                    .shape(egui_plot::MarkerShape::Circle)
+                                    .color(super::plot_style::ACCENT_FILL),
                             );
+                            if let Some((slope, intercept)) = trend {
+                                let line_pts: egui_plot::PlotPoints = vec![
+                                    [x_min, slope * x_min + intercept],
+                                    [x_max, slope * x_max + intercept],
+                                ]
+                                .into();
+                                plot_ui.line(
+                                    egui_plot::Line::new(
+                                        format!("Trend (r = {:.3})", bv.pearson_r),
+                                        line_pts,
+                                    )
+                                    .color(super::plot_style::TREND)
+                                    .width(2.0),
+                                );
+                            }
                         });
+                    });
                 } else {
                     ui.label("No numeric data for these fields.");
                 }
@@ -1182,7 +1380,6 @@ impl GisEditorApp {
         ui.separator();
 
         // ── Export ───────────────────────────────────────────────────────
-        #[cfg(not(target_arch = "wasm32"))]
         {
             ui.label(egui::RichText::new("Export").strong());
             if let LayerKind::Points(_) = &self.layers[li].data {
@@ -1193,6 +1390,9 @@ impl GisEditorApp {
             } else {
                 ui.label("Only available for point-cloud layers.");
             }
+        }
+        if ui.button("Create new Layer from Selection").clicked() {
+            action = SidebarAction::CreateLayerFromSelection;
         }
 
         action

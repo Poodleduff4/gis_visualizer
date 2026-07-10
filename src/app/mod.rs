@@ -1,4 +1,5 @@
 mod loader;
+mod plot_style;
 mod ui;
 mod ui_layer_panel;
 mod ui_loading;

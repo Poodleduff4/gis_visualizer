@@ -39,6 +39,7 @@ pub enum SidebarAction {
     ExportSelection,
     ComputeLocalVarianceSelection(String, f64),
     ComputeLisaSelection(String, f64),
+    CreateLayerFromSelection,
 }
 
 // ── Main sidebar widget ───────────────────────────────────────────────────────
@@ -359,7 +360,6 @@ pub fn show_sidebar(
     ui.separator();
 
     // ── Export ────────────────────────────────────────────────────────────────
-    #[cfg(not(target_arch = "wasm32"))]
     {
         ui.label(RichText::new("Export").strong());
         let filtered_count = layer.data.filtered_count();
