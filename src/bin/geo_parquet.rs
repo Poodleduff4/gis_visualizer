@@ -235,7 +235,7 @@ impl GeoParquetReader {
         })
     }
 
-    /// Mirrors GisReader::load_point_layer_batched — streams all points via channel.
+    /// Mirrors GisReader::read_file(ReadOp::Full) — streams all points via channel.
     pub async fn load_point_layer_batched(
         path: &str,
         dest_idx: usize,
@@ -261,7 +261,7 @@ impl GeoParquetReader {
         Ok(())
     }
 
-    /// Mirrors GisReader::stream_fgb_bbox — bbox-filtered point stream via channel.
+    /// Mirrors GisReader::read_file(ReadOp::Bbox) — bbox-filtered point stream via channel.
     ///
     /// XY-column files push the bbox predicate into SQL (fast, uses row-group stats
     /// if data is spatially sorted). WKB-column files do a full scan and filter in Rust.

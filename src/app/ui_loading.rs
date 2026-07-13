@@ -6,7 +6,7 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::gis_layer::{BatchMessage, LayerKind};
-use crate::gis_reader::GisReader;
+use crate::gis_reader::{GisReader, ReadOp};
 #[cfg(target_arch = "wasm32")]
 use crate::raster_reader::load_raster_bytes;
 #[cfg(not(target_arch = "wasm32"))]
@@ -236,11 +236,19 @@ impl GisEditorApp {
                         .id_salt("layer_scroll")
                         .max_height(200.0)
                         .show(ui, |ui| {
-                            for (desc, selected) in &mut self.pending_layers {
+                            for (desc, selected, convert) in &mut self.pending_layers {
                                 ui.checkbox(
                                     selected,
                                     format!("{} ({} features)", desc.name, desc.num_features),
                                 );
+                                if let Some(crs) = &desc.crs {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(format!("CRS: {crs}")).weak());
+                                        if desc.crs_epsg.is_some() {
+                                            ui.checkbox(convert, "Convert to WGS84");
+                                        }
+                                    });
+                                }
                             }
                         });
 
@@ -286,7 +294,7 @@ impl GisEditorApp {
 
                     ui.separator();
                     ui.horizontal(|ui| {
-                        let any_selected = self.pending_layers.iter().any(|(_, s)| *s);
+                        let any_selected = self.pending_layers.iter().any(|(_, s, _)| *s);
                         if ui
                             .add_enabled(any_selected, egui::Button::new("Load"))
                             .clicked()
@@ -295,7 +303,7 @@ impl GisEditorApp {
                                 self.pending_layers
                                     .iter()
                                     .enumerate()
-                                    .filter(|(_, (_, s))| *s)
+                                    .filter(|(_, (_, s, _))| *s)
                                     .map(|(i, _)| i)
                                     .collect(),
                             );
@@ -326,11 +334,43 @@ impl GisEditorApp {
                 ),
             };
 
+            // Captured before `pending_layers` is cleared — one entry per selected
+            // index, in the same order `load_selected_without_features` returns layers.
+            let mut crs_notice: Option<String> = None;
+            let crs_transforms: Vec<Option<crate::crs::CrsTransform>> = indices
+                .iter()
+                .map(|&i| {
+                    let (desc, _selected, convert) = &self.pending_layers[i];
+                    let Some(epsg) = convert.then(|| desc.crs_epsg).flatten() else {
+                        return None;
+                    };
+                    match crate::crs::CrsTransform::from_epsg(epsg) {
+                        Ok(t) => {
+                            if t.approximate_datum {
+                                crs_notice = Some(format!(
+                                    "Note: EPSG:{epsg}'s datum needs a grid file this app doesn't \
+                                     have — reprojected with an approximate (ellipsoid-only) shift, \
+                                     expect up to ~100m offset."
+                                ));
+                            }
+                            Some(t)
+                        }
+                        Err(e) => {
+                            crs_notice = Some(format!(
+                                "CRS conversion failed for EPSG:{epsg} ({e}) — layer loaded \
+                                 un-reprojected; it will likely be off the map."
+                            ));
+                            None
+                        }
+                    }
+                })
+                .collect();
+
             self.pending_layers.clear();
             self.pending_field_selection.clear();
 
             #[cfg(not(target_arch = "wasm32"))]
-            let layers = GisReader::load_selected_without_features(
+            let mut layers = GisReader::load_selected_without_features(
                 path.clone(),
                 &indices,
                 attr_fields.clone(),
@@ -342,7 +382,7 @@ impl GisEditorApp {
                 path.to_string()
             )));
             #[cfg(target_arch = "wasm32")]
-            let layers = GisReader::load_selected_without_features(
+            let mut layers = GisReader::load_selected_without_features(
                 path.clone(),
                 self.pending_file_descriptor.clone().unwrap(),
                 attr_fields.clone(),
@@ -353,9 +393,12 @@ impl GisEditorApp {
                 .iter()
                 .map(|l| matches!(l.data, LayerKind::Points(_)))
                 .collect();
+            for (layer, t) in layers.iter_mut().zip(crs_transforms.iter()) {
+                layer.crs_transform = t.clone();
+            }
             self.layers.extend(layers.into_iter());
             self.active_layer_idx = Some(first_new);
-            self.status = format!("Loading {} layer(s)…", indices.len());
+            self.status = crs_notice.unwrap_or_else(|| format!("Loading {} layer(s)…", indices.len()));
 
             let rect_clone = self
                 .viewport
@@ -371,25 +414,17 @@ impl GisEditorApp {
             let reader_cache_for_load = self.fgb_reader_cache.clone();
             #[cfg(not(target_arch = "wasm32"))]
             std::thread::spawn(move || {
-                for (pos, file_idx) in indices.into_iter().enumerate() {
+                for (pos, _file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
-                    let result = if is_points[pos] {
-                        GisReader::load_point_layer_batched(
-                            path_clone.clone(),
-                            file_idx,
-                            dest,
-                            load_tx.clone(),
-                            attr_fields.clone(),
-                        )
-                    } else {
-                        GisReader::load_layer_batched(
-                            path_clone.clone(),
-                            file_idx,
-                            dest,
-                            load_tx.clone(),
-                            attr_fields.clone(),
-                        )
-                    };
+                    let result = GisReader::read_file(
+                        path_clone.clone(),
+                        dest,
+                        is_points[pos],
+                        ReadOp::Full,
+                        attr_fields.clone(),
+                        load_tx.clone(),
+                        cancel_clone.clone(),
+                    );
                     if let Err(e) = result {
                         eprintln!("[load thread] error: {e:#}");
                     }
@@ -397,58 +432,25 @@ impl GisEditorApp {
             });
             #[cfg(target_arch = "wasm32")]
             spawn_local(async move {
-                web_sys::console::log_1(&JsValue::from_str("spawn_local: starting load"));
-                for (pos, file_idx) in indices.into_iter().enumerate() {
+                for (pos, _file_idx) in indices.into_iter().enumerate() {
                     let dest = first_new + pos;
-                    let result: anyhow::Result<()> = match &path_clone {
-                        crate::gis_reader::GisFilePath::Bytes(bytes, _) => {
-                            web_sys::console::log_1(&JsValue::from_str(&format!(
-                                "spawn_local: loading parquet bytes={} is_points={}",
-                                bytes.len(),
-                                is_points[pos]
-                            )));
-                            if is_points[pos] {
-                                let r = crate::gis_reader::GeoParquetReader::load_point_layer_batched_from_bytes(
-                                        bytes.clone(),
-                                        dest,
-                                        load_tx.clone(),
-                                        attr_fields.clone(),
-                                    );
-                                web_sys::console::log_1(&JsValue::from_str(&format!(
-                                    "spawn_local: load result ok={}",
-                                    r.is_ok()
-                                )));
-                                if let Err(ref e) = r {
-                                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                                        "spawn_local: load error: {e}"
-                                    )));
-                                }
-                                r
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        _ => {
-                            if is_points[pos] {
-                                GisReader::stream_fgb_bbox(
-                                    &path_clone,
-                                    rect_clone,
-                                    file_idx,
-                                    dest,
-                                    load_tx.clone(),
-                                    attr_fields.clone(),
-                                    cancel_clone.clone(),
-                                    reader_cache_for_load.clone(),
-                                )
-                                .await
-                            } else {
-                                Ok(())
-                            }
-                        }
-                    };
-                    let _ = result;
+                    let result = GisReader::read_file(
+                        path_clone.clone(),
+                        dest,
+                        is_points[pos],
+                        ReadOp::Bbox(rect_clone),
+                        attr_fields.clone(),
+                        load_tx.clone(),
+                        cancel_clone.clone(),
+                        reader_cache_for_load.clone(),
+                    )
+                    .await;
+                    if let Err(e) = result {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "read_file error: {e}"
+                        )));
+                    }
                 }
-                web_sys::console::log_1(&JsValue::from_str("spawn_local: done"));
             });
         } else if cancel_pending {
             self.pending_file = None;
@@ -458,12 +460,19 @@ impl GisEditorApp {
         if let Some(load_rx) = &self.load_rx {
             for msg in load_rx.try_iter() {
                 match msg {
-                    BatchMessage::Points(layer_idx, pts, named_cols) => {
+                    BatchMessage::Points(layer_idx, mut pts, named_cols) => {
                         #[cfg(target_arch = "wasm32")]
                         web_sys::console::log_1(&JsValue::from_str(&format!(
                             "BatchMessage::Points layer={layer_idx} count={}",
                             pts.len()
                         )));
+                        let transform =
+                            self.layers.get(layer_idx).and_then(|l| l.crs_transform.clone());
+                        if let Some(t) = &transform {
+                            for (_, xy) in pts.iter_mut() {
+                                t.convert(xy);
+                            }
+                        }
                         if let Some(LayerKind::Points(pc)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
                         {
@@ -491,7 +500,14 @@ impl GisEditorApp {
                                 .for_each(|idx| pc.viewport_mask.set(*idx as usize, true));
                         }
                     }
-                    BatchMessage::Vector(layer_idx, features) => {
+                    BatchMessage::Vector(layer_idx, mut features) => {
+                        let transform =
+                            self.layers.get(layer_idx).and_then(|l| l.crs_transform.clone());
+                        if let Some(t) = &transform {
+                            for f in &mut features {
+                                f.reproject(t);
+                            }
+                        }
                         if let Some(LayerKind::Vector(gl)) =
                             &mut self.layers.get_mut(layer_idx).map(|l| &mut l.data)
                         {

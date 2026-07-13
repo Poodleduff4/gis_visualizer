@@ -201,7 +201,7 @@ impl PointCloudLayer {
             measurement_type,
             max_depth,
         );
-        uq.insert_batch(self.points.iter().enumerate().filter_map(|(idx, (i, p))| {
+        uq.insert_batch(self.points.iter().enumerate().filter_map(|(idx, (_i, p))| {
             match self.filter_mask[idx] {
                 true => {
                     let value = field_idx
@@ -219,7 +219,7 @@ impl PointCloudLayer {
                             eprintln!("attribute '{}' not found", attribute);
                             0.0
                         });
-                    Some((*i as usize, [p[0], p[1], p[0], p[1]], value))
+                    Some((idx, [p[0], p[1], p[0], p[1]], value))
                 }
                 false => None,
             }

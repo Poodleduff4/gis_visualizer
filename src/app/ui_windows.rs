@@ -284,7 +284,8 @@ impl GisEditorApp {
                 let mut open = true;
                 let name = self.layers[layer_idx].name.clone();
                 let mut color = self.layers[layer_idx].color;
-                let mut color_changed = false;
+                let mut opacity = self.layers[layer_idx].opacity;
+                let mut changed = false;
                 egui::Window::new("Layer Color")
                     .open(&mut open)
                     .resizable(false)
@@ -294,11 +295,17 @@ impl GisEditorApp {
                         ui.label(&name);
                         ui.separator();
                         if egui::color_picker::color_edit_button_srgb(ui, &mut color).changed() {
-                            color_changed = true;
+                            changed = true;
+                        }
+                        ui.separator();
+                        ui.label("Opacity:");
+                        if ui.add(egui::Slider::new(&mut opacity, 0..=255)).changed() {
+                            changed = true;
                         }
                     });
-                if color_changed {
+                if changed {
                     self.layers[layer_idx].color = color;
+                    self.layers[layer_idx].opacity = opacity;
                     self.points_dirty = true;
                     self.globe_points_dirty = true;
                     self.map_render_ttl = 3;

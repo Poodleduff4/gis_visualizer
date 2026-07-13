@@ -516,6 +516,7 @@ impl GisEditorApp {
                                     self.layers.push(crate::gis_layer::LayerEntry {
                                         data,
                                         visible: true,
+                                        show_points: true,
                                         name: new_name,
                                         color,
                                         opacity,
@@ -525,6 +526,15 @@ impl GisEditorApp {
                                         roi_bboxes: Vec::new(),
                                         selections: Vec::new(),
                                         active_selection: None,
+                                        // Features are already-transformed copies of the
+                                        // source layer's data, not a fresh streamed load.
+                                        crs_transform: None,
+                                        show_index: false,
+                                        index_kind: crate::spatial_index::IndexKind::Quadtree,
+                                        show_heatmap: false,
+                                        heatmap_metric: crate::heatmap::HeatmapMetric::Density,
+                                        heatmap_cache: None,
+                                        heatmap_dirty: true,
                                     });
                                     self.active_layer_idx = Some(self.layers.len() - 1);
                                 }
@@ -902,9 +912,9 @@ impl GisEditorApp {
                         }
                     }
                 }
+                self.layers[idx].heatmap_dirty = true;
             }
             self.points_dirty = true;
-            self.heatmap_dirty = true;
         }
     }
 
@@ -1040,6 +1050,25 @@ impl GisEditorApp {
                         );
                         pipeline.upload_points(device, queue, &self.gpu_points_buf);
                     }
+                    if let Some(pipeline) =
+                        renderer.callback_resources.get_mut::<crate::vector_gpu::VectorPipeline>()
+                    {
+                        crate::gpu_collect::collect_gpu_vector_mesh(
+                            &self.layers,
+                            self.active_layer_idx,
+                            self.selected_id,
+                            &mut self.gpu_vector_fill_verts_buf,
+                            &mut self.gpu_vector_fill_indices_buf,
+                            &mut self.gpu_vector_line_verts_buf,
+                        );
+                        pipeline.upload(
+                            device,
+                            queue,
+                            &self.gpu_vector_fill_verts_buf,
+                            &self.gpu_vector_fill_indices_buf,
+                            &self.gpu_vector_line_verts_buf,
+                        );
+                    }
                 }
                 self.map_render_ttl = 2;
                 self.points_dirty = false;
@@ -1050,75 +1079,14 @@ impl GisEditorApp {
                 self.last_viewport_ppu = self.viewport.pixels_per_unit;
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            if self.viewport_load_pending
-                && self.viewport_stable_frames >= 3
-                && !self.streaming_features
-            {
+            // Index-based viewport streaming (query_and_stream_viewport) is
+            // disabled: the shader already does viewport culling on the GPU
+            // path, and the CPU-side spatial index can go stale relative to
+            // `pc.points`/`viewport_mask` (returns ids past their length),
+            // which crashed here. Just clear the pending flag so state stays
+            // consistent; no query/thread-spawn work happens.
+            if self.viewport_load_pending && self.viewport_stable_frames >= 3 {
                 self.viewport_load_pending = false;
-                self.cancel_stream
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.cancel_stream = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let (tx, rx) = mpsc::sync_channel(40);
-                self.load_rx = Some(rx);
-                let full_bbox = self
-                    .viewport
-                    .viewport_bbox(self.last_canvas_rect.clone().unwrap());
-                for (actual_idx, layer) in self.layers.iter_mut().enumerate() {
-                    if !layer.visible {
-                        continue;
-                    }
-                    if let LayerKind::Points(pc) = &mut layer.data {
-                        let pts_clone = Arc::clone(&pc.points);
-                        let idx_clone = pc.index.clone();
-                        let cancel_clone = self.cancel_stream.clone();
-                        let tx_clone = tx.clone();
-                        std::thread::spawn(move || {
-                            crate::point_cloud_layer::query_and_stream_viewport(
-                                actual_idx,
-                                pts_clone,
-                                idx_clone,
-                                full_bbox,
-                                tx_clone,
-                                cancel_clone,
-                            );
-                        });
-                    }
-                }
-            }
-
-            #[cfg(target_arch = "wasm32")]
-            if self.viewport_load_pending
-                && self.viewport_stable_frames >= 3
-                && !self.streaming_features
-            {
-                self.viewport_load_pending = false;
-                let (tx, rx) = mpsc::sync_channel(40);
-                self.load_rx = Some(rx);
-                let full_bbox = self
-                    .viewport
-                    .viewport_bbox(self.last_canvas_rect.clone().unwrap());
-                for (actual_idx, layer) in self.layers.iter_mut().enumerate() {
-                    if !layer.visible {
-                        continue;
-                    }
-                    if let LayerKind::Points(pc) = &mut layer.data {
-                        let pts_clone = Arc::clone(&pc.points);
-                        let idx_clone = pc.index.clone();
-                        let tx_clone = tx.clone();
-                        let cancel_clone = self.cancel_stream.clone();
-                        spawn_local(async move {
-                            crate::point_cloud_layer::query_and_stream_viewport(
-                                actual_idx,
-                                pts_clone,
-                                idx_clone,
-                                full_bbox,
-                                tx_clone,
-                                cancel_clone,
-                            );
-                        });
-                    }
-                }
             }
         }
     }

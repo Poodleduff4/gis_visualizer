@@ -13,7 +13,7 @@ use crate::quadtree::Quadtree;
 use crate::spatial_index::{IndexKind, SpatialIndex};
 use anyhow::{anyhow, Result};
 use flatgeobuf::{FgbReader, GeometryType};
-use geo::BoundingRect;
+use geo::{BoundingRect, MapCoordsInPlace};
 use geo_types::{
     Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
 };
@@ -104,6 +104,21 @@ impl TessellatedGeom {
             fill_idx: vec![],
             outlines: vec![],
             points: vec![],
+        }
+    }
+
+    /// Reprojects every stored world-coordinate array in place.
+    fn reproject(&mut self, t: &crate::crs::CrsTransform) {
+        for v in &mut self.fill_verts {
+            t.convert(v);
+        }
+        for outline in &mut self.outlines {
+            for v in outline {
+                t.convert(v);
+            }
+        }
+        for v in &mut self.points {
+            t.convert(v);
         }
     }
 
@@ -239,6 +254,17 @@ impl GisFeature {
 
     pub fn bbox(&self) -> [f64; 4] {
         bounding_box(&self.geometry)
+    }
+
+    /// Reprojects geometry and its precomputed tessellation in place —
+    /// coordinate-wise, topology-preserving, so no re-tessellation needed.
+    pub fn reproject(&mut self, t: &crate::crs::CrsTransform) {
+        self.geometry.map_coords_in_place(|c| {
+            let mut xy = [c.x, c.y];
+            t.convert(&mut xy);
+            Coord { x: xy[0], y: xy[1] }
+        });
+        self.tessellated.reproject(t);
     }
 }
 
@@ -393,11 +419,6 @@ impl LayerKind {
             LayerKind::Raster(_) => {}
         }
     }
-    pub fn features_in_bbox(&self, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Vec<usize> {
-        self.index(IndexKind::Quadtree)
-            .map(|i| i.search(&[xmin, ymin, xmax, ymax]))
-            .unwrap_or(Vec::new())
-    }
 
     /// Ids of features/points within `bbox`, using the quadtree index when
     /// built, else a linear scan (mirrors `PointCloudLayer::hit_test`'s
@@ -523,6 +544,10 @@ impl LayerKind {
 pub struct LayerEntry {
     pub data: LayerKind,
     pub visible: bool,
+    /// Whether raw points/features render for this layer. Independent of
+    /// `visible`, which also gates the layer's index/heatmap overlays — this
+    /// lets a heatmap show without the point cloud cluttering it.
+    pub show_points: bool,
     pub name: String,
     pub color: [u8; 3],
     pub opacity: u8,
@@ -537,6 +562,15 @@ pub struct LayerEntry {
     pub selections: Vec<LayerSelection>,
     /// Index into `selections` currently driving the Selection Stats window.
     pub active_selection: Option<usize>,
+    /// Set when the user opted to reproject this layer to WGS84 on load;
+    /// applied to incoming `BatchMessage` batches as they stream in.
+    pub crs_transform: Option<crate::crs::CrsTransform>,
+    pub show_index: bool,
+    pub index_kind: IndexKind,
+    pub show_heatmap: bool,
+    pub heatmap_metric: crate::heatmap::HeatmapMetric,
+    pub heatmap_cache: Option<crate::heatmap::HeatmapLayer>,
+    pub heatmap_dirty: bool,
 }
 impl LayerEntry {}
 
@@ -710,11 +744,21 @@ impl GisLayer {
     // }
 
     /// Returns IDs of features whose center points fall within the viewport.
+    /// Falls back to a linear bbox scan when no quadtree has been built yet —
+    /// without this, a freshly loaded vector layer renders nothing until the
+    /// user manually rebuilds the index (mirrors `ids_in_bbox_with_fallback`).
     pub fn features_in_bbox(&self, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Vec<usize> {
-        self.quadtree
-            .as_ref()
-            .map(|i| i.search(&[xmin, ymin, xmax, ymax]))
-            .unwrap_or(Vec::new())
+        if let Some(idx) = self.quadtree.as_ref() {
+            return idx.search(&[xmin, ymin, xmax, ymax]);
+        }
+        self.features
+            .iter()
+            .filter(|f| {
+                let b = f.bbox();
+                b[0] <= xmax && b[2] >= xmin && b[1] <= ymax && b[3] >= ymin
+            })
+            .map(|f| f.id)
+            .collect()
     }
 
     /// Returns the ID of the first feature containing (or near) the world point.

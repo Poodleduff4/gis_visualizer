@@ -22,13 +22,13 @@ use crate::gis_layer::{BatchMessage, LayerEntry, LayerKind};
 use crate::gis_reader::FgbReaderCache;
 use crate::gis_reader::{GisFilePath, LayerDescriptor};
 use crate::globe::{GlobeCamera, GlobePipeline, GlobePoint};
-use crate::heatmap::HeatmapMetric;
 use crate::histogram::{BivariateStats, FieldStats, HistogramState, LisaPoint};
 use crate::map_view::Viewport;
 use crate::selection_stats::{
     SelectionBivariate, SelectionFieldStats, SelectionHistogram,
 };
 use crate::point_cloud::{GpuPoint, PointCloudPipeline};
+use crate::vector_gpu::{GpuVertex, VectorPipeline};
 use crate::raster_reader::RasterDescriptor;
 use crate::sidebar::AddAttributeForm;
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,7 +37,6 @@ use crate::snapshot::{
     AnalysisSnapshot, AppSnapshot, DisplaySnapshot, LayerSnapshot, PendingSnapshotRestore,
     ViewportSnapshot,
 };
-use crate::spatial_index::IndexKind;
 use crate::uncertainty_quadtree::{MeasurementType, UncertaintyMeasure};
 
 pub const LAYER_PANEL_WIDTH: f32 = 180.0;
@@ -95,21 +94,15 @@ pub struct GisEditorApp {
     pub(super) fitted: bool,
     pub(super) show_basemap: bool,
     pub(super) basemap_cache: BasemapCache,
-    pub(super) show_index: bool,
-    pub(super) index_kind: IndexKind,
-    pub(super) show_heatmap: bool,
-    pub(super) heatmap_metric: HeatmapMetric,
     pub(super) roi_rebuild_pending: bool,
-    pub(super) heatmap_cache: Option<crate::heatmap::HeatmapLayer>,
-    pub(super) heatmap_dirty: bool,
-    pub(super) last_heatmap_layer_idx: Option<usize>,
     pub(super) click_target: ClickTarget,
     pub(super) select_mode: bool,
     pub(super) select_drag_start: Option<egui::Pos2>,
 
     pub(super) pending_file: Option<GisFilePath>,
     pub(super) pending_file_descriptor: Option<LayerDescriptor>,
-    pub(super) pending_layers: Vec<(LayerDescriptor, bool)>,
+    /// (descriptor, selected, convert-to-WGS84) per pending layer awaiting load.
+    pub(super) pending_layers: Vec<(LayerDescriptor, bool, bool)>,
     pub(super) pending_load_mode: LoadMode,
     pub(super) pending_field_selection: Vec<(String, bool)>,
     pub(super) load_rx: Option<mpsc::Receiver<BatchMessage>>,
@@ -126,6 +119,9 @@ pub struct GisEditorApp {
     pub(super) last_layer_count: usize,
     pub(super) heatmap_opacity: u8,
     pub(super) gpu_points_buf: Vec<GpuPoint>,
+    pub(super) gpu_vector_fill_verts_buf: Vec<GpuVertex>,
+    pub(super) gpu_vector_fill_indices_buf: Vec<u32>,
+    pub(super) gpu_vector_line_verts_buf: Vec<GpuVertex>,
     pub(super) spatial_index_split_density: usize,
     pub(super) last_split_density: usize,
     pub(super) hilbert_order: u32,
@@ -206,9 +202,11 @@ impl GisEditorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let has_gpu = if let Some(wrs) = cc.wgpu_render_state.as_ref() {
             let pipeline = PointCloudPipeline::new(&wrs.device, wrs.target_format);
+            let vector_pipeline = VectorPipeline::new(&wrs.device, wrs.target_format);
             let globe_pipeline = GlobePipeline::new(&wrs.device, &wrs.queue, wrs.target_format);
             let mut renderer = wrs.renderer.write();
             renderer.callback_resources.insert(pipeline);
+            renderer.callback_resources.insert(vector_pipeline);
             renderer.callback_resources.insert(globe_pipeline);
             true
         } else {
@@ -232,14 +230,7 @@ impl GisEditorApp {
             fitted: false,
             show_basemap: true,
             basemap_cache: BasemapCache::default(),
-            show_index: false,
-            index_kind: IndexKind::Quadtree,
-            show_heatmap: false,
-            heatmap_metric: HeatmapMetric::Density,
             roi_rebuild_pending: false,
-            heatmap_cache: None,
-            heatmap_dirty: true,
-            last_heatmap_layer_idx: None,
             click_target: ClickTarget::GridCell,
             select_mode: false,
             select_drag_start: None,
@@ -251,6 +242,9 @@ impl GisEditorApp {
             last_layer_count: 0,
             heatmap_opacity: 255,
             gpu_points_buf: Vec::new(),
+            gpu_vector_fill_verts_buf: Vec::new(),
+            gpu_vector_fill_indices_buf: Vec::new(),
+            gpu_vector_line_verts_buf: Vec::new(),
             spatial_index_split_density: 10000,
             last_split_density: 10000,
             hilbert_order: 6,
@@ -399,6 +393,11 @@ impl GisEditorApp {
                         })
                         .collect(),
                     active_selection: le.active_selection,
+                    show_index: le.show_index,
+                    index_kind: crate::snapshot::index_kind_to_str(&le.index_kind),
+                    show_heatmap: le.show_heatmap,
+                    heatmap_metric: crate::snapshot::heatmap_metric_to_str(&le.heatmap_metric),
+                    show_points: le.show_points,
                 }
             })
             .collect();
@@ -410,8 +409,6 @@ impl GisEditorApp {
             },
             display: DisplaySnapshot {
                 show_basemap: self.show_basemap,
-                show_heatmap: self.show_heatmap,
-                show_index: self.show_index,
                 point_size: self.point_size,
                 heatmap_opacity: self.heatmap_opacity,
             },
@@ -490,6 +487,13 @@ impl GisEditorApp {
                     });
                 }
                 layer.active_selection = layer_snap.active_selection;
+                layer.show_index = layer_snap.show_index;
+                layer.index_kind = crate::snapshot::str_to_index_kind(&layer_snap.index_kind);
+                layer.show_heatmap = layer_snap.show_heatmap;
+                layer.heatmap_metric =
+                    crate::snapshot::str_to_heatmap_metric(&layer_snap.heatmap_metric);
+                layer.heatmap_dirty = layer_snap.show_heatmap;
+                layer.show_points = layer_snap.show_points;
             }
             if has_filters {
                 self.updated_filters = true;
@@ -503,8 +507,6 @@ impl GisEditorApp {
             self.viewport.center = r.viewport.center;
             self.viewport.pixels_per_unit = r.viewport.pixels_per_unit;
             self.show_basemap = r.display.show_basemap;
-            self.show_heatmap = r.display.show_heatmap;
-            self.show_index = r.display.show_index;
             self.point_size = r.display.point_size;
             self.heatmap_opacity = r.display.heatmap_opacity;
             self.histogram_field = r.analysis.histogram_field;

@@ -1,5 +1,6 @@
 mod app;
 mod basemap;
+mod crs;
 mod snapshot;
 mod exporter;
 mod filter;
@@ -24,6 +25,7 @@ mod rtree_index;
 mod selection_stats;
 mod stats_core;
 mod uncertainty_quadtree;
+mod vector_gpu;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), eframe::Error> {

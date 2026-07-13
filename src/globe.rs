@@ -813,7 +813,7 @@ fn pack_color(c: Color32) -> u32 {
 pub fn collect_globe_points(layers: &[LayerEntry], point_size: f32, out: &mut Vec<GlobePoint>) {
     out.clear();
     for entry in layers {
-        if !entry.visible { continue; }
+        if !entry.visible || !entry.show_points { continue; }
         let LayerKind::Points(pc) = &entry.data else { continue };
 
         let packed = pack_color(Color32::from_rgb(entry.color[0], entry.color[1], entry.color[2]));

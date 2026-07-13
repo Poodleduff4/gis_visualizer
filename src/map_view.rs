@@ -76,9 +76,7 @@ impl Viewport {
 
 // ── Colours ───────────────────────────────────────────────────────────────────
 
-const FILL_NORMAL: Color32 = Color32::from_rgb(100, 149, 237);
 const FILL_SELECTED: Color32 = Color32::from_rgb(255, 165, 0);
-const STROKE_NORMAL: Color32 = Color32::from_rgb(30, 60, 120);
 const STROKE_SELECTED: Color32 = Color32::from_rgb(200, 80, 0);
 const POINT_RADIUS: f32 = 5.0;
 
@@ -207,32 +205,43 @@ pub fn show_map(
         }
     }
 
-    // Render all visible layers bottom-to-top
-    let [xmin, ymin, xmax, ymax] = viewport.viewport_bbox(rect);
-    let active_layer_name = active_entry.map(|e| e.name.as_str());
-    for entry in layers.iter().filter(|e| e.visible) {
-        // When GPU handles points, skip layers that have no polygons or lines.
-        if !render_points
-            && match &entry.data {
-                LayerKind::Points(_) => true,
-                LayerKind::Vector(_) | LayerKind::Raster(_) => false,
-            }
-        {
-            continue;
-        }
-        let LayerKind::Vector(layer) = &entry.data else {
-            continue;
-        };
-        let is_active = active_layer_name == Some(entry.name.as_str());
-        let visible_ids = layer.features_in_bbox(xmin, ymin, xmax, ymax);
-        for id in visible_ids {
-            let feature = &layer.features[id];
-            let tess = &feature.tessellated;
-            if !render_points && tess.fill_idx.is_empty() && tess.outlines.is_empty() {
+    // Render all visible layers bottom-to-top.
+    // `render_points` is really "no GPU available, use the CPU fallback path" —
+    // when it's false, both points and vector layers are GPU-rendered instead
+    // (see VectorCallback in ui_map.rs), so this whole CPU loop is skipped.
+    if render_points {
+        let [xmin, ymin, xmax, ymax] = viewport.viewport_bbox(rect);
+        let active_layer_name = active_entry.map(|e| e.name.as_str());
+        for entry in layers.iter().filter(|e| e.visible) {
+            let LayerKind::Vector(layer) = &entry.data else {
                 continue;
+            };
+            let is_active = active_layer_name == Some(entry.name.as_str());
+            // Fill respects the layer's opacity; outline stays fully opaque
+            // so the edge stays crisp even on a very transparent fill.
+            let fill = Color32::from_rgba_unmultiplied(
+                entry.color[0],
+                entry.color[1],
+                entry.color[2],
+                entry.opacity,
+            );
+            let stroke = Color32::from_rgb(entry.color[0], entry.color[1], entry.color[2]);
+            let visible_ids = layer.features_in_bbox(xmin, ymin, xmax, ymax);
+            for id in visible_ids {
+                let feature = &layer.features[id];
+                let tess = &feature.tessellated;
+                let is_selected = is_active && *selected_id == Some(id);
+                render_tessellated(
+                    &painter,
+                    tess,
+                    viewport,
+                    rect,
+                    is_selected,
+                    render_points,
+                    fill,
+                    stroke,
+                );
             }
-            let is_selected = is_active && *selected_id == Some(id);
-            render_tessellated(&painter, tess, viewport, rect, is_selected, render_points);
         }
     }
 
@@ -326,6 +335,7 @@ pub fn show_quadtree_heatmap(
         let t = match metric {
             HeatmapMetric::Density => cell.density,
             HeatmapMetric::Unpredictability => cell.unpredictability,
+            HeatmapMetric::AttributeMean => cell.attribute_mean,
         };
         let color = heat_color(t, opacity);
         let p1 = viewport.world_to_screen(cell.bbox[0], cell.bbox[1], rect);
@@ -438,13 +448,11 @@ fn render_tessellated(
     rect: Rect,
     selected: bool,
     render_points: bool,
+    layer_fill: Color32,
+    layer_stroke: Color32,
 ) {
-    let fill = if selected { FILL_SELECTED } else { FILL_NORMAL };
-    let stroke_color = if selected {
-        STROKE_SELECTED
-    } else {
-        STROKE_NORMAL
-    };
+    let fill = if selected { FILL_SELECTED } else { layer_fill };
+    let stroke_color = if selected { STROKE_SELECTED } else { layer_stroke };
     let stroke = Stroke::new(1.0, stroke_color);
 
     // Filled polygon mesh

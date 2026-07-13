@@ -6,12 +6,10 @@ use wasm_bindgen_futures::spawn_local;
 use egui::UiKind;
 
 use crate::gis_reader::GisFilePath;
-use crate::heatmap::HeatmapMetric;
 #[cfg(target_arch = "wasm32")]
 use crate::raster_reader::read_raster_descriptor_bytes;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::raster_reader::read_raster_descriptor_sync;
-use crate::spatial_index::IndexKind;
 use crate::uncertainty_quadtree::MeasurementType;
 
 use super::{ClickTarget, GisEditorApp, MapView};
@@ -22,17 +20,6 @@ impl GisEditorApp {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_basemap, "Basemap");
-                    ui.checkbox(&mut self.show_index, "Spatial Index");
-                    if self.show_index {
-                        ui.indent("index_kind", |ui| {
-                            ui.radio_value(&mut self.index_kind, IndexKind::Quadtree, "Quadtree");
-                            ui.radio_value(
-                                &mut self.index_kind,
-                                IndexKind::Hilbert,
-                                "Hilbert R-Tree",
-                            );
-                        });
-                    }
                     ui.horizontal(|ui| {
                         ui.label("Quadtree Split Density:");
                         ui.add(
@@ -45,19 +32,17 @@ impl GisEditorApp {
                         ui.horizontal(|ui| {
                             if ui.button("Variance").clicked() {
                                 self.selected_split_measurement_type = MeasurementType::Variance;
-                                self.heatmap_dirty = true;
                             }
                             if ui.button("Kernel-Density Entropy").clicked() {
                                 self.selected_split_measurement_type =
                                     MeasurementType::KernalDensity;
-                                self.heatmap_dirty = true;
                             }
                         })
                     });
                     ui.horizontal(|ui| {
                         ui.label("Uncertainty Quadtree Threshold:");
                         ui.add(
-                            egui::Slider::new(&mut self.uncertainty_split_threshold, 0_f32..=2.)
+                            egui::Slider::new(&mut self.uncertainty_split_threshold, 0_f32..=5.)
                                 .step_by(0.01),
                         );
                     });
@@ -71,29 +56,9 @@ impl GisEditorApp {
                         ui.label("Heatmap Opacity:");
                         ui.add(egui::Slider::new(&mut self.hilbert_order, 1..=12).step_by(1.0));
                     });
-                    if ui
-                        .checkbox(&mut self.show_heatmap, "Quadtree Heatmap")
-                        .changed()
-                        && self.show_heatmap
-                    {
-                        self.heatmap_dirty = true;
-                    }
                     ui.horizontal(|ui| {
                         ui.label("Heatmap Opacity:");
                         ui.add(egui::Slider::new(&mut self.heatmap_opacity, 0..=255).step_by(1.0));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Heatmap Metric:");
-                        ui.radio_value(
-                            &mut self.heatmap_metric,
-                            HeatmapMetric::Density,
-                            "Density",
-                        );
-                        ui.radio_value(
-                            &mut self.heatmap_metric,
-                            HeatmapMetric::Unpredictability,
-                            "Unpredictability",
-                        );
                     });
                     ui.horizontal(|ui| {
                         if let Some(idx) = self.active_layer_idx {
@@ -106,7 +71,7 @@ impl GisEditorApp {
                                     self.layers[idx].roi_bboxes.clear();
                                     self.updated_filters = true;
                                     self.roi_rebuild_pending = true;
-                                    self.heatmap_dirty = true;
+                                    self.layers[idx].heatmap_dirty = true;
                                 }
                             }
                         }
@@ -159,9 +124,10 @@ impl GisEditorApp {
                         std::thread::spawn(move || {
                             if let Some(f) = pollster::block_on(
                                 rfd::AsyncFileDialog::new()
-                                    .add_filter("All Supported", &["fgb", "parquet"])
+                                    .add_filter("All Supported", &["fgb", "parquet", "geojson"])
                                     .add_filter("FlatGeobuf", &["fgb"])
                                     .add_filter("GeoParquet", &["parquet"])
+                                    .add_filter("GeoJSON", &["geojson"])
                                     .pick_file(),
                             ) {
                                 let path =
@@ -175,14 +141,20 @@ impl GisEditorApp {
                             let mut base_url = self.fgb_file_url.clone();
                             spawn_local(async move {
                                 if let Some(f) = rfd::AsyncFileDialog::new()
-                                    .add_filter("All Supported", &["fgb", "parquet"])
+                                    .add_filter("All Supported", &["fgb", "parquet", "geojson"])
                                     .add_filter("FlatGeobuf", &["fgb"])
                                     .add_filter("GeoParquet", &["parquet"])
+                                    .add_filter("GeoJSON", &["geojson"])
                                     .pick_file()
                                     .await
                                 {
                                     let name = f.file_name();
-                                    let path = if name.ends_with(".parquet") {
+                                    // Parquet and GeoJSON are read fully into memory (no
+                                    // streaming format exists for either); FlatGeobuf streams
+                                    // over HTTP instead.
+                                    let path = if name.ends_with(".parquet")
+                                        || name.ends_with(".geojson")
+                                    {
                                         let raw = f.read().await;
                                         let arc: std::sync::Arc<[u8]> = raw.into();
                                         GisFilePath::Bytes(arc, name)

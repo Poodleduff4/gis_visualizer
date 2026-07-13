@@ -191,6 +191,7 @@ fn build_layer_entry(
     LayerEntry {
         data: LayerKind::Raster(raster),
         visible: true,
+        show_points: true,
         name: name.clone(),
         color: [255, 255, 255],
         opacity: 255,
@@ -200,12 +201,21 @@ fn build_layer_entry(
             field_names: Vec::new(),
             geometry_type: RASTER_GEOMETRY_TYPE,
             location,
+            crs: None,
+            crs_epsg: None,
         },
         filters: Vec::new(),
         filter_logic: FilterLogic::default(),
         roi_bboxes: Vec::new(),
         selections: Vec::new(),
         active_selection: None,
+        crs_transform: None,
+        show_index: false,
+        index_kind: crate::spatial_index::IndexKind::Quadtree,
+        show_heatmap: false,
+        heatmap_metric: crate::heatmap::HeatmapMetric::Density,
+        heatmap_cache: None,
+        heatmap_dirty: true,
     }
 }
 

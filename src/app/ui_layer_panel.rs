@@ -1,6 +1,7 @@
 use egui::UiKind;
 
 use crate::gis_layer::LayerKind;
+use crate::spatial_index::IndexKind;
 
 use super::{GisEditorApp, LAYER_PANEL_WIDTH};
 
@@ -45,6 +46,15 @@ impl GisEditorApp {
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut entry.visible, "").changed() {
                                     visibility_changed = true;
+                                }
+                                if matches!(entry.data, LayerKind::Points(_)) {
+                                    if ui
+                                        .checkbox(&mut entry.show_points, "")
+                                        .on_hover_text("Show points")
+                                        .changed()
+                                    {
+                                        visibility_changed = true;
+                                    }
                                 }
                                 let is_active = self.active_layer_idx == Some(i);
                                 let label = if is_active {
@@ -92,7 +102,7 @@ impl GisEditorApp {
                                                     .clicked()
                                                 {
                                                     ui.close_kind(UiKind::Menu);
-                                                    self.heatmap_dirty = true;
+                                                    entry.heatmap_dirty = true;
                                                 }
                                             }
                                         });
@@ -111,6 +121,68 @@ impl GisEditorApp {
                                         ui.close_kind(egui::UiKind::Menu);
                                     }
                                     ui.separator();
+
+                                    let has_quadtree =
+                                        entry.data.index(IndexKind::Quadtree).is_some();
+                                    let has_hilbert =
+                                        entry.data.index(IndexKind::Hilbert).is_some();
+                                    if has_quadtree || has_hilbert {
+                                        ui.checkbox(&mut entry.show_index, "Show Spatial Index");
+                                        if entry.show_index {
+                                            ui.indent("layer_index_kind", |ui| {
+                                                if has_quadtree {
+                                                    ui.radio_value(
+                                                        &mut entry.index_kind,
+                                                        IndexKind::Quadtree,
+                                                        "Quadtree",
+                                                    );
+                                                }
+                                                if has_hilbert {
+                                                    ui.radio_value(
+                                                        &mut entry.index_kind,
+                                                        IndexKind::Hilbert,
+                                                        "Hilbert R-Tree",
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        ui.separator();
+                                    }
+
+                                    let has_point_index = matches!(
+                                        &entry.data,
+                                        LayerKind::Points(pc) if pc.index.is_some()
+                                    );
+                                    if has_point_index {
+                                        if ui
+                                            .checkbox(&mut entry.show_heatmap, "Show Heatmap")
+                                            .changed()
+                                            && entry.show_heatmap
+                                        {
+                                            entry.heatmap_dirty = true;
+                                        }
+                                        if entry.show_heatmap {
+                                            ui.indent("layer_heatmap_metric", |ui| {
+                                                ui.radio_value(
+                                                    &mut entry.heatmap_metric,
+                                                    crate::heatmap::HeatmapMetric::Density,
+                                                    "Density",
+                                                );
+                                                ui.radio_value(
+                                                    &mut entry.heatmap_metric,
+                                                    crate::heatmap::HeatmapMetric::Unpredictability,
+                                                    "Unpredictability",
+                                                );
+                                                ui.radio_value(
+                                                    &mut entry.heatmap_metric,
+                                                    crate::heatmap::HeatmapMetric::AttributeMean,
+                                                    "Attribute Average",
+                                                );
+                                            });
+                                        }
+                                        ui.separator();
+                                    }
+
                                     if ui.button("Change Color…").clicked() {
                                         self.color_picker_layer = Some(i);
                                         ui.close_kind(egui::UiKind::Menu);
@@ -198,7 +270,7 @@ impl GisEditorApp {
                         self.fitted = true;
                         self.viewport_load_pending = true;
                         self.viewport_stable_frames = 0;
-                        self.heatmap_dirty = true;
+                        self.layers[idx].heatmap_dirty = true;
                     }
                     if let Some(idx) = rebuild_uncertainty_quadtree_idx {
                         match &mut self.layers[idx].data {
@@ -215,7 +287,7 @@ impl GisEditorApp {
                             LayerKind::Vector(_gl) => {}
                             LayerKind::Raster(_) => {}
                         }
-                        self.heatmap_dirty = true;
+                        self.layers[idx].heatmap_dirty = true;
                     }
                     if let Some(idx) = rebuild_hilbert_idx {
                         let order = self.hilbert_order;

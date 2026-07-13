@@ -1,5 +1,7 @@
 use std::sync::mpsc;
 
+#[cfg(target_arch = "wasm32")]
+use crate::gis_reader::{vector_file_type, GeoJsonReader, VectorFileType};
 use crate::gis_reader::{GeoParquetReader, GisFilePath, GisReader, LayerDescriptor};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsValue;
@@ -36,13 +38,21 @@ impl GisEditorApp {
                 });
             }
             GisFilePath::Bytes(bytes, name) => {
-                match GeoParquetReader::load_descriptor_from_bytes(&bytes, &name) {
+                let result = match vector_file_type(&name) {
+                    Ok(VectorFileType::GeoJson) => GeoJsonReader::load_descriptor_from_bytes(
+                        &bytes,
+                        &name,
+                        GisFilePath::Bytes(bytes.clone(), name.clone()),
+                    ),
+                    _ => GeoParquetReader::load_descriptor_from_bytes(&bytes, &name),
+                };
+                match result {
                     Ok(descriptor) => {
                         let _ = tx.send(descriptor);
                     }
                     Err(e) => {
                         web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "parquet open error: {e}"
+                            "file open error: {e}"
                         )));
                     }
                 }
@@ -65,7 +75,12 @@ impl GisEditorApp {
         self.pending_load_mode = LoadMode::GeometryOnly;
         self.pending_layers = vec![descriptor.clone()]
             .into_iter()
-            .map(|d| (d, true))
+            .map(|d| {
+                // Default the reprojection checkbox on whenever a non-4326 EPSG CRS is
+                // detected — the app's single global viewport can't render it as-is.
+                let convert = d.crs_epsg.is_some_and(|c| c != 4326);
+                (d, true, convert)
+            })
             .collect();
         self.pending_file = Some(file_path);
         self.pending_file_descriptor = Some(descriptor.clone());

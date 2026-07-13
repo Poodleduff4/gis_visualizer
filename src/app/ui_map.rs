@@ -110,10 +110,10 @@ impl GisEditorApp {
                     self.roi_rebuild_pending = true;
                 }
             }
-            let active_layer = self.active_layer_idx.and_then(|i| self.layers.get(i));
 
-            // GPU point cloud: always blit the cached offscreen texture (cheap).
-            // The offscreen re-render only happens when map_render_ttl > 0 (viewport/data changed).
+            // GPU vector + point layers: always blit the cached offscreen texture
+            // (cheap). The offscreen re-render only happens when map_render_ttl > 0
+            // (viewport/data changed). Vector is added first so it paints under points.
             if self.has_gpu {
                 let rect = response.rect;
                 let [wx_min, wy_min, wx_max, wy_max] = self.viewport.viewport_bbox(rect);
@@ -122,6 +122,18 @@ impl GisEditorApp {
                 if self.map_render_ttl > 0 {
                     self.map_render_ttl -= 1;
                 }
+                painter.add(egui::Shape::Callback(
+                    egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        crate::vector_gpu::VectorCallback {
+                            world_min: [wx_min as f32, wy_min as f32],
+                            world_size,
+                            screen_min: [rect.left(), rect.top()],
+                            screen_size: [rect.width(), rect.height()],
+                            render_dirty,
+                        },
+                    ),
+                ));
                 painter.add(egui::Shape::Callback(
                     egui_wgpu::Callback::new_paint_callback(
                         rect,
@@ -163,114 +175,137 @@ impl GisEditorApp {
                 self.points_dirty = true;
             }
 
-            if self.show_heatmap {
-                if self.active_layer_idx != self.last_heatmap_layer_idx {
-                    self.last_heatmap_layer_idx = self.active_layer_idx;
-                    self.heatmap_dirty = true;
+            let mut heatmap_legend_slot = 0;
+            for idx in 0..self.layers.len() {
+                if !self.layers[idx].visible {
+                    continue;
                 }
-                if self.heatmap_dirty {
-                    use crate::point_cloud_layer::AttributeColumn;
-                    self.heatmap_cache = active_layer.and_then(|e| {
-                        let LayerKind::Points(pc) = &e.data else {
-                            return None;
-                        };
-                        let index = pc.index.as_deref()?;
-                        let attr = self.selected_uncertainty_attribute.as_ref()?;
-                        let field_idx = pc.field_names.iter().position(|n| n == attr)?;
-                        let values: Vec<f64> = match &pc.attributes[field_idx] {
-                            AttributeColumn::Float(v) => v.clone(),
-                            AttributeColumn::Integer(v) => v.iter().map(|x| *x as f64).collect(),
-                            AttributeColumn::Text(_) => return None,
-                        };
-                        Some(HeatmapLayer::build(
-                            index,
-                            &values,
-                            self.selected_split_measurement_type.clone(),
-                        ))
-                    });
-                    self.heatmap_dirty = false;
-                }
-                if let Some(heatmap) = &self.heatmap_cache {
-                    let roi_bboxes = active_layer.map(|e| e.roi_bboxes.as_slice()).unwrap_or(&[]);
-                    show_quadtree_heatmap(
-                        &painter,
-                        heatmap,
-                        self.heatmap_metric,
-                        roi_bboxes,
-                        &self.viewport,
-                        response.rect,
-                        self.heatmap_opacity,
-                    );
 
-                    // ── Legend: gradient bar + range + meaning ──────────────────
-                    let (title, max_val, unit) = match self.heatmap_metric {
-                        HeatmapMetric::Density => {
-                            ("Density (points/cell)".to_string(), heatmap.max_density, "")
-                        }
-                        HeatmapMetric::Unpredictability => {
-                            let label = match &heatmap.measurement_type {
-                                MeasurementType::Variance => "Unpredictability (variance)",
-                                MeasurementType::KernalDensity => "Unpredictability (entropy)",
-                            };
-                            (label.to_string(), heatmap.max_unpredictability, "")
-                        }
-                    };
-                    let r = response.rect;
-                    let bar_w = 200.0_f32;
-                    let bar_h = 14.0_f32;
-                    let x = r.min.x + 10.0;
-                    let y = r.max.y - 46.0;
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(x - 4.0, y - 18.0),
-                            egui::vec2(bar_w + 8.0, bar_h + 40.0),
-                        ),
-                        4.0,
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
-                    );
-                    painter.text(
-                        egui::pos2(x, y - 16.0),
-                        egui::Align2::LEFT_TOP,
-                        &title,
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::WHITE,
-                    );
-                    let steps = 40;
-                    for i in 0..steps {
-                        let t0 = i as f32 / steps as f32;
-                        let t1 = (i + 1) as f32 / steps as f32;
-                        let color = crate::map_view::heat_color(t0, 255);
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(x + t0 * bar_w, y),
-                                egui::pos2(x + t1 * bar_w, y + bar_h),
+                if self.layers[idx].show_heatmap {
+                    if self.layers[idx].heatmap_dirty {
+                        use crate::point_cloud_layer::AttributeColumn;
+                        let selected_uncertainty_attribute =
+                            self.selected_uncertainty_attribute.clone();
+                        let measurement_type = self.selected_split_measurement_type.clone();
+                        self.layers[idx].heatmap_cache = {
+                            let entry = &self.layers[idx];
+                            if let LayerKind::Points(pc) = &entry.data {
+                                (|| {
+                                    let index = pc.index.as_deref()?;
+                                    let attr = selected_uncertainty_attribute.as_ref()?;
+                                    let field_idx =
+                                        pc.field_names.iter().position(|n| n == attr)?;
+                                    let values: Vec<f64> = match &pc.attributes[field_idx] {
+                                        AttributeColumn::Float(v) => v.clone(),
+                                        AttributeColumn::Integer(v) => {
+                                            v.iter().map(|x| *x as f64).collect()
+                                        }
+                                        AttributeColumn::Text(_) => return None,
+                                    };
+                                    Some(HeatmapLayer::build(
+                                        index,
+                                        &values,
+                                        measurement_type,
+                                        attr.clone(),
+                                    ))
+                                })()
+                            } else {
+                                None
+                            }
+                        };
+                        self.layers[idx].heatmap_dirty = false;
+                    }
+                    if let Some(heatmap) = &self.layers[idx].heatmap_cache {
+                        let heatmap_metric = self.layers[idx].heatmap_metric;
+                        let roi_bboxes = &self.layers[idx].roi_bboxes;
+                        show_quadtree_heatmap(
+                            &painter,
+                            heatmap,
+                            heatmap_metric,
+                            roi_bboxes,
+                            &self.viewport,
+                            response.rect,
+                            self.heatmap_opacity,
+                        );
+
+                        // ── Legend: gradient bar + range + meaning ──────────────
+                        let (title, min_val, max_val, unit) = match heatmap_metric {
+                            HeatmapMetric::Density => (
+                                "Density (points/cell)".to_string(),
+                                0.0,
+                                heatmap.max_density,
+                                "",
                             ),
-                            0.0,
-                            color,
+                            HeatmapMetric::Unpredictability => {
+                                let label = match &heatmap.measurement_type {
+                                    MeasurementType::Variance => "Unpredictability (variance)",
+                                    MeasurementType::KernalDensity => "Unpredictability (entropy)",
+                                };
+                                (label.to_string(), 0.0, heatmap.max_unpredictability, "")
+                            }
+                            HeatmapMetric::AttributeMean => (
+                                format!("{} (avg)", heatmap.attribute_name),
+                                heatmap.min_attribute_value,
+                                heatmap.max_attribute_value,
+                                "",
+                            ),
+                        };
+                        let r = response.rect;
+                        let bar_w = 200.0_f32;
+                        let bar_h = 14.0_f32;
+                        let x = r.min.x + 10.0;
+                        let y = r.max.y - 46.0 - (heatmap_legend_slot as f32) * 66.0;
+                        heatmap_legend_slot += 1;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x - 4.0, y - 18.0),
+                                egui::vec2(bar_w + 8.0, bar_h + 40.0),
+                            ),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                        );
+                        painter.text(
+                            egui::pos2(x, y - 16.0),
+                            egui::Align2::LEFT_TOP,
+                            &title,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        let steps = 40;
+                        for i in 0..steps {
+                            let t0 = i as f32 / steps as f32;
+                            let t1 = (i + 1) as f32 / steps as f32;
+                            let color = crate::map_view::heat_color(t0, 255);
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(x + t0 * bar_w, y),
+                                    egui::pos2(x + t1 * bar_w, y + bar_h),
+                                ),
+                                0.0,
+                                color,
+                            );
+                        }
+                        painter.text(
+                            egui::pos2(x, y + bar_h + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{:.3}{}", min_val, unit),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x + bar_w, y + bar_h + 2.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{:.3}{}", max_val, unit),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
                         );
                     }
-                    painter.text(
-                        egui::pos2(x, y + bar_h + 2.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("0{}", unit),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::WHITE,
-                    );
-                    painter.text(
-                        egui::pos2(x + bar_w, y + bar_h + 2.0),
-                        egui::Align2::RIGHT_TOP,
-                        format!("{:.3}{}", max_val, unit),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::WHITE,
-                    );
                 }
-            }
 
-            if self.show_index {
-                let index = active_layer
-                    .map(|e| e.data.index(self.index_kind))
-                    .flatten();
-                show_spatial_index_grid(&painter, index, &mut self.viewport, response.rect);
+                if self.layers[idx].show_index {
+                    let index = self.layers[idx].data.index(self.layers[idx].index_kind);
+                    show_spatial_index_grid(&painter, index, &mut self.viewport, response.rect);
+                }
             }
 
             if self.show_local_variance {

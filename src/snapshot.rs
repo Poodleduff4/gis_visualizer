@@ -22,8 +22,6 @@ pub struct ViewportSnapshot {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DisplaySnapshot {
     pub show_basemap: bool,
-    pub show_heatmap: bool,
-    pub show_index: bool,
     pub point_size: f32,
     pub heatmap_opacity: u8,
 }
@@ -66,6 +64,20 @@ pub struct LayerSnapshot {
     pub selections: Vec<SelectionSnapshot>,
     #[serde(default)]
     pub active_selection: Option<usize>,
+    #[serde(default)]
+    pub show_index: bool,
+    #[serde(default)]
+    pub index_kind: String,
+    #[serde(default)]
+    pub show_heatmap: bool,
+    #[serde(default)]
+    pub heatmap_metric: String,
+    #[serde(default = "default_true")]
+    pub show_points: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -93,6 +105,36 @@ pub fn str_to_measurement_type(s: &str) -> crate::uncertainty_quadtree::Measurem
     match s {
         "KernalDensity" => crate::uncertainty_quadtree::MeasurementType::KernalDensity,
         _ => crate::uncertainty_quadtree::MeasurementType::Variance,
+    }
+}
+
+pub fn index_kind_to_str(kind: &crate::spatial_index::IndexKind) -> String {
+    match kind {
+        crate::spatial_index::IndexKind::Quadtree => "Quadtree".to_string(),
+        crate::spatial_index::IndexKind::Hilbert => "Hilbert".to_string(),
+    }
+}
+
+pub fn str_to_index_kind(s: &str) -> crate::spatial_index::IndexKind {
+    match s {
+        "Hilbert" => crate::spatial_index::IndexKind::Hilbert,
+        _ => crate::spatial_index::IndexKind::Quadtree,
+    }
+}
+
+pub fn heatmap_metric_to_str(metric: &crate::heatmap::HeatmapMetric) -> String {
+    match metric {
+        crate::heatmap::HeatmapMetric::Density => "Density".to_string(),
+        crate::heatmap::HeatmapMetric::Unpredictability => "Unpredictability".to_string(),
+        crate::heatmap::HeatmapMetric::AttributeMean => "AttributeMean".to_string(),
+    }
+}
+
+pub fn str_to_heatmap_metric(s: &str) -> crate::heatmap::HeatmapMetric {
+    match s {
+        "Unpredictability" => crate::heatmap::HeatmapMetric::Unpredictability,
+        "AttributeMean" => crate::heatmap::HeatmapMetric::AttributeMean,
+        _ => crate::heatmap::HeatmapMetric::Density,
     }
 }
 
