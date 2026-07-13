@@ -15,6 +15,8 @@ mod kde;
 mod map_view;
 #[cfg(not(target_arch = "wasm32"))]
 mod parquet;
+#[cfg(not(target_arch = "wasm32"))]
+mod plugin;
 mod point_cloud;
 mod point_cloud_layer;
 mod quadtree;

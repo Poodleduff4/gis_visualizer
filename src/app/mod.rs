@@ -5,6 +5,10 @@ mod ui_layer_panel;
 mod ui_loading;
 mod ui_map;
 mod ui_menu;
+#[cfg(not(target_arch = "wasm32"))]
+mod plugin_bridge;
+#[cfg(not(target_arch = "wasm32"))]
+mod ui_plugins;
 mod ui_sidebar;
 mod ui_windows;
 
@@ -209,6 +213,28 @@ pub struct GisEditorApp {
     pub(super) snapshot_restore: Option<PendingSnapshotRestore>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) snapshot_pick_rx: Option<std::sync::mpsc::Receiver<std::path::PathBuf>>,
+
+    // ── Plugins (subprocess + msgpack protocol; native-only) ──────────────
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_window_open: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugins_dir: std::path::PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) available_plugins: Vec<crate::plugin::PluginManifest>,
+    /// Name of the plugin currently running, if any — drives the spinner
+    /// and disables concurrent runs (one plugin process at a time for now).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_running: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_events_rx: Option<std::sync::mpsc::Receiver<crate::plugin::PluginEvent>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_log: Vec<(crate::plugin::LogLevel, String)>,
+    /// Current values for each plugin's `[[params]]`, keyed by plugin name
+    /// then param name. Populated (from each param's `default`) the first
+    /// time a plugin with params is shown in the list.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_param_values:
+        std::collections::HashMap<String, std::collections::HashMap<String, ui_plugins::ParamEditValue>>,
 }
 
 impl GisEditorApp {
@@ -341,6 +367,20 @@ impl GisEditorApp {
             snapshot_restore: None,
             #[cfg(not(target_arch = "wasm32"))]
             snapshot_pick_rx: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_window_open: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugins_dir: std::path::PathBuf::from("plugins"),
+            #[cfg(not(target_arch = "wasm32"))]
+            available_plugins: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_running: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_events_rx: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_log: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_param_values: std::collections::HashMap::new(),
         }
     }
 }

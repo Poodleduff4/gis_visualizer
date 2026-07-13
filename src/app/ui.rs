@@ -4,6 +4,11 @@ impl eframe::App for GisEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.show_menu_bar(ui);
         self.poll_loading(ui);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.poll_plugin_events();
+            self.show_plugins_window(ui);
+        }
         self.show_windows(ui);
         self.show_status_bar(ui);
         self.show_layer_panel(ui);

@@ -120,6 +120,14 @@ impl GisEditorApp {
                         ui.close_kind(UiKind::Menu);
                     }
                 });
+                #[cfg(not(target_arch = "wasm32"))]
+                ui.menu_button("Plugins", |ui| {
+                    if ui.button("Manage Plugins…").clicked() {
+                        self.available_plugins = crate::plugin::discover_plugins(&self.plugins_dir);
+                        self.plugin_window_open = true;
+                        ui.close_kind(UiKind::Menu);
+                    }
+                });
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
                         ui.close_kind(UiKind::Menu);
