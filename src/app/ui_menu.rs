@@ -114,6 +114,12 @@ impl GisEditorApp {
                         }
                     }
                 });
+                ui.menu_button("Analysis", |ui| {
+                    if ui.button("Kernel Density Estimation…").clicked() {
+                        self.kde_window_open = true;
+                        ui.close_kind(UiKind::Menu);
+                    }
+                });
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
                         ui.close_kind(UiKind::Menu);

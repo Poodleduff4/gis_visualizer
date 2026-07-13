@@ -161,4 +161,30 @@ impl HeatmapLayer {
             measurement_type,
         }
     }
+
+    /// Wraps a KDE grid (from `kde::build_kde_grid`) as a `HeatmapLayer` so it
+    /// can reuse `show_quadtree_heatmap`'s rendering — `cells` are already
+    /// scored by density only (no per-cell variance/entropy/attribute-mean).
+    pub fn from_kde_cells(cells: Vec<([f64; 4], f32)>, attribute_name: String) -> Self {
+        let max_density = cells.iter().map(|(_, v)| *v).fold(0.0_f32, f32::max);
+        let cells = cells
+            .into_iter()
+            .map(|(bbox, v)| ScoredCell {
+                bbox,
+                density: if max_density > 0.0 { v / max_density } else { 0.0 },
+                unpredictability: 0.0,
+                attribute_mean: 0.0,
+            })
+            .collect();
+
+        Self {
+            cells,
+            max_density,
+            max_unpredictability: 0.0,
+            min_attribute_value: 0.0,
+            max_attribute_value: 0.0,
+            attribute_name,
+            measurement_type: MeasurementType::Variance,
+        }
+    }
 }

@@ -183,6 +183,11 @@ impl GisEditorApp {
                                         ui.separator();
                                     }
 
+                                    if entry.kde_cache.is_some() {
+                                        ui.checkbox(&mut entry.show_kde, "Show KDE Heatmap");
+                                        ui.separator();
+                                    }
+
                                     if ui.button("Change Color…").clicked() {
                                         self.color_picker_layer = Some(i);
                                         ui.close_kind(egui::UiKind::Menu);

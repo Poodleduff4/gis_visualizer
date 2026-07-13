@@ -317,5 +317,148 @@ impl GisEditorApp {
                 self.color_picker_layer = None;
             }
         }
+
+        // ── Kernel Density Estimation window ───────────────────────────────────
+        if self.kde_window_open {
+            let mut open = true;
+            let mut run_clicked = false;
+            egui::Window::new("Kernel Density Estimation")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_size([320.0, 260.0])
+                .show(ui.ctx(), |ui| {
+                    let Some(idx) = self.active_layer_idx else {
+                        ui.label("Select a Points layer first.");
+                        return;
+                    };
+                    let Some(entry) = self.layers.get(idx) else {
+                        ui.label("Select a Points layer first.");
+                        return;
+                    };
+                    if !matches!(entry.data, LayerKind::Points(_)) {
+                        ui.label("Active layer must be a Points layer.");
+                        return;
+                    }
+                    ui.label(format!("Layer: {}", entry.name));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Cell size:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.kde_cell_size)
+                                .speed(0.001)
+                                .range(1e-9..=f64::MAX),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Search radius (bandwidth):");
+                        ui.add(
+                            egui::DragValue::new(&mut self.kde_radius)
+                                .speed(0.001)
+                                .range(1e-9..=f64::MAX),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Kernel:");
+                        egui::ComboBox::from_id_salt("kde_kernel_combo")
+                            .selected_text(self.kde_kernel.label())
+                            .show_ui(ui, |ui| {
+                                for k in crate::kde::KdeKernel::ALL {
+                                    ui.selectable_value(&mut self.kde_kernel, k, k.label());
+                                }
+                            });
+                    });
+                    let numeric_fields = entry.data.numeric_field_names();
+                    ui.horizontal(|ui| {
+                        ui.label("Weight field:");
+                        egui::ComboBox::from_id_salt("kde_weight_field_combo")
+                            .selected_text(self.kde_weight_field.as_deref().unwrap_or("None (count)"))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.kde_weight_field, None, "None (count)");
+                                for f in &numeric_fields {
+                                    ui.selectable_value(
+                                        &mut self.kde_weight_field,
+                                        Some(f.clone()),
+                                        f,
+                                    );
+                                }
+                            });
+                    });
+                    ui.separator();
+                    if self.kde_running {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Computing…");
+                        });
+                    } else if ui.button("Run").clicked() {
+                        run_clicked = true;
+                    }
+                });
+            if run_clicked {
+                self.start_kde_compute();
+            }
+            self.kde_window_open = open;
+        }
+    }
+
+    /// Spawns a background thread that builds a KDE grid over the active
+    /// Points layer's (filtered) points, then sends the result back through
+    /// `kde_rx` for `poll_spatial_analysis` to install as that layer's
+    /// `kde_cache`.
+    fn start_kde_compute(&mut self) {
+        let Some(idx) = self.active_layer_idx else {
+            return;
+        };
+        let Some(entry) = self.layers.get_mut(idx) else {
+            return;
+        };
+        let LayerKind::Points(pc) = &mut entry.data else {
+            return;
+        };
+        pc.ensure_bbox();
+        let Some(bbox) = pc.bbox else {
+            return;
+        };
+
+        let weights = self
+            .kde_weight_field
+            .as_ref()
+            .and_then(|f| crate::histogram::extract_field_values(pc, f));
+        let points: Vec<[f64; 2]> = pc
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| pc.filter_mask[*i])
+            .map(|(_, (_, p))| *p)
+            .collect();
+        let weights: Option<Vec<f64>> = weights.map(|w| {
+            pc.points
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| pc.filter_mask[*i])
+                .map(|(i, _)| w[i])
+                .collect()
+        });
+
+        let params = crate::kde::KdeParams {
+            cell_size: self.kde_cell_size,
+            radius: self.kde_radius,
+            kernel: self.kde_kernel,
+        };
+        let attribute_name = self
+            .kde_weight_field
+            .clone()
+            .unwrap_or_else(|| "KDE Density".to_string());
+
+        let (tx, rx) = futures_channel::oneshot::channel();
+        self.kde_rx = Some(rx);
+        self.kde_running = true;
+        self.status = format!("Computing KDE ({} pts)…", points.len());
+
+        std::thread::spawn(move || {
+            let cells = crate::kde::build_kde_grid(&points, weights.as_deref(), bbox, &params);
+            let heatmap = crate::heatmap::HeatmapLayer::from_kde_cells(cells, attribute_name);
+            tx.send((idx, heatmap)).ok();
+        });
     }
 }

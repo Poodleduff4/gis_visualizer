@@ -216,6 +216,8 @@ fn build_layer_entry(
         heatmap_metric: crate::heatmap::HeatmapMetric::Density,
         heatmap_cache: None,
         heatmap_dirty: true,
+        show_kde: false,
+        kde_cache: None,
     }
 }
 

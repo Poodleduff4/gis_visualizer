@@ -571,6 +571,10 @@ pub struct LayerEntry {
     pub heatmap_metric: crate::heatmap::HeatmapMetric,
     pub heatmap_cache: Option<crate::heatmap::HeatmapLayer>,
     pub heatmap_dirty: bool,
+    /// Whether the grid-based kernel density estimate overlay is shown.
+    /// Independent of `show_heatmap`/`heatmap_cache` (quadtree-based).
+    pub show_kde: bool,
+    pub kde_cache: Option<crate::heatmap::HeatmapLayer>,
 }
 impl LayerEntry {}
 

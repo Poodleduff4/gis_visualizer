@@ -170,6 +170,15 @@ pub struct GisEditorApp {
     pub(super) show_lisa: bool,
     pub(super) lisa_rx: Option<oneshot::Receiver<Option<Vec<Option<LisaPoint>>>>>,
 
+    // ── Kernel density estimation (grid-based heatmap, à la QGIS) ─────────
+    pub(super) kde_window_open: bool,
+    pub(super) kde_cell_size: f64,
+    pub(super) kde_radius: f64,
+    pub(super) kde_kernel: crate::kde::KdeKernel,
+    pub(super) kde_weight_field: Option<String>,
+    pub(super) kde_running: bool,
+    pub(super) kde_rx: Option<oneshot::Receiver<(usize, crate::heatmap::HeatmapLayer)>>,
+
     // ── Globe view + raster ──────────────────────────────────────────────
     pub(super) map_view: MapView,
     pub(super) globe_camera: GlobeCamera,
@@ -303,6 +312,13 @@ impl GisEditorApp {
             lisa_results: None,
             show_lisa: false,
             lisa_rx: None,
+            kde_window_open: false,
+            kde_cell_size: 0.01,
+            kde_radius: 0.05,
+            kde_kernel: crate::kde::KdeKernel::Quartic,
+            kde_weight_field: None,
+            kde_running: false,
+            kde_rx: None,
             map_view: MapView::default(),
             globe_camera: GlobeCamera::default(),
             globe_points_buf: Vec::new(),

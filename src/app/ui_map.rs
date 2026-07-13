@@ -302,6 +302,72 @@ impl GisEditorApp {
                     }
                 }
 
+                if self.layers[idx].show_kde {
+                    if let Some(kde) = &self.layers[idx].kde_cache {
+                        let roi_bboxes = &self.layers[idx].roi_bboxes;
+                        show_quadtree_heatmap(
+                            &painter,
+                            kde,
+                            HeatmapMetric::Density,
+                            roi_bboxes,
+                            &self.viewport,
+                            response.rect,
+                            self.heatmap_opacity,
+                        );
+
+                        let title = format!("KDE: {}", kde.attribute_name);
+                        let r = response.rect;
+                        let bar_w = 200.0_f32;
+                        let bar_h = 14.0_f32;
+                        let x = r.min.x + 10.0;
+                        let y = r.max.y - 46.0 - (heatmap_legend_slot as f32) * 66.0;
+                        heatmap_legend_slot += 1;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x - 4.0, y - 18.0),
+                                egui::vec2(bar_w + 8.0, bar_h + 40.0),
+                            ),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                        );
+                        painter.text(
+                            egui::pos2(x, y - 16.0),
+                            egui::Align2::LEFT_TOP,
+                            &title,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        let steps = 40;
+                        for i in 0..steps {
+                            let t0 = i as f32 / steps as f32;
+                            let t1 = (i + 1) as f32 / steps as f32;
+                            let color = crate::map_view::heat_color(t0, 255);
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(x + t0 * bar_w, y),
+                                    egui::pos2(x + t1 * bar_w, y + bar_h),
+                                ),
+                                0.0,
+                                color,
+                            );
+                        }
+                        painter.text(
+                            egui::pos2(x, y + bar_h + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            "0.000",
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x + bar_w, y + bar_h + 2.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{:.3}", kde.max_density),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+
                 if self.layers[idx].show_index {
                     let index = self.layers[idx].data.index(self.layers[idx].index_kind);
                     show_spatial_index_grid(&painter, index, &mut self.viewport, response.rect);

@@ -535,6 +535,8 @@ impl GisEditorApp {
                                         heatmap_metric: crate::heatmap::HeatmapMetric::Density,
                                         heatmap_cache: None,
                                         heatmap_dirty: true,
+                                        show_kde: false,
+                                        kde_cache: None,
                                     });
                                     self.active_layer_idx = Some(self.layers.len() - 1);
                                 }
@@ -953,6 +955,28 @@ impl GisEditorApp {
                 Err(_) => {
                     self.lisa_rx = None;
                     self.status = "LISA failed.".to_string();
+                }
+            }
+        }
+        if let Some(rx) = &mut self.kde_rx {
+            match rx.try_recv() {
+                Ok(Some((layer_idx, heatmap))) => {
+                    self.kde_rx = None;
+                    self.kde_running = false;
+                    if let Some(entry) = self.layers.get_mut(layer_idx) {
+                        entry.kde_cache = Some(heatmap);
+                        entry.show_kde = true;
+                    }
+                    self.status = "KDE done.".to_string();
+                }
+                Ok(None) => {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(_) => {
+                    self.kde_rx = None;
+                    self.kde_running = false;
+                    self.status = "KDE failed.".to_string();
                 }
             }
         }
