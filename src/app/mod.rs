@@ -177,7 +177,11 @@ pub struct GisEditorApp {
     pub(super) kde_kernel: crate::kde::KdeKernel,
     pub(super) kde_weight_field: Option<String>,
     pub(super) kde_running: bool,
-    pub(super) kde_rx: Option<oneshot::Receiver<(usize, crate::heatmap::HeatmapLayer)>>,
+    pub(super) kde_rx: Option<
+        oneshot::Receiver<(usize, crate::heatmap::HeatmapLayer, crate::heatmap::SavedHeatmap)>,
+    >,
+
+    pub(super) export_window_open: bool,
 
     // ── Globe view + raster ──────────────────────────────────────────────
     pub(super) map_view: MapView,
@@ -319,6 +323,7 @@ impl GisEditorApp {
             kde_weight_field: None,
             kde_running: false,
             kde_rx: None,
+            export_window_open: false,
             map_view: MapView::default(),
             globe_camera: GlobeCamera::default(),
             globe_points_buf: Vec::new(),

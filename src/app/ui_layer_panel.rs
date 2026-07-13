@@ -38,6 +38,11 @@ impl GisEditorApp {
                     let mut visibility_changed = false;
                     let mut set_active_selection: Option<(usize, usize)> = None;
                     let mut remove_selection: Option<(usize, usize)> = None;
+                    let mut save_heatmap_idx: Option<usize> = None;
+                    let mut export_heatmap: Option<(usize, usize)> = None;
+                    let mut promote_heatmap: Option<(usize, usize)> = None;
+                    let mut remove_heatmap: Option<(usize, usize)> = None;
+                    let mut select_heatmap: Option<(usize, usize)> = None;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -178,6 +183,11 @@ impl GisEditorApp {
                                                     crate::heatmap::HeatmapMetric::AttributeMean,
                                                     "Attribute Average",
                                                 );
+                                                if entry.heatmap_cache.is_some()
+                                                    && ui.button("💾 Save this heatmap").clicked()
+                                                {
+                                                    save_heatmap_idx = Some(i);
+                                                }
                                             });
                                         }
                                         ui.separator();
@@ -230,6 +240,69 @@ impl GisEditorApp {
                                             if ui.small_button("✕").clicked() {
                                                 remove_selection = Some((i, sidx));
                                             }
+                                        });
+                                    }
+                                });
+                            }
+                            if !entry.saved_heatmaps.is_empty() {
+                                egui::CollapsingHeader::new(format!(
+                                    "Saved Heatmaps ({})",
+                                    entry.saved_heatmaps.len()
+                                ))
+                                .id_salt(("saved_heatmaps_hdr", i))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for (hidx, saved) in entry.saved_heatmaps.iter().enumerate() {
+                                        let is_active = entry.active_saved_heatmap == Some(hidx);
+                                        ui.horizontal(|ui| {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("✕").clicked() {
+                                                        remove_heatmap = Some((i, hidx));
+                                                    }
+                                                    if ui
+                                                        .small_button("➕")
+                                                        .on_hover_text("Add as a raster layer")
+                                                        .clicked()
+                                                    {
+                                                        promote_heatmap = Some((i, hidx));
+                                                    }
+                                                    if ui
+                                                        .small_button("📄")
+                                                        .on_hover_text("Export as GeoTIFF")
+                                                        .clicked()
+                                                    {
+                                                        export_heatmap = Some((i, hidx));
+                                                    }
+                                                    let icon = match saved.kind {
+                                                        crate::heatmap::HeatmapKind::Quadtree => {
+                                                            "🔲"
+                                                        }
+                                                        crate::heatmap::HeatmapKind::Kde => "🎯",
+                                                    };
+                                                    // Manually truncated (rather than relying on
+                                                    // egui's shrink-to-fit) so a long name can't
+                                                    // blow out the panel's max width and squeeze
+                                                    // the map view — it did before this was added.
+                                                    let full = format!("{icon} {}", saved.name);
+                                                    let short: String = if full.chars().count() > 34 {
+                                                        full.chars().take(31).collect::<String>() + "…"
+                                                    } else {
+                                                        full.clone()
+                                                    };
+                                                    if ui
+                                                        .selectable_label(is_active, short)
+                                                        .on_hover_text(format!(
+                                                            "{full} ({} cells)",
+                                                            saved.cells.len()
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        select_heatmap = Some((i, hidx));
+                                                    }
+                                                },
+                                            );
                                         });
                                     }
                                 });
@@ -331,6 +404,113 @@ impl GisEditorApp {
                             _ => {}
                         };
                         fixup(&mut self.layers[li].active_selection);
+                    }
+                    if let Some(li) = save_heatmap_idx {
+                        let entry = &self.layers[li];
+                        if let Some(heatmap) = &entry.heatmap_cache {
+                            let metric = entry.heatmap_metric;
+                            let cells = heatmap.raw_cells(metric);
+                            let name = format!("Heatmap {}", heatmap.metric_label(metric));
+                            let units = heatmap.metric_label(metric);
+                            let saved = crate::heatmap::SavedHeatmap::new(
+                                name,
+                                crate::heatmap::HeatmapKind::Quadtree,
+                                cells,
+                                units,
+                            );
+                            let entry = &mut self.layers[li];
+                            entry.saved_heatmaps.push(saved);
+                            entry.active_saved_heatmap = Some(entry.saved_heatmaps.len() - 1);
+                        }
+                    }
+                    if let Some((li, hidx)) = select_heatmap {
+                        if let Some(entry) = self.layers.get_mut(li) {
+                            if entry.active_saved_heatmap == Some(hidx) {
+                                entry.active_saved_heatmap = None;
+                                entry.show_kde = false;
+                            } else if let Some(saved) = entry.saved_heatmaps.get(hidx) {
+                                entry.kde_cache = Some(crate::heatmap::HeatmapLayer::from_kde_cells(
+                                    saved.cells.clone(),
+                                    saved.name.clone(),
+                                ));
+                                entry.show_kde = true;
+                                entry.active_saved_heatmap = Some(hidx);
+                            }
+                        }
+                        self.map_render_ttl = 3;
+                    }
+                    if let Some((li, hidx)) = remove_heatmap {
+                        if let Some(entry) = self.layers.get_mut(li) {
+                            if hidx < entry.saved_heatmaps.len() {
+                                entry.saved_heatmaps.remove(hidx);
+                                let fixup = |sel: &mut Option<usize>| match *sel {
+                                    Some(s) if s == hidx => *sel = None,
+                                    Some(s) if s > hidx => *sel = Some(s - 1),
+                                    _ => {}
+                                };
+                                fixup(&mut entry.active_saved_heatmap);
+                                if entry.active_saved_heatmap.is_none() {
+                                    entry.show_kde = false;
+                                }
+                            }
+                        }
+                    }
+                    if let Some((li, hidx)) = promote_heatmap {
+                        if let Some(saved) = self.layers.get(li).and_then(|l| l.saved_heatmaps.get(hidx)) {
+                            let cell_size = saved
+                                .cells
+                                .iter()
+                                .map(|(b, _)| (b[2] - b[0]).min(b[3] - b[1]))
+                                .fold(f64::INFINITY, f64::min);
+                            let (width, height, _actual_cell_size, values) =
+                                crate::heatmap::rasterize_cells(&saved.cells, saved.bbox, cell_size);
+                            let layer = crate::raster_reader::build_layer_entry(
+                                saved.name.clone(),
+                                width,
+                                height,
+                                vec![values],
+                                saved.units.clone(),
+                                crate::gis_reader::GisFilePath::LocalFile(String::new()),
+                                saved.bbox,
+                            );
+                            self.layers.push(layer);
+                            self.active_layer_idx = Some(self.layers.len() - 1);
+                            self.raster_dirty = true;
+                            self.flat_raster_dirty = true;
+                            self.map_render_ttl = 3;
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some((li, hidx)) = export_heatmap {
+                        if let Some(saved) = self.layers.get(li).and_then(|l| l.saved_heatmaps.get(hidx)) {
+                            let cells = saved.cells.clone();
+                            let bbox = saved.bbox;
+                            let default_name = format!("{}.tif", saved.name.replace([' ', '/'], "_"));
+                            let cell_size = cells
+                                .iter()
+                                .map(|(b, _)| (b[2] - b[0]).min(b[3] - b[1]))
+                                .fold(f64::INFINITY, f64::min);
+                            std::thread::spawn(move || {
+                                if let Some(f) = pollster::block_on(
+                                    rfd::AsyncFileDialog::new()
+                                        .set_file_name(default_name)
+                                        .add_filter("GeoTIFF", &["tif", "tiff"])
+                                        .save_file(),
+                                ) {
+                                    let (width, height, _cs, values) =
+                                        crate::heatmap::rasterize_cells(&cells, bbox, cell_size);
+                                    if let Err(e) = crate::raster_reader::write_geotiff(
+                                        &f.path().to_path_buf(),
+                                        width,
+                                        height,
+                                        &values,
+                                        bbox,
+                                    ) {
+                                        eprintln!("[heatmap export] error: {e:#}");
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
             });

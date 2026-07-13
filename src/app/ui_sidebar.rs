@@ -26,7 +26,7 @@ use crate::spatial_index::{IndexKind, SpatialIndex};
 
 use super::{now_ms, GisEditorApp};
 
-fn clone_pc_for_export(
+pub(super) fn clone_pc_for_export(
     pc: &crate::point_cloud_layer::PointCloudLayer,
 ) -> crate::point_cloud_layer::PointCloudLayer {
     crate::point_cloud_layer::PointCloudLayer {
@@ -537,6 +537,8 @@ impl GisEditorApp {
                                         heatmap_dirty: true,
                                         show_kde: false,
                                         kde_cache: None,
+                                        saved_heatmaps: Vec::new(),
+                                        active_saved_heatmap: None,
                                     });
                                     self.active_layer_idx = Some(self.layers.len() - 1);
                                 }
@@ -960,12 +962,14 @@ impl GisEditorApp {
         }
         if let Some(rx) = &mut self.kde_rx {
             match rx.try_recv() {
-                Ok(Some((layer_idx, heatmap))) => {
+                Ok(Some((layer_idx, heatmap, saved))) => {
                     self.kde_rx = None;
                     self.kde_running = false;
                     if let Some(entry) = self.layers.get_mut(layer_idx) {
                         entry.kde_cache = Some(heatmap);
                         entry.show_kde = true;
+                        entry.saved_heatmaps.push(saved);
+                        entry.active_saved_heatmap = Some(entry.saved_heatmaps.len() - 1);
                     }
                     self.status = "KDE done.".to_string();
                 }

@@ -187,4 +187,117 @@ impl HeatmapLayer {
             measurement_type: MeasurementType::Variance,
         }
     }
+
+    /// Recovers raw (un-normalized) per-cell values for `metric` — inverts the
+    /// normalization `build`/`from_kde_cells` applies, so a saved snapshot
+    /// carries physical-unit magnitudes rather than 0..1 scores.
+    pub fn raw_cells(&self, metric: HeatmapMetric) -> Vec<([f64; 4], f32)> {
+        let attr_range = self.max_attribute_value - self.min_attribute_value;
+        self.cells
+            .iter()
+            .map(|c| {
+                let value = match metric {
+                    HeatmapMetric::Density => c.density * self.max_density,
+                    HeatmapMetric::Unpredictability => {
+                        c.unpredictability * self.max_unpredictability
+                    }
+                    HeatmapMetric::AttributeMean => {
+                        c.attribute_mean * attr_range + self.min_attribute_value
+                    }
+                };
+                (c.bbox, value)
+            })
+            .collect()
+    }
+
+    /// Legend/units label for `metric`, for naming a saved snapshot.
+    pub fn metric_label(&self, metric: HeatmapMetric) -> String {
+        match metric {
+            HeatmapMetric::Density => "density (points/cell)".to_string(),
+            HeatmapMetric::Unpredictability => match self.measurement_type {
+                MeasurementType::Variance => "unpredictability (variance)".to_string(),
+                MeasurementType::KernalDensity => "unpredictability (entropy)".to_string(),
+            },
+            HeatmapMetric::AttributeMean => format!("{} (avg)", self.attribute_name),
+        }
+    }
+}
+
+/// Kind of analysis a `SavedHeatmap` snapshot came from — just for the layer
+/// panel's icon/label, doesn't affect export/render logic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeatmapKind {
+    Quadtree,
+    Kde,
+}
+
+/// A named, persisted snapshot of a built heatmap/KDE grid, stored under the
+/// layer it was built for (mirrors `LayerSelection`). Cells are raw
+/// (physical-unit) values, not the 0..1 scores `HeatmapLayer` renders with,
+/// so it can be rasterized to an exact-magnitude GeoTIFF or raster layer.
+pub struct SavedHeatmap {
+    pub name: String,
+    pub kind: HeatmapKind,
+    /// Enclosing bbox of every cell — the default export/promote extent.
+    pub bbox: [f64; 4],
+    pub cells: Vec<([f64; 4], f32)>,
+    pub units: String,
+}
+
+impl SavedHeatmap {
+    pub fn new(name: String, kind: HeatmapKind, cells: Vec<([f64; 4], f32)>, units: String) -> Self {
+        let bbox = cells.iter().fold(
+            [f64::MAX, f64::MAX, f64::MIN, f64::MIN],
+            |acc, (b, _)| {
+                [
+                    acc[0].min(b[0]),
+                    acc[1].min(b[1]),
+                    acc[2].max(b[2]),
+                    acc[3].max(b[3]),
+                ]
+            },
+        );
+        Self { name, kind, bbox, cells, units }
+    }
+}
+
+/// Cap so a too-fine `cell_size` can't allocate unbounded memory; doubles the
+/// cell size until the grid fits instead of failing outright.
+const RASTERIZE_MAX_CELLS: usize = 16_000_000;
+
+/// Rasterizes arbitrary (possibly irregular, e.g. quadtree-leaf) `cells` onto
+/// a uniform grid covering `bbox`. Each source cell writes to every output
+/// pixel its bbox overlaps, so cost is linear in output pixels (source cells
+/// tile space without overlap) rather than pixels × cells — same technique as
+/// `kde::build_kde_grid`'s per-point cell range. Returns
+/// `(width, height, actual_cell_size, values)`; `values` is row-major, row 0
+/// = north edge, `NAN` where no source cell covered that pixel.
+pub fn rasterize_cells(
+    cells: &[([f64; 4], f32)],
+    bbox: [f64; 4],
+    cell_size: f64,
+) -> (usize, usize, f64, Vec<f32>) {
+    let [xmin, ymin, xmax, ymax] = bbox;
+    let mut cell_size = cell_size.max(1e-12);
+    let mut width = (((xmax - xmin) / cell_size).ceil() as usize).max(1);
+    let mut height = (((ymax - ymin) / cell_size).ceil() as usize).max(1);
+    while width.saturating_mul(height) > RASTERIZE_MAX_CELLS {
+        cell_size *= 2.0;
+        width = (((xmax - xmin) / cell_size).ceil() as usize).max(1);
+        height = (((ymax - ymin) / cell_size).ceil() as usize).max(1);
+    }
+
+    let mut grid = vec![f32::NAN; width * height];
+    for (cbbox, value) in cells {
+        let col0 = (((cbbox[0] - xmin) / cell_size).floor().max(0.0)) as usize;
+        let col1 = ((((cbbox[2] - xmin) / cell_size).ceil()) as usize).min(width);
+        let row0 = (((ymax - cbbox[3]) / cell_size).floor().max(0.0)) as usize;
+        let row1 = ((((ymax - cbbox[1]) / cell_size).ceil()) as usize).min(height);
+        for row in row0..row1 {
+            for col in col0..col1 {
+                grid[row * width + col] = *value;
+            }
+        }
+    }
+    (width, height, cell_size, grid)
 }

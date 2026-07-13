@@ -4,6 +4,7 @@ use arrow::array::{BinaryArray, Float64Array, Int64Array, StringArray, UInt32Arr
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::gis_layer::{AttributeValue, GisFeature, GisLayer};
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 
 /// Builds the geometry + attribute + `idx` record batch shared by every
@@ -102,4 +103,35 @@ pub fn export_points_by_ids(pc: &PointCloudLayer, ids: &[usize], path: &str) -> 
     let bytes = export_points_by_ids_bytes(pc, ids)?;
     std::fs::write(path, bytes)?;
     Ok(())
+}
+
+fn feature_to_geojson(f: &GisFeature) -> geojson::Feature {
+    let mut properties = geojson::JsonObject::new();
+    for (k, v) in &f.attributes {
+        let val = match v {
+            AttributeValue::Text(s) => serde_json::Value::String(s.clone()),
+            AttributeValue::Integer(i) => serde_json::json!(*i),
+            AttributeValue::Float(x) => serde_json::json!(*x),
+        };
+        properties.insert(k.clone(), val);
+    }
+    geojson::Feature {
+        bbox: None,
+        geometry: Some(geojson::Geometry::new(geojson::Value::from(&f.geometry))),
+        id: None,
+        properties: Some(properties),
+        foreign_members: None,
+    }
+}
+
+/// Serializes every feature in a vector layer to GeoJSON bytes — no filter
+/// concept exists for vector layers today (unlike Points), so this is
+/// always the whole layer.
+pub fn export_vector_geojson_bytes(gl: &GisLayer) -> anyhow::Result<Vec<u8>> {
+    let fc = geojson::FeatureCollection {
+        bbox: None,
+        features: gl.features.iter().map(feature_to_geojson).collect(),
+        foreign_members: None,
+    };
+    Ok(geojson::GeoJson::from(fc).to_string().into_bytes())
 }

@@ -399,6 +399,165 @@ impl GisEditorApp {
             }
             self.kde_window_open = open;
         }
+
+        // ── Export window ───────────────────────────────────────────────────────
+        if self.export_window_open {
+            let mut open = true;
+            egui::Window::new("Export Layer")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_size([320.0, 140.0])
+                .show(ui.ctx(), |ui| {
+                    let Some(idx) = self.active_layer_idx else {
+                        ui.label("Select a layer first.");
+                        return;
+                    };
+                    let Some(entry) = self.layers.get(idx) else {
+                        ui.label("Select a layer first.");
+                        return;
+                    };
+                    ui.label(format!("Layer: {}", entry.name));
+                    ui.separator();
+                    match &entry.data {
+                        LayerKind::Points(_) => {
+                            ui.label(format!(
+                                "{} of {} points pass current filters.",
+                                entry.data.filtered_count(),
+                                entry.data.feature_count()
+                            ));
+                            if ui.button("Export as GeoParquet…").clicked() {
+                                self.export_active_layer();
+                            }
+                        }
+                        LayerKind::Vector(gl) => {
+                            ui.label(format!("{} features.", gl.features.len()));
+                            if ui.button("Export as GeoJSON…").clicked() {
+                                self.export_active_layer();
+                            }
+                        }
+                        LayerKind::Raster(r) => {
+                            ui.label(format!(
+                                "{} × {} px, band: {}",
+                                r.width,
+                                r.height,
+                                r.variable()
+                            ));
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if ui.button("Export as GeoTIFF…").clicked() {
+                                self.export_active_layer();
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            ui.label("GeoTIFF export isn't available in the browser build.");
+                        }
+                    }
+                });
+            self.export_window_open = open;
+        }
+    }
+
+    /// Dispatches to the export routine matching the active layer's kind —
+    /// GeoParquet (Points), GeoJSON (Vector), GeoTIFF (Raster) — via a native
+    /// save dialog (desktop) or browser download (wasm).
+    fn export_active_layer(&mut self) {
+        let Some(idx) = self.active_layer_idx else { return };
+        let Some(entry) = self.layers.get(idx) else { return };
+        let name = entry.name.clone();
+
+        match &entry.data {
+            LayerKind::Points(pc) => {
+                let pc_export = super::ui_sidebar::clone_pc_for_export(pc);
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::spawn(move || {
+                    if let Some(path) = pollster::block_on(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("GeoParquet", &["parquet"])
+                            .set_file_name(format!("{name}_export.parquet"))
+                            .save_file(),
+                    ) {
+                        let _ = crate::exporter::export_filtered_points(
+                            &pc_export,
+                            path.path().to_string_lossy().as_ref(),
+                        );
+                    }
+                });
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Ok(bytes) = crate::exporter::export_filtered_points_bytes(&pc_export) {
+                        if let Some(file) = rfd::AsyncFileDialog::new()
+                            .add_filter("GeoParquet", &["parquet"])
+                            .set_file_name(format!("{name}_export.parquet"))
+                            .save_file()
+                            .await
+                        {
+                            let _ = file.write(&bytes).await;
+                        }
+                    }
+                });
+            }
+            LayerKind::Vector(gl) => {
+                let bytes = crate::exporter::export_vector_geojson_bytes(gl);
+                let Ok(bytes) = bytes else { return };
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::spawn(move || {
+                    if let Some(path) = pollster::block_on(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("GeoJSON", &["geojson", "json"])
+                            .set_file_name(format!("{name}_export.geojson"))
+                            .save_file(),
+                    ) {
+                        let _ = std::fs::write(path.path(), bytes);
+                    }
+                });
+                #[cfg(target_arch = "wasm32")]
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Some(file) = rfd::AsyncFileDialog::new()
+                        .add_filter("GeoJSON", &["geojson", "json"])
+                        .set_file_name(format!("{name}_export.geojson"))
+                        .save_file()
+                        .await
+                    {
+                        let _ = file.write(&bytes).await;
+                    }
+                });
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            LayerKind::Raster(r) => {
+                let width = r.width;
+                let height = r.height;
+                let extent = r.extent;
+                let band = match &r.display_mode {
+                    crate::gis_layer::RasterDisplayMode::Single(i) => &r.bands[*i],
+                    crate::gis_layer::RasterDisplayMode::Rgb { r: bi, .. } => &r.bands[*bi],
+                };
+                // Clip to the display range currently set on the band's
+                // min/max sliders, not the full raw data range — so the
+                // exported file reflects what's actually on screen.
+                let (lo, hi) = (band.display_min as f32, band.display_max as f32);
+                let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                let values: Vec<f32> = band.values.iter().map(|v| v.clamp(lo, hi)).collect();
+                std::thread::spawn(move || {
+                    if let Some(path) = pollster::block_on(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("GeoTIFF", &["tif", "tiff"])
+                            .set_file_name(format!("{name}_export.tif"))
+                            .save_file(),
+                    ) {
+                        if let Err(e) = crate::raster_reader::write_geotiff(
+                            &path.path().to_path_buf(),
+                            width,
+                            height,
+                            &values,
+                            extent,
+                        ) {
+                            eprintln!("[raster export] error: {e:#}");
+                        }
+                    }
+                });
+            }
+            #[cfg(target_arch = "wasm32")]
+            LayerKind::Raster(_) => {}
+        }
     }
 
     /// Spawns a background thread that builds a KDE grid over the active
@@ -457,8 +616,19 @@ impl GisEditorApp {
 
         std::thread::spawn(move || {
             let cells = crate::kde::build_kde_grid(&points, weights.as_deref(), bbox, &params);
+            let saved = crate::heatmap::SavedHeatmap::new(
+                format!(
+                    "KDE {} r={:.3} — {}",
+                    params.kernel.short_label(),
+                    params.radius,
+                    attribute_name
+                ),
+                crate::heatmap::HeatmapKind::Kde,
+                cells.clone(),
+                attribute_name.clone(),
+            );
             let heatmap = crate::heatmap::HeatmapLayer::from_kde_cells(cells, attribute_name);
-            tx.send((idx, heatmap)).ok();
+            tx.send((idx, heatmap, saved)).ok();
         });
     }
 }

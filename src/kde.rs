@@ -33,6 +33,15 @@ impl KdeKernel {
         }
     }
 
+    /// Same as `label` but without the "(default)" annotation — for compact
+    /// contexts like an auto-generated saved-heatmap name.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            KdeKernel::Quartic => "Quartic",
+            other => other.label(),
+        }
+    }
+
     /// Kernel value at `dist` from the point, for a kernel of bandwidth `radius`.
     /// Zero outside the radius; each shape is normalized to integrate to 1
     /// over the disk of that radius (standard 2D kernel-density formulas).

@@ -505,6 +505,7 @@ pub fn render_raster_overlay(
     rect: Rect,
     texture_cache: &mut Option<egui::TextureHandle>,
     dirty: bool,
+    opacity: u8,
 ) {
     if dirty || texture_cache.is_none() {
         let rgba = bake_raster_rgba(raster);
@@ -517,13 +518,14 @@ pub fn render_raster_overlay(
     }
     let Some(texture) = texture_cache else { return };
 
-    let top_left = viewport.world_to_screen(-180.0, 90.0, rect);
-    let bottom_right = viewport.world_to_screen(180.0, -90.0, rect);
+    let [xmin, ymin, xmax, ymax] = raster.extent;
+    let top_left = viewport.world_to_screen(xmin, ymax, rect);
+    let bottom_right = viewport.world_to_screen(xmax, ymin, rect);
     let screen_rect = Rect::from_two_pos(top_left, bottom_right);
     painter.image(
         texture.id(),
         screen_rect,
         Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-        Color32::WHITE,
+        Color32::from_white_alpha(opacity),
     );
 }

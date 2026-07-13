@@ -209,6 +209,11 @@ impl GisEditorApp {
                         });
                     }
                     ui.separator();
+                    if ui.button("Export…").clicked() {
+                        ui.close_kind(UiKind::Menu);
+                        self.export_window_open = true;
+                    }
+                    ui.separator();
                     #[cfg(not(target_arch = "wasm32"))]
                     if ui.button("Save Snapshot…").clicked() {
                         ui.close_kind(UiKind::Menu);

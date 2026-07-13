@@ -1515,6 +1515,8 @@ impl GisReader {
             heatmap_dirty: true,
             show_kde: false,
             kde_cache: None,
+            saved_heatmaps: Vec::new(),
+            active_saved_heatmap: None,
         }
     }
 }

@@ -161,13 +161,17 @@ fn band_stats(values: &[f32]) -> (f64, f64) {
     if lo.is_finite() && hi.is_finite() { (lo, hi) } else { (0.0, 0.0) }
 }
 
-fn build_layer_entry(
+/// Builds a raster `LayerEntry` from decoded band grids. `extent` is the
+/// world bbox the grid spans — `[-180,-90,180,90]` for loaded GeoTIFFs, or a
+/// local bbox for rasters synthesized in-app (e.g. a promoted saved heatmap).
+pub fn build_layer_entry(
     name: String,
     width: usize,
     height: usize,
     bands_raw: Vec<Vec<f32>>,
     units: String,
     location: GisFilePath,
+    extent: [f64; 4],
 ) -> LayerEntry {
     let single = bands_raw.len() == 1;
     let bands: Vec<RasterBand> = bands_raw.into_iter().enumerate().map(|(i, values)| {
@@ -186,6 +190,7 @@ fn build_layer_entry(
         display_mode: RasterDisplayMode::Single(0),
         bands,
         units,
+        extent,
     };
 
     LayerEntry {
@@ -218,7 +223,34 @@ fn build_layer_entry(
         heatmap_dirty: true,
         show_kde: false,
         kde_cache: None,
+        saved_heatmaps: Vec::new(),
+        active_saved_heatmap: None,
     }
+}
+
+/// Recovers the world bbox a GeoTIFF was written at from `ModelPixelScaleTag`
+/// (33550) + `ModelTiepointTag` (33922) — the tags `write_geotiff` embeds.
+/// `None` if either tag is absent (climate-style rasters this app also loads
+/// have neither and are assumed full-globe by the caller).
+fn read_geo_extent<R: std::io::Read + std::io::Seek>(
+    decoder: &mut Decoder<R>,
+    width: usize,
+    height: usize,
+) -> Option<[f64; 4]> {
+    let scale = decoder.get_tag_f64_vec(Tag::ModelPixelScaleTag).ok()?;
+    let tiepoint = decoder.get_tag_f64_vec(Tag::ModelTiepointTag).ok()?;
+    if scale.len() < 2 || tiepoint.len() < 6 {
+        return None;
+    }
+    let (sx, sy) = (scale[0], scale[1]);
+    // Tiepoint is (raster_i, raster_j, raster_k) -> (model_x, model_y, model_z);
+    // `write_geotiff` always ties raster (0,0) to the grid's (xmin, ymax).
+    let (ri, rj, mx, my) = (tiepoint[0], tiepoint[1], tiepoint[3], tiepoint[4]);
+    let xmin = mx - ri * sx;
+    let ymax = my + rj * sy;
+    let xmax = xmin + width as f64 * sx;
+    let ymin = ymax - height as f64 * sy;
+    Some([xmin, ymin, xmax, ymax])
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -227,6 +259,8 @@ pub fn load_raster_sync(path: &std::path::Path) -> Result<LayerEntry> {
     let mut decoder = Decoder::new(std::io::BufReader::new(file))?;
     let units = decoder.get_tag_ascii_string(Tag::ImageDescription).unwrap_or_default();
     let (width, height, bands) = decode_bands(&mut decoder)?;
+    let extent = read_geo_extent(&mut decoder, width, height)
+        .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
 
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
     let (variable, date) = parse_name(stem);
@@ -235,7 +269,45 @@ pub fn load_raster_sync(path: &std::path::Path) -> Result<LayerEntry> {
     Ok(build_layer_entry(
         name, width, height, bands, units,
         GisFilePath::LocalFile(path.to_string_lossy().into_owned()),
+        extent,
     ))
+}
+
+/// Writes a single-band 32-bit float GeoTIFF, georeferenced (geographic
+/// WGS84) by `bbox` — used to export saved heatmaps/KDE grids. `values` is
+/// row-major, row 0 = north edge, NaN = no data.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_geotiff(
+    path: &std::path::Path,
+    width: usize,
+    height: usize,
+    values: &[f32],
+    bbox: [f64; 4],
+) -> Result<()> {
+    use tiff::encoder::{colortype::Gray32Float, TiffEncoder};
+
+    let [xmin, ymin, xmax, ymax] = bbox;
+    let file = std::fs::File::create(path)?;
+    let mut tiff = TiffEncoder::new(file)?;
+    let mut img = tiff.new_image::<Gray32Float>(width as u32, height as u32)?;
+
+    let pixel_scale_x = (xmax - xmin) / width as f64;
+    let pixel_scale_y = (ymax - ymin) / height as f64;
+    img.encoder()
+        .write_tag(Tag::ModelPixelScaleTag, &[pixel_scale_x, pixel_scale_y, 0.0][..])?;
+    img.encoder()
+        .write_tag(Tag::ModelTiepointTag, &[0.0, 0.0, 0.0, xmin, ymax, 0.0][..])?;
+    // Minimal GeoKeyDirectory: geographic WGS84 (EPSG:4326), pixel-is-area.
+    let geo_keys: [u16; 16] = [
+        1, 1, 0, 3, // KeyDirectoryVersion, KeyRevision, MinorRevision, NumberOfKeys
+        1024, 0, 1, 2, // GTModelTypeGeoKey = 2 (Geographic)
+        1025, 0, 1, 1, // GTRasterTypeGeoKey = 1 (PixelIsArea)
+        2048, 0, 1, 4326, // GeographicTypeGeoKey = 4326 (WGS 84)
+    ];
+    img.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geo_keys[..])?;
+
+    img.write_data(values)?;
+    Ok(())
 }
 
 pub fn load_raster_bytes(bytes: Vec<u8>, filename: &str) -> Result<LayerEntry> {
@@ -243,6 +315,8 @@ pub fn load_raster_bytes(bytes: Vec<u8>, filename: &str) -> Result<LayerEntry> {
     let mut decoder = Decoder::new(std::io::Cursor::new(bytes))?;
     let units = decoder.get_tag_ascii_string(Tag::ImageDescription).unwrap_or_default();
     let (width, height, bands) = decode_bands(&mut decoder)?;
+    let extent = read_geo_extent(&mut decoder, width, height)
+        .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
 
     let stem = filename.strip_suffix(".tif").or_else(|| filename.strip_suffix(".tiff")).unwrap_or(filename);
     let (variable, date) = parse_name(stem);
@@ -251,5 +325,6 @@ pub fn load_raster_bytes(bytes: Vec<u8>, filename: &str) -> Result<LayerEntry> {
     Ok(build_layer_entry(
         name, width, height, bands, units,
         GisFilePath::Bytes(raw, filename.to_string()),
+        extent,
     ))
 }

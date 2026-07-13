@@ -318,8 +318,10 @@ pub enum RasterDisplayMode {
     Rgb { r: usize, g: usize, b: usize },
 }
 
-/// A dense lon/lat grid. Canonical layout: full -180..180 / -90..90 canvas,
-/// row 0 = lat +90 (north), col 0 = lon -180, row-major.
+/// A dense grid, row 0 = north edge, col 0 = west edge, row-major. Loaded
+/// GeoTIFFs use the canonical full -180..180 / -90..90 canvas; rasters
+/// synthesized in-app (e.g. a saved heatmap promoted to a layer) carry
+/// whatever local `extent` they were built over instead.
 #[derive(Debug, Clone)]
 pub struct RasterData {
     pub width: usize,
@@ -328,6 +330,11 @@ pub struct RasterData {
     /// Unit label parsed from the source file, e.g. "K" — empty if unknown.
     pub units: String,
     pub display_mode: RasterDisplayMode,
+    /// World bbox [xmin, ymin, xmax, ymax] this grid spans. The flat-map
+    /// overlay renderer maps the grid onto this rect; the globe renderer
+    /// still assumes the full -180..180/-90..90 canvas regardless of this
+    /// field (arbitrary-extent rasters won't display correctly in Globe view).
+    pub extent: [f64; 4],
 }
 
 impl RasterData {
@@ -518,7 +525,7 @@ impl LayerKind {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.bbox,
             LayerKind::Vector(gis_layer) => Some(gis_layer.world_bbox),
-            LayerKind::Raster(_) => Some([-180.0, -90.0, 180.0, 90.0]),
+            LayerKind::Raster(r) => Some(r.extent),
         }
     }
     pub fn hit_test(&self, x: f64, y: f64, tolerance: f64) -> Option<usize> {
@@ -575,6 +582,12 @@ pub struct LayerEntry {
     /// Independent of `show_heatmap`/`heatmap_cache` (quadtree-based).
     pub show_kde: bool,
     pub kde_cache: Option<crate::heatmap::HeatmapLayer>,
+    /// Named heatmap/KDE snapshots saved under this layer, for later export
+    /// to GeoTIFF or promotion to a raster layer — mirrors `selections`.
+    pub saved_heatmaps: Vec<crate::heatmap::SavedHeatmap>,
+    /// Index into `saved_heatmaps` currently loaded into `kde_cache` for
+    /// display, if any — drives the selected-row highlight in the layer panel.
+    pub active_saved_heatmap: Option<usize>,
 }
 impl LayerEntry {}
 

@@ -153,12 +153,12 @@ impl GisEditorApp {
                     return None;
                 }
                 if let LayerKind::Raster(r) = &l.data {
-                    Some(r)
+                    Some((r, l.opacity))
                 } else {
                     None
                 }
             });
-            if let Some(raster) = visible_raster {
+            if let Some((raster, opacity)) = visible_raster {
                 render_raster_overlay(
                     ui,
                     &painter,
@@ -167,6 +167,7 @@ impl GisEditorApp {
                     response.rect,
                     &mut self.raster_texture,
                     self.flat_raster_dirty,
+                    opacity,
                 );
                 self.flat_raster_dirty = false;
             }
