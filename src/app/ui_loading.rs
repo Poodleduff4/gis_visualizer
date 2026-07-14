@@ -186,6 +186,7 @@ impl GisEditorApp {
                                 viewport: snap.viewport,
                                 display: snap.display,
                                 analysis: snap.analysis,
+                                pending_selections: Vec::new(),
                             });
                             self.open_snapshot_layer(first);
                         } else {

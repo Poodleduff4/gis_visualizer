@@ -6,9 +6,7 @@ use futures_channel::oneshot;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
 
-use crate::filter::FilterLogic;
-#[cfg(target_arch = "wasm32")]
-use crate::filter::{FilterOperation, LayerAttributeFilter};
+use crate::filter::{FilterLogic, FilterOperation, LayerAttributeFilter};
 use crate::gis_layer::{ramp_rgba, AttributeValue, LayerKind, RasterDisplayMode};
 use crate::gpu_collect::collect_gpu_points;
 use crate::histogram::{
@@ -38,6 +36,73 @@ pub(super) fn clone_pc_for_export(
         bbox: None,
         viewport_mask: bitvec![0; 0],
     }
+}
+
+/// Evaluates `filters` against `pc`'s in-memory attribute columns, returning
+/// the (parquet-file-relative) ids of points that pass. Used as the wasm
+/// path always (no local DataFusion), and as the native path's fallback for
+/// any Points layer with no real backing file to query — e.g. one a plugin
+/// added via `AddLayer`/`UpdateLayer`, whose `descriptor.location` is empty.
+fn evaluate_filters_in_memory(
+    pc: &crate::point_cloud_layer::PointCloudLayer,
+    filters: &[LayerAttributeFilter],
+    use_and: bool,
+) -> Vec<u32> {
+    use crate::point_cloud_layer::AttributeColumn;
+    let field_names = &pc.field_names;
+    let attributes = &pc.attributes;
+    pc.points
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, (parquet_id, _))| {
+            let eval = |f: &LayerAttributeFilter| {
+                let Some(attr) = f.attribute.as_deref() else {
+                    return false;
+                };
+                let Some(col_pos) = field_names.iter().position(|n| n == attr) else {
+                    return false;
+                };
+                let Some(col) = attributes.get(col_pos) else {
+                    return false;
+                };
+                let raw = &f.comparitor_raw;
+                match (&f.operation, col) {
+                    (Some(FilterOperation::GreaterThan), AttributeColumn::Float(v)) => raw
+                        .parse::<f64>()
+                        .map(|t| v[pos] > t)
+                        .unwrap_or(false),
+                    (Some(FilterOperation::LessThan), AttributeColumn::Float(v)) => raw
+                        .parse::<f64>()
+                        .map(|t| v[pos] < t)
+                        .unwrap_or(false),
+                    (Some(FilterOperation::Equal), AttributeColumn::Float(v)) => raw
+                        .parse::<f64>()
+                        .map(|t| (v[pos] - t).abs() < 1e-9)
+                        .unwrap_or(false),
+                    (Some(FilterOperation::GreaterThan), AttributeColumn::Integer(v)) => raw
+                        .parse::<i64>()
+                        .map(|t| v[pos] > t)
+                        .unwrap_or(false),
+                    (Some(FilterOperation::LessThan), AttributeColumn::Integer(v)) => raw
+                        .parse::<i64>()
+                        .map(|t| v[pos] < t)
+                        .unwrap_or(false),
+                    (Some(FilterOperation::Equal), AttributeColumn::Integer(v)) => raw
+                        .parse::<i64>()
+                        .map(|t| v[pos] == t)
+                        .unwrap_or(false),
+                    (Some(FilterOperation::Equal), AttributeColumn::Text(v)) => v[pos] == *raw,
+                    _ => false,
+                }
+            };
+            let passes = if use_and {
+                filters.iter().all(|f| eval(f))
+            } else {
+                filters.iter().any(|f| eval(f))
+            };
+            passes.then_some(*parquet_id)
+        })
+        .collect()
 }
 
 fn union_bboxes(bboxes: &[[f64; 4]]) -> Option<[f64; 4]> {
@@ -539,6 +604,95 @@ impl GisEditorApp {
                                         kde_cache: None,
                                         saved_heatmaps: Vec::new(),
                                         active_saved_heatmap: None,
+                                        show_bivariate_grid: false,
+                                        bivariate_grid_cache: None,
+                                        saved_bivariate_grids: Vec::new(),
+                                        active_saved_bivariate_grid: None,
+                                    });
+                                    self.active_layer_idx = Some(self.layers.len() - 1);
+                                }
+                            }
+                        }
+                        SidebarAction::CreateLayerFromFiltered => {
+                            if let Some(li) = self.active_layer_idx {
+                                if let LayerKind::Points(pc) = &self.layers[li].data {
+                                    let ids: Vec<usize> = pc
+                                        .filter_mask
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, b)| **b)
+                                        .map(|(i, _)| i)
+                                        .collect();
+                                    let n = ids.len();
+                                    let new_name = format!("{}_filtered", self.layers[li].name);
+                                    let color = self.layers[li].color;
+                                    let opacity = self.layers[li].opacity;
+                                    let mut descriptor = self.layers[li].descriptor.clone();
+                                    descriptor.name = new_name.clone();
+                                    descriptor.num_features = n as u64;
+
+                                    let new_points: Vec<(u32, [f64; 2])> =
+                                        ids.iter().map(|&id| pc.points[id]).collect();
+                                    let new_attrs: Vec<crate::point_cloud_layer::AttributeColumn> = pc
+                                        .attributes
+                                        .iter()
+                                        .map(|col| match col {
+                                            crate::point_cloud_layer::AttributeColumn::Text(v) => {
+                                                crate::point_cloud_layer::AttributeColumn::Text(
+                                                    ids.iter().map(|&id| v[id].clone()).collect(),
+                                                )
+                                            }
+                                            crate::point_cloud_layer::AttributeColumn::Integer(v) => {
+                                                crate::point_cloud_layer::AttributeColumn::Integer(
+                                                    ids.iter().map(|&id| v[id]).collect(),
+                                                )
+                                            }
+                                            crate::point_cloud_layer::AttributeColumn::Float(v) => {
+                                                crate::point_cloud_layer::AttributeColumn::Float(
+                                                    ids.iter().map(|&id| v[id]).collect(),
+                                                )
+                                            }
+                                        })
+                                        .collect();
+                                    let mut new_pc = crate::point_cloud_layer::PointCloudLayer {
+                                        points: std::sync::Arc::new(new_points),
+                                        attributes: new_attrs,
+                                        field_names: pc.field_names.clone(),
+                                        index: None,
+                                        bbox: None,
+                                        viewport_mask: bitvec![0; n],
+                                        filter_mask: bitvec![1; n],
+                                    };
+                                    new_pc.ensure_bbox();
+
+                                    self.layers.push(crate::gis_layer::LayerEntry {
+                                        data: LayerKind::Points(new_pc),
+                                        visible: true,
+                                        show_points: true,
+                                        name: new_name,
+                                        color,
+                                        opacity,
+                                        descriptor,
+                                        filters: Vec::new(),
+                                        filter_logic: FilterLogic::default(),
+                                        roi_bboxes: Vec::new(),
+                                        selections: Vec::new(),
+                                        active_selection: None,
+                                        crs_transform: None,
+                                        show_index: false,
+                                        index_kind: crate::spatial_index::IndexKind::Quadtree,
+                                        show_heatmap: false,
+                                        heatmap_metric: crate::heatmap::HeatmapMetric::Density,
+                                        heatmap_cache: None,
+                                        heatmap_dirty: true,
+                                        show_kde: false,
+                                        kde_cache: None,
+                                        saved_heatmaps: Vec::new(),
+                                        active_saved_heatmap: None,
+                                        show_bivariate_grid: false,
+                                        bivariate_grid_cache: None,
+                                        saved_bivariate_grids: Vec::new(),
+                                        active_saved_bivariate_grid: None,
                                     });
                                     self.active_layer_idx = Some(self.layers.len() - 1);
                                 }
@@ -703,8 +857,19 @@ impl GisEditorApp {
                     self.roi_rebuild_pending = true;
                 }
                 _ => {
+                    let use_and = layer.filter_logic == FilterLogic::And;
+                    // No real backing file to query (e.g. a plugin-added
+                    // Points layer via AddLayer/UpdateLayer — its
+                    // `descriptor.location` is always empty) — the
+                    // DataFusion query below would just run against a
+                    // nonexistent file and return zero rows, filtering out
+                    // every point. Evaluate in memory instead, same as wasm
+                    // (which has no local DataFusion at all) always does.
+                    let file_path = layer.descriptor.location.to_string();
+                    let no_backing_file = file_path.is_empty();
+
                     #[cfg(not(target_arch = "wasm32"))]
-                    {
+                    if !no_backing_file {
                         let join_op = match layer.filter_logic {
                             FilterLogic::And => " AND ",
                             FilterLogic::Or => " OR ",
@@ -727,7 +892,6 @@ impl GisEditorApp {
                             .collect::<Vec<String>>()
                             .join(join_op);
                         let query = format!("SELECT \"idx\" FROM layer WHERE {}", where_clause);
-                        let file_path = layer.descriptor.location.to_string();
                         let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
                         self.filtered_idx_rx = Some(rx);
                         std::thread::spawn(move || {
@@ -749,94 +913,14 @@ impl GisEditorApp {
                         });
                     }
                     #[cfg(target_arch = "wasm32")]
-                    {
-                        use crate::point_cloud_layer::AttributeColumn;
-                        let use_and = layer.filter_logic == FilterLogic::And;
-                        let matching_ids: Vec<u32> = if let LayerKind::Points(pc) = &layer.data {
-                            let filters = &layer.filters;
-                            let field_names = &pc.field_names;
-                            let attributes = &pc.attributes;
-                            pc.points
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(pos, (parquet_id, _))| {
-                                    let eval = |f: &LayerAttributeFilter| {
-                                        let Some(attr) = f.attribute.as_deref() else {
-                                            return false;
-                                        };
-                                        let Some(col_pos) =
-                                            field_names.iter().position(|n| n == attr)
-                                        else {
-                                            return false;
-                                        };
-                                        let Some(col) = attributes.get(col_pos) else {
-                                            return false;
-                                        };
-                                        let raw = &f.comparitor_raw;
-                                        match (&f.operation, col) {
-                                            (
-                                                Some(FilterOperation::GreaterThan),
-                                                AttributeColumn::Float(v),
-                                            ) => raw
-                                                .parse::<f64>()
-                                                .map(|t| v[pos] > t)
-                                                .unwrap_or(false),
-                                            (
-                                                Some(FilterOperation::LessThan),
-                                                AttributeColumn::Float(v),
-                                            ) => raw
-                                                .parse::<f64>()
-                                                .map(|t| v[pos] < t)
-                                                .unwrap_or(false),
-                                            (
-                                                Some(FilterOperation::Equal),
-                                                AttributeColumn::Float(v),
-                                            ) => raw
-                                                .parse::<f64>()
-                                                .map(|t| (v[pos] - t).abs() < 1e-9)
-                                                .unwrap_or(false),
-                                            (
-                                                Some(FilterOperation::GreaterThan),
-                                                AttributeColumn::Integer(v),
-                                            ) => raw
-                                                .parse::<i64>()
-                                                .map(|t| v[pos] > t)
-                                                .unwrap_or(false),
-                                            (
-                                                Some(FilterOperation::LessThan),
-                                                AttributeColumn::Integer(v),
-                                            ) => raw
-                                                .parse::<i64>()
-                                                .map(|t| v[pos] < t)
-                                                .unwrap_or(false),
-                                            (
-                                                Some(FilterOperation::Equal),
-                                                AttributeColumn::Integer(v),
-                                            ) => raw
-                                                .parse::<i64>()
-                                                .map(|t| v[pos] == t)
-                                                .unwrap_or(false),
-                                            (
-                                                Some(FilterOperation::Equal),
-                                                AttributeColumn::Text(v),
-                                            ) => v[pos] == *raw,
-                                            _ => false,
-                                        }
-                                    };
-                                    let passes = if use_and {
-                                        filters.iter().all(|f| eval(f))
-                                    } else {
-                                        filters.iter().any(|f| eval(f))
-                                    };
-                                    if passes {
-                                        Some(*parquet_id)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
+                    let no_backing_file = true;
+
+                    if no_backing_file {
+                        let matching_ids = match &layer.data {
+                            LayerKind::Points(pc) => {
+                                evaluate_filters_in_memory(pc, &layer.filters, use_and)
+                            }
+                            _ => Vec::new(),
                         };
                         let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
                         self.filtered_idx_rx = Some(rx);
@@ -982,6 +1066,80 @@ impl GisEditorApp {
                     self.kde_running = false;
                     self.status = "KDE failed.".to_string();
                 }
+            }
+        }
+        if let Some(rx) = &mut self.bivariate_grid_rx {
+            match rx.try_recv() {
+                Ok(Some((layer_idx, layer, saved))) => {
+                    self.bivariate_grid_rx = None;
+                    self.bivariate_grid_running = false;
+                    if let Some(entry) = self.layers.get_mut(layer_idx) {
+                        entry.bivariate_grid_cache = Some(layer);
+                        entry.show_bivariate_grid = true;
+                        entry.saved_bivariate_grids.push(saved);
+                        entry.active_saved_bivariate_grid =
+                            Some(entry.saved_bivariate_grids.len() - 1);
+                    }
+                    self.status = "Bivariate grid done.".to_string();
+                }
+                Ok(None) => {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(_) => {
+                    self.bivariate_grid_rx = None;
+                    self.bivariate_grid_running = false;
+                    self.status = "Bivariate grid failed.".to_string();
+                }
+            }
+        }
+        if let Some(rx) = &mut self.raster_export_rx {
+            match rx.try_recv() {
+                Ok(Some((layer_idx, path_str))) => {
+                    self.raster_export_rx = None;
+                    if let Some(entry) = self.layers.get_mut(layer_idx) {
+                        entry.descriptor.location = crate::gis_reader::GisFilePath::LocalFile(path_str);
+                    }
+                }
+                Ok(None) => {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(_) => {
+                    self.raster_export_rx = None;
+                }
+            }
+        }
+    }
+
+    /// Turns snapshot-restored selections into real `LayerSelection`s once
+    /// their layer's filters have actually resolved (`updated_filters`
+    /// cleared and no `filtered_idx_rx` query in flight) — computing ids any
+    /// earlier would bake in a stale, unfiltered result. See
+    /// `open_snapshot_layer`/the layer-settings-restore block in `mod.rs`,
+    /// which defers into `pending_selections` instead of building ids inline.
+    pub(super) fn resolve_pending_snapshot_selections(&mut self) {
+        let Some(restore) = &self.snapshot_restore else { return };
+        if restore.pending_selections.is_empty() {
+            return;
+        }
+        if self.updated_filters || self.filtered_idx_rx.is_some() {
+            return;
+        }
+        let pending = std::mem::take(
+            &mut self.snapshot_restore.as_mut().unwrap().pending_selections,
+        );
+        for (layer_idx, selections, active) in pending {
+            if let Some(layer) = self.layers.get_mut(layer_idx) {
+                for s in &selections {
+                    let ids = layer.data.ids_in_bbox_with_fallback(s.bbox);
+                    layer.selections.push(crate::gis_layer::LayerSelection {
+                        name: s.name.clone(),
+                        bbox: s.bbox,
+                        ids,
+                    });
+                }
+                layer.active_selection = active;
             }
         }
     }

@@ -13,6 +13,9 @@ pub(super) enum ParamEditValue {
     Integer(String),
     Float(String),
     Bool(bool),
+    /// Selected layer index, if any — `None` until the user picks one (or
+    /// `ui` auto-selects the sole matching layer).
+    Layer(Option<usize>),
 }
 
 impl ParamEditValue {
@@ -37,6 +40,11 @@ impl ParamEditValue {
                     .unwrap_or_default(),
             ),
             ParamKind::Bool => Self::Bool(default.and_then(toml::Value::as_bool).unwrap_or(false)),
+            // No sane default across sessions — a saved layer index would
+            // point at whatever's loaded next time, not necessarily the
+            // same layer. Left unselected; `ui` auto-picks when there's
+            // exactly one candidate.
+            ParamKind::Layer => Self::Layer(None),
         }
     }
 
@@ -54,10 +62,17 @@ impl ParamEditValue {
                 .map(serde_json::Value::from)
                 .map_err(|_| format!("{label}: {s:?} isn't a number")),
             Self::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+            Self::Layer(sel) => sel
+                .map(|idx| serde_json::Value::from(idx as u64))
+                .ok_or_else(|| format!("{label}: select a layer")),
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui) {
+    /// `layer_options` is `(layer index, display name)` pairs already
+    /// filtered to this param's `layer_kind` — empty/ignored for every kind
+    /// but `Layer`. `id_salt` keys the dropdown's egui id so two `Layer`
+    /// params in the same plugin don't collide.
+    fn ui(&mut self, ui: &mut egui::Ui, id_salt: &str, layer_options: &[(usize, String)]) {
         match self {
             Self::Text(s) => {
                 ui.text_edit_singleline(s);
@@ -68,8 +83,44 @@ impl ParamEditValue {
             Self::Bool(b) => {
                 ui.checkbox(b, "");
             }
+            Self::Layer(sel) => {
+                if sel.is_none() {
+                    if let Some((only_idx, _)) = layer_options.first() {
+                        *sel = Some(*only_idx);
+                    }
+                }
+                let selected_text = sel
+                    .and_then(|idx| layer_options.iter().find(|(i, _)| *i == idx))
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| "Select a layer…".to_string());
+                egui::ComboBox::from_id_salt(("plugin_layer_param", id_salt.to_string()))
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for (idx, name) in layer_options {
+                            ui.selectable_value(sel, Some(*idx), name);
+                        }
+                    });
+                if layer_options.is_empty() {
+                    ui.label(
+                        egui::RichText::new("no matching layers loaded")
+                            .color(ui.visuals().error_fg_color),
+                    );
+                }
+            }
         }
     }
+}
+
+/// Whether `data` matches a `PluginParam.layer_kind` string (`"points"`,
+/// `"vector"`, `"raster"`).
+fn layer_kind_matches(data: &crate::gis_layer::LayerKind, kind: &str) -> bool {
+    use crate::gis_layer::LayerKind;
+    matches!(
+        (data, kind),
+        (LayerKind::Points(_), "points")
+            | (LayerKind::Vector(_), "vector")
+            | (LayerKind::Raster(_), "raster")
+    )
 }
 
 fn default_param_values(manifest: &PluginManifest) -> HashMap<String, ParamEditValue> {
@@ -156,8 +207,8 @@ impl GisEditorApp {
         egui::Window::new("Plugins")
             .open(&mut open)
             .resizable(true)
-            .default_size([460.0, 420.0])
-            .min_size([320.0, 240.0])
+            .default_size([420.0, 420.0])
+            .min_size([300.0, 240.0])
             .show(ui.ctx(), |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("Directory: {}", self.plugins_dir.display()));
@@ -172,61 +223,21 @@ impl GisEditorApp {
                 } else {
                     egui::ScrollArea::vertical()
                         .id_salt("plugin_list_scroll")
-                        .max_height(220.0)
+                        .max_height(160.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for i in 0..self.available_plugins.len() {
-                                let manifest = self.available_plugins[i].clone();
-                                let name = manifest.name.clone();
+                                let name = self.available_plugins[i].name.clone();
                                 let running = self.plugin_running.as_deref() == Some(name.as_str());
-                                let busy = self.plugin_running.is_some();
 
                                 ui.horizontal(|ui| {
-                                    ui.label(&name);
                                     if running {
                                         ui.spinner();
-                                    } else if ui.add_enabled(!busy, egui::Button::new("Run")).clicked() {
-                                        let args_result = if manifest.params.is_empty() {
-                                            Ok(serde_json::Value::Object(Default::default()))
-                                        } else {
-                                            let values = self
-                                                .plugin_param_values
-                                                .entry(name.clone())
-                                                .or_insert_with(|| default_param_values(&manifest));
-                                            build_param_args(&manifest.params, values)
-                                        };
-                                        match args_result {
-                                            Ok(args) => {
-                                                self.plugin_running = Some(name.clone());
-                                                self.plugin_log
-                                                    .push((LogLevel::Info, format!("Running {name}…")));
-                                                self.plugin_events_rx =
-                                                    Some(plugin::run_plugin(manifest.clone(), args));
-                                            }
-                                            Err(e) => {
-                                                self.plugin_log.push((LogLevel::Error, format!("{name}: {e}")));
-                                            }
-                                        }
+                                        ui.label(&name);
+                                    } else if ui.selectable_label(false, &name).clicked() {
+                                        self.plugin_config_open = Some(name.clone());
                                     }
                                 });
-
-                                if !manifest.params.is_empty() {
-                                    let values = self
-                                        .plugin_param_values
-                                        .entry(name.clone())
-                                        .or_insert_with(|| default_param_values(&manifest));
-                                    egui::Frame::new().inner_margin(egui::Margin { left: 16, ..Default::default() }).show(ui, |ui| {
-                                        for p in &manifest.params {
-                                            if let Some(v) = values.get_mut(&p.name) {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(p.display_label());
-                                                    v.ui(ui);
-                                                });
-                                            }
-                                        }
-                                    });
-                                }
-                                ui.separator();
                             }
                         });
                 }
@@ -264,5 +275,104 @@ impl GisEditorApp {
                     });
             });
         self.plugin_window_open = open;
+    }
+
+    /// The "Run plugin" dialog opened by clicking a plugin in the list:
+    /// its params (if any) plus Run/Cancel. Separate from the list window
+    /// so it can be shown, moved and closed independently.
+    pub(super) fn show_plugin_config_window(&mut self, ui: &mut egui::Ui) {
+        let Some(name) = self.plugin_config_open.clone() else {
+            return;
+        };
+        let Some(manifest) = self
+            .available_plugins
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+        else {
+            self.plugin_config_open = None;
+            return;
+        };
+
+        let mut open = true;
+        let mut run_clicked = false;
+        let mut cancel_clicked = false;
+        egui::Window::new(format!("Run {name}"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ui.ctx(), |ui| {
+                if manifest.params.is_empty() {
+                    ui.label("This plugin takes no parameters.");
+                } else {
+                    let values = self
+                        .plugin_param_values
+                        .entry(name.clone())
+                        .or_insert_with(|| default_param_values(&manifest));
+                    let layers = &self.layers;
+                    egui::Grid::new("plugin_param_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            for p in &manifest.params {
+                                if let Some(v) = values.get_mut(&p.name) {
+                                    ui.label(p.display_label());
+                                    if p.kind == ParamKind::Layer {
+                                        let options: Vec<(usize, String)> = layers
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, l)| {
+                                                p.layer_kind
+                                                    .as_deref()
+                                                    .is_none_or(|k| layer_kind_matches(&l.data, k))
+                                            })
+                                            .map(|(i, l)| (i, l.name.clone()))
+                                            .collect();
+                                        v.ui(ui, &p.name, &options);
+                                    } else {
+                                        v.ui(ui, &p.name, &[]);
+                                    }
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Run").clicked() {
+                        run_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if run_clicked {
+            let args_result = if manifest.params.is_empty() {
+                Ok(serde_json::Value::Object(Default::default()))
+            } else {
+                let values = self
+                    .plugin_param_values
+                    .entry(name.clone())
+                    .or_insert_with(|| default_param_values(&manifest));
+                build_param_args(&manifest.params, values)
+            };
+            match args_result {
+                Ok(args) => {
+                    self.plugin_running = Some(name.clone());
+                    self.plugin_log
+                        .push((LogLevel::Info, format!("Running {name}…")));
+                    self.plugin_events_rx = Some(plugin::run_plugin(manifest, args));
+                    self.plugin_config_open = None;
+                }
+                Err(e) => {
+                    self.plugin_log.push((LogLevel::Error, format!("{name}: {e}")));
+                }
+            }
+        } else if cancel_clicked || !open {
+            self.plugin_config_open = None;
+        }
     }
 }

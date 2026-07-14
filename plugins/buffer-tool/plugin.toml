@@ -4,6 +4,12 @@ python = "python3"
 capabilities = ["read_layers", "add_layer"]
 
 [[params]]
+name = "layer"
+label = "Layer"
+kind = "layer"
+layer_kind = "vector"
+
+[[params]]
 name = "distance"
 label = "Buffer distance"
 kind = "float"

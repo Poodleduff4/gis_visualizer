@@ -231,19 +231,15 @@ pub fn show_map(
                 let feature = &layer.features[id];
                 let tess = &feature.tessellated;
                 let is_selected = is_active && *selected_id == Some(id);
-                render_tessellated(
-                    &painter,
-                    tess,
-                    viewport,
-                    rect,
-                    is_selected,
-                    render_points,
-                    fill,
-                    stroke,
-                );
+                render_tessellated(&painter, tess, viewport, rect, is_selected, fill, stroke);
             }
         }
     }
+
+    // Vector-layer point/multipoint features always CPU-paint here — see
+    // `render_vector_points`'s doc comment for why they can't just ride the
+    // GPU fill/outline mesh path like polygons/lines do.
+    render_vector_points(&painter, layers, active_entry, viewport, rect, *selected_id);
 
     // Status line at bottom of map
     if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -447,7 +443,6 @@ fn render_tessellated(
     viewport: &Viewport,
     rect: Rect,
     selected: bool,
-    render_points: bool,
     layer_fill: Color32,
     layer_stroke: Color32,
 ) {
@@ -483,13 +478,55 @@ fn render_tessellated(
             .collect();
         painter.add(Shape::closed_line(pts, stroke));
     }
+}
 
-    if render_points {
-        for &[wx, wy] in &tess.points {
-            let pos = viewport.world_to_screen(wx, wy, rect);
-            let half = POINT_RADIUS;
-            let r = Rect::from_center_size(pos, Vec2::splat(half * 2.0));
-            painter.rect(r, 0.0, fill, stroke, egui::StrokeKind::Outside);
+/// Draws every visible Vector layer's Point/MultiPoint features as small,
+/// screen-space-constant-size squares. Unlike fill/outline geometry (which
+/// GPU mode renders via `collect_gpu_vector_mesh`'s triangulated mesh),
+/// points need a size that doesn't scale with zoom, which the world-space
+/// GPU vertex buffer can't express — so, like the LISA/local-variance
+/// overlays, they're always CPU-painted here regardless of GPU/CPU mode
+/// rather than being gated behind `render_points` (which really means "no
+/// GPU available").
+pub fn render_vector_points(
+    painter: &Painter,
+    layers: &[LayerEntry],
+    active_entry: Option<&LayerEntry>,
+    viewport: &Viewport,
+    rect: Rect,
+    selected_id: Option<usize>,
+) {
+    let [xmin, ymin, xmax, ymax] = viewport.viewport_bbox(rect);
+    let active_layer_name = active_entry.map(|e| e.name.as_str());
+    for entry in layers.iter().filter(|e| e.visible) {
+        let LayerKind::Vector(layer) = &entry.data else {
+            continue;
+        };
+        let is_active = active_layer_name == Some(entry.name.as_str());
+        let layer_fill = Color32::from_rgba_unmultiplied(
+            entry.color[0],
+            entry.color[1],
+            entry.color[2],
+            entry.opacity,
+        );
+        let layer_stroke_color = Color32::from_rgb(entry.color[0], entry.color[1], entry.color[2]);
+
+        for id in layer.features_in_bbox(xmin, ymin, xmax, ymax) {
+            let feature = &layer.features[id];
+            if feature.tessellated.points.is_empty() {
+                continue;
+            }
+            let is_selected = is_active && selected_id == Some(id);
+            let fill = if is_selected { FILL_SELECTED } else { layer_fill };
+            let stroke = Stroke::new(
+                1.0,
+                if is_selected { STROKE_SELECTED } else { layer_stroke_color },
+            );
+            for &[wx, wy] in &feature.tessellated.points {
+                let pos = viewport.world_to_screen(wx, wy, rect);
+                let r = Rect::from_center_size(pos, Vec2::splat(POINT_RADIUS * 2.0));
+                painter.rect(r, 0.0, fill, stroke, egui::StrokeKind::Outside);
+            }
         }
     }
 }
@@ -513,7 +550,10 @@ pub fn render_raster_overlay(
         *texture_cache = Some(ui.ctx().load_texture(
             "raster_overlay",
             image,
-            egui::TextureOptions::LINEAR,
+            // NEAREST, not LINEAR: matches QGIS's default resampling — crisp
+            // cell edges at native/zoomed-in scale instead of blurring
+            // neighboring pixels together.
+            egui::TextureOptions::NEAREST,
         ));
     }
     let Some(texture) = texture_cache else { return };

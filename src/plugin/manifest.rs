@@ -34,6 +34,10 @@ pub enum ParamKind {
     Integer,
     Float,
     Bool,
+    /// A dropdown of currently-loaded layers; the plugin receives the
+    /// selected layer's index (the same id `list_layers`/`get_layer` use)
+    /// as a plain integer under `plugin_args`.
+    Layer,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +50,11 @@ pub struct PluginParam {
     pub kind: ParamKind,
     #[serde(default)]
     pub default: Option<toml::Value>,
+    /// Only meaningful when `kind = "layer"`: restricts the dropdown to
+    /// layers of this kind (`"points"`, `"vector"`, or `"raster"`). Absent
+    /// shows every loaded layer regardless of kind.
+    #[serde(default)]
+    pub layer_kind: Option<String>,
 }
 
 impl PluginParam {

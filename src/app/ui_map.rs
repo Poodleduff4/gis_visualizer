@@ -369,6 +369,87 @@ impl GisEditorApp {
                     }
                 }
 
+                if self.layers[idx].show_bivariate_grid {
+                    if let Some(grid) = &self.layers[idx].bivariate_grid_cache {
+                        let vp = self.viewport.viewport_bbox(response.rect);
+                        let visible = grid.cells.iter().filter(|c| {
+                            c.bbox[0] <= vp[2]
+                                && c.bbox[2] >= vp[0]
+                                && c.bbox[1] <= vp[3]
+                                && c.bbox[3] >= vp[1]
+                        });
+                        for cell in visible {
+                            let color = crate::bivariate::bivariate_color(
+                                cell.class_a,
+                                cell.class_b,
+                                self.heatmap_opacity,
+                            );
+                            let p1 =
+                                self.viewport
+                                    .world_to_screen(cell.bbox[0], cell.bbox[1], response.rect);
+                            let p2 =
+                                self.viewport
+                                    .world_to_screen(cell.bbox[2], cell.bbox[3], response.rect);
+                            painter.rect_filled(egui::Rect::from_two_pos(p1, p2), 0.0, color);
+                        }
+
+                        // ── Legend: 3x3 swatch grid + attribute labels ─────────
+                        let r = response.rect;
+                        let swatch = 16.0_f32;
+                        let grid_w = swatch * 3.0;
+                        let x = r.min.x + 10.0;
+                        let y = r.max.y - 46.0 - (heatmap_legend_slot as f32) * 66.0;
+                        heatmap_legend_slot += 1;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x - 4.0, y - 18.0),
+                                egui::vec2(grid_w + 70.0, swatch * 3.0 + 24.0),
+                            ),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                        );
+                        painter.text(
+                            egui::pos2(x, y - 16.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{} x {}", grid.attr_a, grid.attr_b),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        for row in 0..3u8 {
+                            for col in 0..3u8 {
+                                // row 0 (bottom) = low attr_b, matches screen-down = low.
+                                let class_b = 2 - row;
+                                let color =
+                                    crate::bivariate::bivariate_color(col, class_b, 255);
+                                let cx = x + col as f32 * swatch;
+                                let cy = y + row as f32 * swatch;
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(cx, cy),
+                                        egui::vec2(swatch, swatch),
+                                    ),
+                                    0.0,
+                                    color,
+                                );
+                            }
+                        }
+                        painter.text(
+                            egui::pos2(x, y + grid_w + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{} →", grid.attr_a),
+                            egui::FontId::proportional(10.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x + grid_w + 6.0, y),
+                            egui::Align2::LEFT_TOP,
+                            format!("↑ {}", grid.attr_b),
+                            egui::FontId::proportional(10.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+
                 if self.layers[idx].show_index {
                     let index = self.layers[idx].data.index(self.layers[idx].index_kind);
                     show_spatial_index_grid(&painter, index, &mut self.viewport, response.rect);

@@ -400,6 +400,93 @@ impl GisEditorApp {
             self.kde_window_open = open;
         }
 
+        // ── Bivariate Grid Analysis window ─────────────────────────────────────
+        if self.bivariate_grid_window_open {
+            let mut open = true;
+            let mut run_clicked = false;
+            egui::Window::new("Bivariate Grid Analysis")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_size([320.0, 260.0])
+                .show(ui.ctx(), |ui| {
+                    let Some(idx) = self.active_layer_idx else {
+                        ui.label("Select a Points layer first.");
+                        return;
+                    };
+                    let Some(entry) = self.layers.get(idx) else {
+                        ui.label("Select a Points layer first.");
+                        return;
+                    };
+                    if !matches!(entry.data, LayerKind::Points(_)) {
+                        ui.label("Active layer must be a Points layer.");
+                        return;
+                    }
+                    ui.label(format!("Layer: {}", entry.name));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Cell size:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.bivariate_grid_cell_size)
+                                .speed(0.001)
+                                .range(1e-9..=f64::MAX),
+                        );
+                    });
+                    let numeric_fields = entry.data.numeric_field_names();
+                    ui.horizontal(|ui| {
+                        ui.label("Attribute A:");
+                        egui::ComboBox::from_id_salt("bivariate_field_a_combo")
+                            .selected_text(
+                                self.bivariate_grid_field_a.as_deref().unwrap_or("Select…"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for f in &numeric_fields {
+                                    ui.selectable_value(
+                                        &mut self.bivariate_grid_field_a,
+                                        Some(f.clone()),
+                                        f,
+                                    );
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Attribute B:");
+                        egui::ComboBox::from_id_salt("bivariate_field_b_combo")
+                            .selected_text(
+                                self.bivariate_grid_field_b.as_deref().unwrap_or("Select…"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for f in &numeric_fields {
+                                    ui.selectable_value(
+                                        &mut self.bivariate_grid_field_b,
+                                        Some(f.clone()),
+                                        f,
+                                    );
+                                }
+                            });
+                    });
+                    ui.separator();
+                    let ready = self.bivariate_grid_field_a.is_some()
+                        && self.bivariate_grid_field_b.is_some();
+                    if self.bivariate_grid_running {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Computing…");
+                        });
+                    } else if ready {
+                        if ui.button("Run").clicked() {
+                            run_clicked = true;
+                        }
+                    } else {
+                        ui.label("Pick both attributes first.");
+                    }
+                });
+            if run_clicked {
+                self.start_bivariate_grid_compute();
+            }
+            self.bivariate_grid_window_open = open;
+        }
+
         // ── Export window ───────────────────────────────────────────────────────
         if self.export_window_open {
             let mut open = true;
@@ -536,6 +623,8 @@ impl GisEditorApp {
                 let (lo, hi) = (band.display_min as f32, band.display_max as f32);
                 let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
                 let values: Vec<f32> = band.values.iter().map(|v| v.clamp(lo, hi)).collect();
+                let (tx, rx) = futures_channel::oneshot::channel();
+                self.raster_export_rx = Some(rx);
                 std::thread::spawn(move || {
                     if let Some(path) = pollster::block_on(
                         rfd::AsyncFileDialog::new()
@@ -543,14 +632,17 @@ impl GisEditorApp {
                             .set_file_name(format!("{name}_export.tif"))
                             .save_file(),
                     ) {
+                        let path_buf = path.path().to_path_buf();
                         if let Err(e) = crate::raster_reader::write_geotiff(
-                            &path.path().to_path_buf(),
+                            &path_buf,
                             width,
                             height,
                             &values,
                             extent,
                         ) {
                             eprintln!("[raster export] error: {e:#}");
+                        } else {
+                            tx.send((idx, path_buf.to_string_lossy().into_owned())).ok();
                         }
                     }
                 });
@@ -629,6 +721,87 @@ impl GisEditorApp {
             );
             let heatmap = crate::heatmap::HeatmapLayer::from_kde_cells(cells, attribute_name);
             tx.send((idx, heatmap, saved)).ok();
+        });
+    }
+
+    /// Spawns a background thread that bins the active Points layer's
+    /// (filtered) points into a bivariate grid over two chosen attributes,
+    /// then sends the result back through `bivariate_grid_rx` for
+    /// `poll_spatial_analysis` to install as that layer's `bivariate_grid_cache`.
+    fn start_bivariate_grid_compute(&mut self) {
+        let Some(idx) = self.active_layer_idx else {
+            return;
+        };
+        let Some(entry) = self.layers.get_mut(idx) else {
+            return;
+        };
+        let LayerKind::Points(pc) = &mut entry.data else {
+            return;
+        };
+        let (Some(field_a), Some(field_b)) = (
+            self.bivariate_grid_field_a.clone(),
+            self.bivariate_grid_field_b.clone(),
+        ) else {
+            return;
+        };
+        pc.ensure_bbox();
+        let Some(bbox) = pc.bbox else {
+            return;
+        };
+        let Some(values_a) = crate::histogram::extract_field_values(pc, &field_a) else {
+            return;
+        };
+        let Some(values_b) = crate::histogram::extract_field_values(pc, &field_b) else {
+            return;
+        };
+
+        let points: Vec<[f64; 2]> = pc
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| pc.filter_mask[*i])
+            .map(|(_, (_, p))| *p)
+            .collect();
+        let values_a: Vec<f64> = pc
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| pc.filter_mask[*i])
+            .map(|(i, _)| values_a[i])
+            .collect();
+        let values_b: Vec<f64> = pc
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| pc.filter_mask[*i])
+            .map(|(i, _)| values_b[i])
+            .collect();
+
+        let cell_size = self.bivariate_grid_cell_size;
+
+        let (tx, rx) = futures_channel::oneshot::channel();
+        self.bivariate_grid_rx = Some(rx);
+        self.bivariate_grid_running = true;
+        self.status = format!("Computing bivariate grid ({} pts)…", points.len());
+
+        std::thread::spawn(move || {
+            let Some(layer) = crate::bivariate::BivariateGridLayer::build(
+                &points,
+                &values_a,
+                &values_b,
+                bbox,
+                cell_size,
+                field_a,
+                field_b,
+            ) else {
+                return;
+            };
+            let saved = crate::bivariate::SavedBivariateGrid::from_layer(
+                format!("Bivariate {} x {}", layer.attr_a, layer.attr_b),
+                cell_size,
+                &layer,
+            );
+            tx.send((idx, layer, saved)).ok();
         });
     }
 }

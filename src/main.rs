@@ -1,5 +1,6 @@
 mod app;
 mod basemap;
+mod bivariate;
 mod crs;
 mod snapshot;
 mod exporter;

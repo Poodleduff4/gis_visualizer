@@ -1,5 +1,5 @@
 from . import protocol
-from .geo import arrow_to_geodataframe, geodataframe_to_arrow
+from .geo import arrow_to_geodataframe, arrow_to_raster, geodataframe_to_arrow
 from .protocol import HostError
 
 __all__ = ["Host", "Layer", "LayerSummary", "HostError"]
@@ -29,7 +29,15 @@ class Layer:
         self._arrow_ipc = arrow_ipc
 
     def to_geodataframe(self):
+        """For vector/points layers — errors if called on a raster layer's
+        `Layer` (check `LayerSummary.kind` from `list_layers` first, or use
+        `to_raster()` instead)."""
         return arrow_to_geodataframe(self._arrow_ipc)
+
+    def to_raster(self) -> dict:
+        """For raster layers: `{"width", "height", "units", "extent",
+        "bands": {name: np.ndarray of shape (height, width)}}`."""
+        return arrow_to_raster(self._arrow_ipc)
 
 
 class Host:

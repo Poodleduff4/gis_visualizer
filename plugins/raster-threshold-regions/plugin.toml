@@ -1,0 +1,28 @@
+name = "raster-threshold-regions"
+entrypoint = "main.py"
+python = "python3"
+capabilities = ["read_layers", "add_layer"]
+
+[[params]]
+name = "layer"
+label = "Raster layer"
+kind = "layer"
+layer_kind = "raster"
+
+[[params]]
+name = "band"
+label = "Band name (blank = first band)"
+kind = "text"
+default = ""
+
+[[params]]
+name = "threshold"
+label = "Value threshold"
+kind = "float"
+default = 0.5
+
+[[params]]
+name = "min_region_pixels"
+label = "Minimum region size (pixels)"
+kind = "integer"
+default = 4

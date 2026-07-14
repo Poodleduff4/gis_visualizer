@@ -44,6 +44,36 @@ def arrow_to_geodataframe(arrow_ipc: bytes) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(df, geometry=geometry)
 
 
+def arrow_to_raster(arrow_ipc: bytes) -> dict:
+    """Decodes a raster layer (`bridge::encode_raster_layer`'s schema): one
+    `Float32` column per band, `width`/`height`/`units`/`extent` carried as
+    schema metadata rather than repeated per row. Returns a plain dict —
+    `{"width", "height", "units", "extent", "bands": {name: np.ndarray}}` —
+    with each band reshaped to `(height, width)`, row 0 = north, matching the
+    host's grid convention.
+    """
+    reader = pa.ipc.open_stream(arrow_ipc)
+    batch = reader.read_next_batch()
+    schema = batch.schema
+
+    meta = {k.decode(): v.decode() for k, v in (schema.metadata or {}).items()}
+    width = int(meta["width"])
+    height = int(meta["height"])
+    extent = tuple(float(v) for v in meta["extent"].split(","))
+
+    bands = {
+        name: batch.column(name).to_numpy(zero_copy_only=False).reshape(height, width)
+        for name in schema.names
+    }
+    return {
+        "width": width,
+        "height": height,
+        "units": meta.get("units", ""),
+        "extent": extent,
+        "bands": bands,
+    }
+
+
 def geodataframe_to_arrow(gdf: gpd.GeoDataFrame) -> bytes:
     geometry_col = gdf.geometry.name
     geom_array = pa.array(shapely.to_wkb(gdf.geometry.values), type=pa.binary())

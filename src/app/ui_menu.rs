@@ -119,6 +119,10 @@ impl GisEditorApp {
                         self.kde_window_open = true;
                         ui.close_kind(UiKind::Menu);
                     }
+                    if ui.button("Bivariate Grid Analysis…").clicked() {
+                        self.bivariate_grid_window_open = true;
+                        ui.close_kind(UiKind::Menu);
+                    }
                 });
                 #[cfg(not(target_arch = "wasm32"))]
                 ui.menu_button("Plugins", |ui| {

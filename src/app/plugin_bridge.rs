@@ -40,9 +40,10 @@ impl GisEditorApp {
                         Ok(arrow_ipc) => HostReply::LayerData { arrow_ipc },
                         Err(e) => HostReply::Err(e.to_string()),
                     },
-                    Some(LayerKind::Raster(_)) => {
-                        HostReply::Err("Raster layers aren't exposed to plugins yet".into())
-                    }
+                    Some(LayerKind::Raster(r)) => match plugin::bridge::encode_raster_layer(r) {
+                        Ok(arrow_ipc) => HostReply::LayerData { arrow_ipc },
+                        Err(e) => HostReply::Err(e.to_string()),
+                    },
                     None => HostReply::Err(format!("no layer with id {layer_id}")),
                 }
             }
@@ -50,7 +51,10 @@ impl GisEditorApp {
             PluginCall::AddLayer { name, arrow_ipc } => {
                 match plugin::bridge::decode_vector_layer(&arrow_ipc, name.clone()) {
                     Ok(gl) => {
-                        self.layers.push(plugin::bridge::layer_entry_for(name, gl));
+                        let data = plugin::bridge::vector_layer_to_points(&gl)
+                            .map(LayerKind::Points)
+                            .unwrap_or(LayerKind::Vector(gl));
+                        self.layers.push(plugin::bridge::layer_entry_for(name, data));
                         self.points_dirty = true;
                         self.globe_points_dirty = true;
                         self.map_render_ttl = 3;
@@ -69,7 +73,9 @@ impl GisEditorApp {
                 match plugin::bridge::decode_vector_layer(&arrow_ipc, name) {
                     Ok(gl) => match self.layers.get_mut(layer_id as usize) {
                         Some(entry) => {
-                            entry.data = LayerKind::Vector(gl);
+                            entry.data = plugin::bridge::vector_layer_to_points(&gl)
+                                .map(LayerKind::Points)
+                                .unwrap_or(LayerKind::Vector(gl));
                             self.points_dirty = true;
                             self.globe_points_dirty = true;
                             self.map_render_ttl = 3;

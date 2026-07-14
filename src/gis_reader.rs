@@ -1517,6 +1517,10 @@ impl GisReader {
             kde_cache: None,
             saved_heatmaps: Vec::new(),
             active_saved_heatmap: None,
+            show_bivariate_grid: false,
+            bivariate_grid_cache: None,
+            saved_bivariate_grids: Vec::new(),
+            active_saved_bivariate_grid: None,
         }
     }
 }

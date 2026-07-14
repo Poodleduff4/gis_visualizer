@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use arrow::array::{Array, BinaryArray, Float64Array, Int64Array, StringArray, UInt32Array};
+use bitvec::bitvec;
+use geo_types::Geometry;
+use arrow::array::{Array, BinaryArray, Float32Array, Float64Array, Int64Array, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -26,7 +28,7 @@ use geo::BoundingRect;
 use geozero::{wkb::Wkb, CoordDimensions, ToGeo, ToWkb};
 
 use crate::filter::FilterLogic;
-use crate::gis_layer::{AttributeValue, GisFeature, GisLayer, LayerEntry, LayerKind};
+use crate::gis_layer::{AttributeValue, GisFeature, GisLayer, LayerEntry, LayerKind, RasterData};
 use crate::gis_reader::{GisFilePath, LayerDescriptor};
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 
@@ -158,6 +160,54 @@ pub fn encode_points_layer(layer: &PointCloudLayer) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Encodes a `RasterData` as one `Float32` column per band (named after
+/// `RasterBand.name`, or `band_N` if empty), row-major with row 0 = north —
+/// same convention as the grid itself. There's no `x`/`y`/`geometry` column
+/// like the other two encoders: a raster's shape is regular, so `width`,
+/// `height`, `units`, and `extent` travel as schema metadata instead of being
+/// repeated per row, and a reader reconstructs pixel coordinates from those
+/// plus its row/column index.
+pub fn encode_raster_layer(raster: &RasterData) -> Result<Vec<u8>> {
+    let mut fields = Vec::with_capacity(raster.bands.len());
+    let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(raster.bands.len());
+    for (i, band) in raster.bands.iter().enumerate() {
+        let col_name = if band.name.is_empty() {
+            format!("band_{}", i + 1)
+        } else {
+            band.name.clone()
+        };
+        fields.push(Field::new(&col_name, DataType::Float32, false));
+        arrays.push(Arc::new(Float32Array::from_iter_values(
+            band.values.iter().copied(),
+        )));
+    }
+
+    let metadata = HashMap::from([
+        ("width".to_string(), raster.width.to_string()),
+        ("height".to_string(), raster.height.to_string()),
+        ("units".to_string(), raster.units.clone()),
+        (
+            "extent".to_string(),
+            raster
+                .extent
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    ]);
+
+    let schema = Arc::new(Schema::new(fields).with_metadata(metadata));
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+    }
+    Ok(buf)
+}
+
 /// Decodes an Arrow IPC buffer (as produced by `encode_vector_layer`, or by
 /// a plugin's own `AddLayer`/`UpdateLayer` reply) into a fresh `GisLayer`.
 /// Only the first record batch is read — plugins are expected to send one
@@ -239,21 +289,118 @@ pub fn decode_vector_layer(bytes: &[u8], name: String) -> Result<GisLayer> {
     })
 }
 
-/// Wraps a plugin-decoded `GisLayer` in the `LayerEntry` scaffolding the rest
-/// of the app expects, mirroring `gis_reader::layer_entry_from_descriptor`'s
-/// defaults for a freshly-loaded layer.
-pub fn layer_entry_for(name: String, layer: GisLayer) -> LayerEntry {
+/// If every feature in `layer` is a bare `Point`, converts it into a
+/// `PointCloudLayer` instead of leaving it as a `GisLayer` — so a
+/// plugin-added point layer rides the exact same GPU-instanced point-cloud
+/// rendering path (`point_cloud.rs`/`gpu_collect.rs`) as a Points layer
+/// loaded from a file, rather than the Vector path meant for polygons/lines
+/// (which can only ever CPU-paint points, since that path's GPU mesh is
+/// triangulated fill/outline geometry with no concept of a constant-pixel-
+/// size point sprite). Returns `None` for empty or mixed-geometry layers,
+/// which have no equivalent in the points-only `PointCloudLayer` shape.
+pub fn vector_layer_to_points(layer: &GisLayer) -> Option<PointCloudLayer> {
+    if layer.features.is_empty()
+        || !layer
+            .features
+            .iter()
+            .all(|f| matches!(f.geometry, Geometry::Point(_)))
+    {
+        return None;
+    }
+
+    let points: Arc<Vec<(u32, [f64; 2])>> = Arc::new(
+        layer
+            .features
+            .iter()
+            .map(|f| {
+                let Geometry::Point(p) = &f.geometry else {
+                    unreachable!("checked above")
+                };
+                (f.id as u32, [p.x(), p.y()])
+            })
+            .collect(),
+    );
+
+    let attributes: Vec<AttributeColumn> = layer
+        .field_names
+        .iter()
+        .map(|name| match column_type(&layer.features, name) {
+            AttributeValue::Float(_) => AttributeColumn::Float(
+                layer
+                    .features
+                    .iter()
+                    .map(|f| match f.attributes.get(name) {
+                        Some(AttributeValue::Float(v)) => *v,
+                        Some(AttributeValue::Integer(v)) => *v as f64,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            ),
+            AttributeValue::Integer(_) => AttributeColumn::Integer(
+                layer
+                    .features
+                    .iter()
+                    .map(|f| match f.attributes.get(name) {
+                        Some(AttributeValue::Integer(v)) => *v,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            AttributeValue::Text(_) => AttributeColumn::Text(
+                layer
+                    .features
+                    .iter()
+                    .map(|f| match f.attributes.get(name) {
+                        Some(AttributeValue::Text(v)) => v.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            ),
+        })
+        .collect();
+
+    let n = layer.features.len();
+    Some(PointCloudLayer {
+        points,
+        attributes,
+        field_names: layer.field_names.clone(),
+        index: None,
+        bbox: None,
+        viewport_mask: bitvec![0; n],
+        filter_mask: bitvec![1; n],
+    })
+}
+
+/// Wraps a plugin-decoded layer in the `LayerEntry` scaffolding the rest of
+/// the app expects, mirroring `gis_reader::layer_entry_from_descriptor`'s
+/// defaults for a freshly-loaded layer. `data` is usually `LayerKind::Vector`
+/// straight from `decode_vector_layer`, or `LayerKind::Points` when
+/// `vector_layer_to_points` found an all-point result.
+pub fn layer_entry_for(name: String, data: LayerKind) -> LayerEntry {
+    let (num_features, field_names, geometry_type) = match &data {
+        LayerKind::Vector(gl) => (
+            gl.features.len() as u64,
+            gl.field_names.clone(),
+            flatgeobuf::GeometryType(0),
+        ),
+        LayerKind::Points(pc) => (
+            pc.points.len() as u64,
+            pc.field_names.clone(),
+            flatgeobuf::GeometryType(1),
+        ),
+        LayerKind::Raster(_) => (0, Vec::new(), flatgeobuf::GeometryType(0)),
+    };
     let descriptor = LayerDescriptor {
         name: name.clone(),
-        num_features: layer.features.len() as u64,
-        field_names: layer.field_names.clone(),
-        geometry_type: flatgeobuf::GeometryType(0),
+        num_features,
+        field_names,
+        geometry_type,
         location: GisFilePath::LocalFile(String::new()),
         crs: None,
         crs_epsg: None,
     };
     LayerEntry {
-        data: LayerKind::Vector(layer),
+        data,
         visible: true,
         show_points: true,
         name,
@@ -276,6 +423,10 @@ pub fn layer_entry_for(name: String, layer: GisLayer) -> LayerEntry {
         kde_cache: None,
         saved_heatmaps: Vec::new(),
         active_saved_heatmap: None,
+        show_bivariate_grid: false,
+        bivariate_grid_cache: None,
+        saved_bivariate_grids: Vec::new(),
+        active_saved_bivariate_grid: None,
     }
 }
 
@@ -348,6 +499,49 @@ mod tests {
             decoded.features[1].attributes.get("name"),
             Some(&AttributeValue::Text("beta".into()))
         );
+    }
+
+    #[test]
+    fn encodes_raster_layer_as_band_columns_with_metadata() {
+        use crate::gis_layer::{RasterBand, RasterDisplayMode};
+
+        let raster = RasterData {
+            width: 2,
+            height: 2,
+            bands: vec![RasterBand {
+                name: "elevation".into(),
+                values: vec![1.0, 2.0, 3.0, 4.0],
+                data_min: 1.0,
+                data_max: 4.0,
+                display_min: 1.0,
+                display_max: 4.0,
+            }],
+            units: "m".into(),
+            display_mode: RasterDisplayMode::Single(0),
+            extent: [-10.0, -20.0, 10.0, 20.0],
+        };
+
+        let bytes = encode_raster_layer(&raster).expect("encode");
+        let mut reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader");
+        let batch = reader.next().expect("batch").expect("batch");
+
+        let metadata = batch.schema().metadata().clone();
+        assert_eq!(metadata.get("width").map(String::as_str), Some("2"));
+        assert_eq!(metadata.get("height").map(String::as_str), Some("2"));
+        assert_eq!(metadata.get("units").map(String::as_str), Some("m"));
+        assert_eq!(
+            metadata.get("extent").map(String::as_str),
+            Some("-10,-20,10,20")
+        );
+
+        let elevation = batch
+            .column_by_name("elevation")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(elevation.value(0), 1.0);
+        assert_eq!(elevation.value(3), 4.0);
     }
 
     #[test]

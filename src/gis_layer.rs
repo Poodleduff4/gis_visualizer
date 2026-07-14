@@ -240,10 +240,10 @@ impl GisFeature {
         geometry: Geometry<f64>,
         attributes: HashMap<String, AttributeValue>,
     ) -> Self {
-        let tessellated = match &geometry {
-            Geometry::Point(_) | Geometry::MultiPoint(_) => TessellatedGeom::empty(),
-            _ => tessellate(&geometry),
-        };
+        // `tessellate` already handles Point/MultiPoint (via `from_point`/
+        // `from_multipoint`, populating `TessellatedGeom.points`) — no
+        // special-casing needed here.
+        let tessellated = tessellate(&geometry);
         GisFeature {
             id,
             geometry,
@@ -431,28 +431,41 @@ impl LayerKind {
     /// built, else a linear scan (mirrors `PointCloudLayer::hit_test`'s
     /// index-or-scan fallback). Used by box-select and snapshot restore.
     pub fn ids_in_bbox_with_fallback(&self, bbox: [f64; 4]) -> Vec<usize> {
-        if let Some(idx) = self.index(IndexKind::Quadtree) {
-            return idx.search(&bbox);
-        }
-        let [xmin, ymin, xmax, ymax] = bbox;
-        match self {
-            LayerKind::Vector(gl) => gl
-                .features
-                .iter()
-                .filter(|f| {
-                    let b = f.bbox();
-                    b[0] <= xmax && b[2] >= xmin && b[1] <= ymax && b[3] >= ymin
-                })
-                .map(|f| f.id)
-                .collect(),
-            LayerKind::Points(pc) => pc
-                .points
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, p))| p[0] >= xmin && p[0] <= xmax && p[1] >= ymin && p[1] <= ymax)
-                .map(|(i, _)| i)
-                .collect(),
-            LayerKind::Raster(_) => Vec::new(),
+        let ids = if let Some(idx) = self.index(IndexKind::Quadtree) {
+            idx.search(&bbox)
+        } else {
+            let [xmin, ymin, xmax, ymax] = bbox;
+            match self {
+                LayerKind::Vector(gl) => gl
+                    .features
+                    .iter()
+                    .filter(|f| {
+                        let b = f.bbox();
+                        b[0] <= xmax && b[2] >= xmin && b[1] <= ymax && b[3] >= ymin
+                    })
+                    .map(|f| f.id)
+                    .collect(),
+                LayerKind::Points(pc) => pc
+                    .points
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, p))| {
+                        p[0] >= xmin && p[0] <= xmax && p[1] >= ymin && p[1] <= ymax
+                    })
+                    .map(|(i, _)| i)
+                    .collect(),
+                LayerKind::Raster(_) => Vec::new(),
+            }
+        };
+        // The quadtree path above doesn't re-check the filter mask (it's
+        // built excluding filtered-out points already, when up to date), but
+        // a caller building a selection right after a filter change — before
+        // the index has been rebuilt — would otherwise get stale ids back.
+        // Filtering here makes the result correct regardless of index freshness.
+        if let LayerKind::Points(pc) = self {
+            ids.into_iter().filter(|&i| pc.filter_mask[i]).collect()
+        } else {
+            ids
         }
     }
     pub fn feature_count(&self) -> usize {
@@ -588,6 +601,13 @@ pub struct LayerEntry {
     /// Index into `saved_heatmaps` currently loaded into `kde_cache` for
     /// display, if any — drives the selected-row highlight in the layer panel.
     pub active_saved_heatmap: Option<usize>,
+    /// Whether the bivariate grid overlay is shown.
+    pub show_bivariate_grid: bool,
+    pub bivariate_grid_cache: Option<crate::bivariate::BivariateGridLayer>,
+    /// Named bivariate grid snapshots saved under this layer — mirrors `saved_heatmaps`.
+    pub saved_bivariate_grids: Vec<crate::bivariate::SavedBivariateGrid>,
+    /// Index into `saved_bivariate_grids` currently loaded into `bivariate_grid_cache`.
+    pub active_saved_bivariate_grid: Option<usize>,
 }
 impl LayerEntry {}
 

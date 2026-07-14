@@ -185,7 +185,26 @@ pub struct GisEditorApp {
         oneshot::Receiver<(usize, crate::heatmap::HeatmapLayer, crate::heatmap::SavedHeatmap)>,
     >,
 
+    // ── Bivariate grid analysis (2-attribute choropleth) ──────────────────
+    pub(super) bivariate_grid_window_open: bool,
+    pub(super) bivariate_grid_cell_size: f64,
+    pub(super) bivariate_grid_field_a: Option<String>,
+    pub(super) bivariate_grid_field_b: Option<String>,
+    pub(super) bivariate_grid_running: bool,
+    pub(super) bivariate_grid_rx: Option<
+        oneshot::Receiver<(
+            usize,
+            crate::bivariate::BivariateGridLayer,
+            crate::bivariate::SavedBivariateGrid,
+        )>,
+    >,
+
     pub(super) export_window_open: bool,
+    /// Path a background raster export thread just wrote to, sent back so
+    /// `poll_spatial_analysis` can update that layer's `descriptor.location`
+    /// — otherwise a promoted (synthetic) raster layer keeps its empty path
+    /// forever and a later snapshot save/restore fails with "No such file".
+    pub(super) raster_export_rx: Option<oneshot::Receiver<(usize, String)>>,
 
     // ── Globe view + raster ──────────────────────────────────────────────
     pub(super) map_view: MapView,
@@ -235,6 +254,11 @@ pub struct GisEditorApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) plugin_param_values:
         std::collections::HashMap<String, std::collections::HashMap<String, ui_plugins::ParamEditValue>>,
+    /// Name of the plugin whose "Run plugin" config window (params + Run/
+    /// Cancel) is currently open, if any — set by clicking a plugin in the
+    /// list.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_config_open: Option<String>,
 }
 
 impl GisEditorApp {
@@ -349,7 +373,14 @@ impl GisEditorApp {
             kde_weight_field: None,
             kde_running: false,
             kde_rx: None,
+            bivariate_grid_window_open: false,
+            bivariate_grid_cell_size: 0.01,
+            bivariate_grid_field_a: None,
+            bivariate_grid_field_b: None,
+            bivariate_grid_running: false,
+            bivariate_grid_rx: None,
             export_window_open: false,
+            raster_export_rx: None,
             map_view: MapView::default(),
             globe_camera: GlobeCamera::default(),
             globe_points_buf: Vec::new(),
@@ -381,6 +412,8 @@ impl GisEditorApp {
             plugin_log: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             plugin_param_values: std::collections::HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_config_open: None,
         }
     }
 }
@@ -502,6 +535,7 @@ impl GisEditorApp {
             .take()
         {
             let has_filters = !layer_snap.filters.is_empty();
+            let layer_idx = self.layers.len().saturating_sub(1);
             if let Some(layer) = self.layers.last_mut() {
                 layer.visible = layer_snap.visible;
                 layer.color = layer_snap.color;
@@ -539,15 +573,6 @@ impl GisEditorApp {
                     }
                     LayerKind::Raster(_) => {}
                 }
-                for s in &layer_snap.selections {
-                    let ids = layer.data.ids_in_bbox_with_fallback(s.bbox);
-                    layer.selections.push(crate::gis_layer::LayerSelection {
-                        name: s.name.clone(),
-                        bbox: s.bbox,
-                        ids,
-                    });
-                }
-                layer.active_selection = layer_snap.active_selection;
                 layer.show_index = layer_snap.show_index;
                 layer.index_kind = crate::snapshot::str_to_index_kind(&layer_snap.index_kind);
                 layer.show_heatmap = layer_snap.show_heatmap;
@@ -555,6 +580,13 @@ impl GisEditorApp {
                     crate::snapshot::str_to_heatmap_metric(&layer_snap.heatmap_metric);
                 layer.heatmap_dirty = layer_snap.show_heatmap;
                 layer.show_points = layer_snap.show_points;
+            }
+            if !layer_snap.selections.is_empty() {
+                self.snapshot_restore
+                    .as_mut()
+                    .unwrap()
+                    .pending_selections
+                    .push((layer_idx, layer_snap.selections.clone(), layer_snap.active_selection));
             }
             if has_filters {
                 self.updated_filters = true;

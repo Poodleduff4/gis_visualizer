@@ -153,6 +153,11 @@ pub struct PendingSnapshotRestore {
     pub viewport: ViewportSnapshot,
     pub display: DisplaySnapshot,
     pub analysis: AnalysisSnapshot,
+    /// Selections queued for (layer index, selections, active index) but not
+    /// yet turned into `LayerSelection`s — held back until that layer's
+    /// filters have actually resolved (filter_mask updated), so a restored
+    /// selection's ids reflect the filter, not a stale unfiltered index.
+    pub pending_selections: Vec<(usize, Vec<SelectionSnapshot>, Option<usize>)>,
 }
 
 pub fn parse_comparitor_best(raw: &str) -> AttributeValue {

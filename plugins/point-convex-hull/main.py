@@ -11,27 +11,22 @@ from gis_editor_sdk import run_plugin
 from gis_editor_sdk.host import Host
 
 
-def run(host: Host):
-    layers = host.list_layers()
-    point_layers = [l for l in layers if l.kind == "points"]
-    if not point_layers:
-        host.log("no point layers loaded", level="Warn")
-        return
+def run(host: Host, params: dict):
+    layer_id = int(params["layer"])
+    target = next((l for l in host.list_layers() if l.id == layer_id), None)
+    name = target.name if target else f"layer {layer_id}"
 
-    target = point_layers[0]
-    host.progress(0.0, f"reading {target.name} ({target.feature_count} points)")
-    gdf: gpd.GeoDataFrame = host.get_layer(target.id).to_geodataframe()
+    host.progress(0.0, f"reading {name}")
+    gdf: gpd.GeoDataFrame = host.get_layer(layer_id).to_geodataframe()
 
     host.progress(0.6, "computing convex hull")
     hull = gdf.union_all().convex_hull
 
-    result = gpd.GeoDataFrame(
-        {"source_layer": [target.name]}, geometry=[hull], crs=gdf.crs
-    )
+    result = gpd.GeoDataFrame({"source_layer": [name]}, geometry=[hull], crs=gdf.crs)
 
     host.progress(0.9, "adding hull layer")
-    host.add_layer(f"{target.name} (convex hull)", result)
-    host.log(f"added convex hull of {target.feature_count} points from {target.name}")
+    host.add_layer(f"{name} (convex hull)", result)
+    host.log(f"added convex hull of {len(gdf)} points from {name}")
 
 
 if __name__ == "__main__":

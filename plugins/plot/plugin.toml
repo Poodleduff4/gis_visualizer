@@ -2,3 +2,21 @@ name = "plot"
 entrypoint = "main.py"
 python = "python3"
 capabilities = ["read_layers", "add_layer"]
+
+[[params]]
+name = "layer"
+label = "Points layer"
+kind = "layer"
+layer_kind = "points"
+
+[[params]]
+name = "x_col"
+label = "x_col"
+kind = "text"
+default = "x_col"
+
+[[params]]
+name = "y_col"
+label = "y_col"
+kind = "text"
+default = "y_col"
