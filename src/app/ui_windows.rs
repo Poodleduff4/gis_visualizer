@@ -487,6 +487,72 @@ impl GisEditorApp {
             self.bivariate_grid_window_open = open;
         }
 
+        // ── Grid Binning (uniform hexbin/gridbin) window ────────────────────────
+        if self.gridbin_window_open {
+            let mut open = true;
+            let mut run_clicked = false;
+            egui::Window::new("Grid Binning")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_size([320.0, 260.0])
+                .show(ui.ctx(), |ui| {
+                    let Some(idx) = self.active_layer_idx else {
+                        ui.label("Select a Points layer first.");
+                        return;
+                    };
+                    let Some(entry) = self.layers.get(idx) else {
+                        ui.label("Select a Points layer first.");
+                        return;
+                    };
+                    if !matches!(entry.data, LayerKind::Points(_)) {
+                        ui.label("Active layer must be a Points layer.");
+                        return;
+                    }
+                    ui.label(format!("Layer: {}", entry.name));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Cell size:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.gridbin_cell_size)
+                                .speed(0.001)
+                                .range(1e-9..=f64::MAX),
+                        );
+                    });
+                    let numeric_fields = entry.data.numeric_field_names();
+                    ui.horizontal(|ui| {
+                        ui.label("Color by:");
+                        egui::ComboBox::from_id_salt("gridbin_field_combo")
+                            .selected_text(
+                                self.gridbin_field.as_deref().unwrap_or("Density (count)"),
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.gridbin_field,
+                                    None,
+                                    "Density (count)",
+                                );
+                                for f in &numeric_fields {
+                                    ui.selectable_value(&mut self.gridbin_field, Some(f.clone()), f);
+                                }
+                            });
+                    });
+                    ui.separator();
+                    if self.gridbin_running {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Computing…");
+                        });
+                    } else if ui.button("Run").clicked() {
+                        run_clicked = true;
+                    }
+                });
+            if run_clicked {
+                self.start_gridbin_compute();
+            }
+            self.gridbin_window_open = open;
+        }
+
         // ── Export window ───────────────────────────────────────────────────────
         if self.export_window_open {
             let mut open = true;
@@ -802,6 +868,70 @@ impl GisEditorApp {
                 &layer,
             );
             tx.send((idx, layer, saved)).ok();
+        });
+    }
+
+    /// Spawns a background thread that bins the active Points layer's
+    /// (filtered) points into a uniform grid, then sends the result back
+    /// through `gridbin_rx` for `poll_spatial_analysis` to install as that
+    /// layer's `gridbin_cache`.
+    fn start_gridbin_compute(&mut self) {
+        let Some(idx) = self.active_layer_idx else {
+            return;
+        };
+        let Some(entry) = self.layers.get_mut(idx) else {
+            return;
+        };
+        let LayerKind::Points(pc) = &mut entry.data else {
+            return;
+        };
+        pc.ensure_bbox();
+        let Some(bbox) = pc.bbox else {
+            return;
+        };
+
+        let field = self.gridbin_field.clone();
+        let values = field
+            .as_ref()
+            .and_then(|f| crate::histogram::extract_field_values(pc, f));
+        let points: Vec<[f64; 2]> = pc
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| pc.filter_mask[*i])
+            .map(|(_, (_, p))| *p)
+            .collect();
+        let values: Option<Vec<f64>> = values.map(|v| {
+            pc.points
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| pc.filter_mask[*i])
+                .map(|(i, _)| v[i])
+                .collect()
+        });
+
+        let cell_size = self.gridbin_cell_size;
+        let attribute_name = field.clone().unwrap_or_else(|| "Density".to_string());
+
+        let (tx, rx) = futures_channel::oneshot::channel();
+        self.gridbin_rx = Some(rx);
+        self.gridbin_running = true;
+        self.status = format!("Computing grid bins ({} pts)…", points.len());
+
+        std::thread::spawn(move || {
+            let cells = crate::gridbin::build_gridbin(&points, values.as_deref(), bbox, cell_size);
+            let raw_cells: Vec<([f64; 4], f32)> = cells
+                .iter()
+                .map(|c| (c.bbox, c.mean.unwrap_or(c.count as f32)))
+                .collect();
+            let saved = crate::heatmap::SavedHeatmap::new(
+                format!("Gridbin {:.4} — {}", cell_size, attribute_name),
+                crate::heatmap::HeatmapKind::GridBin,
+                raw_cells,
+                attribute_name.clone(),
+            );
+            let heatmap = crate::heatmap::HeatmapLayer::from_grid_cells(cells, attribute_name);
+            tx.send((idx, heatmap, saved)).ok();
         });
     }
 }

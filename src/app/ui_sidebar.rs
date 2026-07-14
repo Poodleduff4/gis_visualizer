@@ -569,7 +569,6 @@ impl GisEditorApp {
                                             field_names: gl.field_names.clone(),
                                             extra_field_names: gl.extra_field_names.clone(),
                                             quadtree: None,
-                                            hilbert: None,
                                             point_only: gl.point_only,
                                             world_bbox,
                                         }))
@@ -604,6 +603,9 @@ impl GisEditorApp {
                                         kde_cache: None,
                                         saved_heatmaps: Vec::new(),
                                         active_saved_heatmap: None,
+                                        show_gridbin: false,
+                                        gridbin_cache: None,
+                                        gridbin_metric: crate::heatmap::HeatmapMetric::Density,
                                         show_bivariate_grid: false,
                                         bivariate_grid_cache: None,
                                         saved_bivariate_grids: Vec::new(),
@@ -689,6 +691,9 @@ impl GisEditorApp {
                                         kde_cache: None,
                                         saved_heatmaps: Vec::new(),
                                         active_saved_heatmap: None,
+                                        show_gridbin: false,
+                                        gridbin_cache: None,
+                                        gridbin_metric: crate::heatmap::HeatmapMetric::Density,
                                         show_bivariate_grid: false,
                                         bivariate_grid_cache: None,
                                         saved_bivariate_grids: Vec::new(),
@@ -1093,6 +1098,35 @@ impl GisEditorApp {
                 }
             }
         }
+        if let Some(rx) = &mut self.gridbin_rx {
+            match rx.try_recv() {
+                Ok(Some((layer_idx, heatmap, saved))) => {
+                    self.gridbin_rx = None;
+                    self.gridbin_running = false;
+                    if let Some(entry) = self.layers.get_mut(layer_idx) {
+                        entry.gridbin_cache = Some(heatmap);
+                        entry.gridbin_metric = if saved.units == "Density" {
+                            crate::heatmap::HeatmapMetric::Density
+                        } else {
+                            crate::heatmap::HeatmapMetric::AttributeMean
+                        };
+                        entry.show_gridbin = true;
+                        entry.saved_heatmaps.push(saved);
+                        entry.active_saved_heatmap = Some(entry.saved_heatmaps.len() - 1);
+                    }
+                    self.status = "Grid binning done.".to_string();
+                }
+                Ok(None) => {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(_) => {
+                    self.gridbin_rx = None;
+                    self.gridbin_running = false;
+                    self.status = "Grid binning failed.".to_string();
+                }
+            }
+        }
         if let Some(rx) = &mut self.raster_export_rx {
             match rx.try_recv() {
                 Ok(Some((layer_idx, path_str))) => {
@@ -1160,24 +1194,6 @@ impl GisEditorApp {
                 }
             }
             self.last_split_density = capacity;
-            self.points_dirty = true;
-            self.viewport_load_pending = true;
-            self.viewport_stable_frames = 0;
-        }
-        if self.hilbert_order != self.last_hilbert_order {
-            let order = self.hilbert_order;
-            for entry in &mut self.layers {
-                match &mut entry.data {
-                    LayerKind::Points(point_layer) => {
-                        point_layer.rebuild_hilbert_tree(order);
-                    }
-                    LayerKind::Vector(vector_layer) => {
-                        vector_layer.rebuild_hilbert_tree(order);
-                    }
-                    LayerKind::Raster(_) => {}
-                }
-            }
-            self.last_hilbert_order = order;
             self.points_dirty = true;
             self.viewport_load_pending = true;
             self.viewport_stable_frames = 0;

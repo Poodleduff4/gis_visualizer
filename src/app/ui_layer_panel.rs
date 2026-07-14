@@ -45,11 +45,11 @@ impl GisEditorApp {
                     let mut rebuild_quadtree_idx: Option<usize> = None;
                     let mut rebuild_rtree_idx: Option<usize> = None;
                     let mut rebuild_uncertainty_quadtree_idx: Option<usize> = None;
-                    let mut rebuild_hilbert_idx: Option<usize> = None;
                     let mut visibility_changed = false;
                     let mut set_active_selection: Option<(usize, usize)> = None;
                     let mut remove_selection: Option<(usize, usize)> = None;
                     let mut save_heatmap_idx: Option<usize> = None;
+                    let mut save_gridbin_idx: Option<usize> = None;
                     let mut export_heatmap: Option<(usize, usize)> = None;
                     let mut promote_heatmap: Option<(usize, usize)> = None;
                     let mut remove_heatmap: Option<(usize, usize)> = None;
@@ -139,34 +139,18 @@ impl GisEditorApp {
                                         ui.close_kind(egui::UiKind::Menu);
                                     }
                                     ui.separator();
-                                    if ui.button("Build Hilbert").clicked() {
-                                        rebuild_hilbert_idx = Some(i);
-                                        ui.close_kind(egui::UiKind::Menu);
-                                    }
-                                    ui.separator();
 
                                     let has_quadtree =
                                         entry.data.index(IndexKind::Quadtree).is_some();
-                                    let has_hilbert =
-                                        entry.data.index(IndexKind::Hilbert).is_some();
-                                    if has_quadtree || has_hilbert {
+                                    if has_quadtree {
                                         ui.checkbox(&mut entry.show_index, "Show Spatial Index");
                                         if entry.show_index {
                                             ui.indent("layer_index_kind", |ui| {
-                                                if has_quadtree {
-                                                    ui.radio_value(
-                                                        &mut entry.index_kind,
-                                                        IndexKind::Quadtree,
-                                                        "Quadtree",
-                                                    );
-                                                }
-                                                if has_hilbert {
-                                                    ui.radio_value(
-                                                        &mut entry.index_kind,
-                                                        IndexKind::Hilbert,
-                                                        "Hilbert R-Tree",
-                                                    );
-                                                }
+                                                ui.radio_value(
+                                                    &mut entry.index_kind,
+                                                    IndexKind::Quadtree,
+                                                    "Quadtree",
+                                                );
                                             });
                                         }
                                         ui.separator();
@@ -213,6 +197,28 @@ impl GisEditorApp {
 
                                     if entry.kde_cache.is_some() {
                                         ui.checkbox(&mut entry.show_kde, "Show KDE Heatmap");
+                                        ui.separator();
+                                    }
+
+                                    if entry.gridbin_cache.is_some() {
+                                        ui.checkbox(&mut entry.show_gridbin, "Show Grid Binning");
+                                        if entry.show_gridbin {
+                                            ui.indent("layer_gridbin_metric", |ui| {
+                                                ui.radio_value(
+                                                    &mut entry.gridbin_metric,
+                                                    crate::heatmap::HeatmapMetric::Density,
+                                                    "Density",
+                                                );
+                                                ui.radio_value(
+                                                    &mut entry.gridbin_metric,
+                                                    crate::heatmap::HeatmapMetric::AttributeMean,
+                                                    "Attribute Average",
+                                                );
+                                                if ui.button("💾 Save this grid").clicked() {
+                                                    save_gridbin_idx = Some(i);
+                                                }
+                                            });
+                                        }
                                         ui.separator();
                                     }
 
@@ -313,6 +319,9 @@ impl GisEditorApp {
                                                             "🔲"
                                                         }
                                                         crate::heatmap::HeatmapKind::Kde => "🎯",
+                                                        crate::heatmap::HeatmapKind::GridBin => {
+                                                            "🟩"
+                                                        }
                                                     };
                                                     let full = format!("{icon} {}", saved.name);
                                                     if ui
@@ -453,17 +462,6 @@ impl GisEditorApp {
                         }
                         self.layers[idx].heatmap_dirty = true;
                     }
-                    if let Some(idx) = rebuild_hilbert_idx {
-                        let order = self.hilbert_order;
-                        match &mut self.layers[idx].data {
-                            LayerKind::Points(pc) => pc.rebuild_hilbert_tree(order),
-                            LayerKind::Vector(gl) => gl.rebuild_hilbert_tree(order),
-                            LayerKind::Raster(_) => {}
-                        }
-                        self.fitted = true;
-                        self.viewport_load_pending = true;
-                        self.viewport_stable_frames = 0;
-                    }
                     if visibility_changed {
                         self.points_dirty = true;
                         self.globe_points_dirty = true;
@@ -501,6 +499,24 @@ impl GisEditorApp {
                             let saved = crate::heatmap::SavedHeatmap::new(
                                 name,
                                 crate::heatmap::HeatmapKind::Quadtree,
+                                cells,
+                                units,
+                            );
+                            let entry = &mut self.layers[li];
+                            entry.saved_heatmaps.push(saved);
+                            entry.active_saved_heatmap = Some(entry.saved_heatmaps.len() - 1);
+                        }
+                    }
+                    if let Some(li) = save_gridbin_idx {
+                        let entry = &self.layers[li];
+                        if let Some(gridbin) = &entry.gridbin_cache {
+                            let metric = entry.gridbin_metric;
+                            let cells = gridbin.raw_cells(metric);
+                            let name = format!("Gridbin {}", gridbin.metric_label(metric));
+                            let units = gridbin.metric_label(metric);
+                            let saved = crate::heatmap::SavedHeatmap::new(
+                                name,
+                                crate::heatmap::HeatmapKind::GridBin,
                                 cells,
                                 units,
                             );

@@ -303,6 +303,85 @@ impl GisEditorApp {
                     }
                 }
 
+                if self.layers[idx].show_gridbin {
+                    if let Some(gridbin) = &self.layers[idx].gridbin_cache {
+                        let gridbin_metric = self.layers[idx].gridbin_metric;
+                        let roi_bboxes = &self.layers[idx].roi_bboxes;
+                        show_quadtree_heatmap(
+                            &painter,
+                            gridbin,
+                            gridbin_metric,
+                            roi_bboxes,
+                            &self.viewport,
+                            response.rect,
+                            self.heatmap_opacity,
+                        );
+
+                        // ── Legend: gradient bar + range + meaning ──────────────
+                        let (title, min_val, max_val) = match gridbin_metric {
+                            HeatmapMetric::AttributeMean => (
+                                format!("Gridbin: {} (avg)", gridbin.attribute_name),
+                                gridbin.min_attribute_value,
+                                gridbin.max_attribute_value,
+                            ),
+                            _ => (
+                                "Gridbin: Density (points/cell)".to_string(),
+                                0.0,
+                                gridbin.max_density,
+                            ),
+                        };
+                        let r = response.rect;
+                        let bar_w = 200.0_f32;
+                        let bar_h = 14.0_f32;
+                        let x = r.min.x + 10.0;
+                        let y = r.max.y - 46.0 - (heatmap_legend_slot as f32) * 66.0;
+                        heatmap_legend_slot += 1;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x - 4.0, y - 18.0),
+                                egui::vec2(bar_w + 8.0, bar_h + 40.0),
+                            ),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                        );
+                        painter.text(
+                            egui::pos2(x, y - 16.0),
+                            egui::Align2::LEFT_TOP,
+                            &title,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        let steps = 40;
+                        for i in 0..steps {
+                            let t0 = i as f32 / steps as f32;
+                            let t1 = (i + 1) as f32 / steps as f32;
+                            let color = crate::map_view::heat_color(t0, 255);
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(x + t0 * bar_w, y),
+                                    egui::pos2(x + t1 * bar_w, y + bar_h),
+                                ),
+                                0.0,
+                                color,
+                            );
+                        }
+                        painter.text(
+                            egui::pos2(x, y + bar_h + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{:.3}", min_val),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x + bar_w, y + bar_h + 2.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{:.3}", max_val),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+
                 if self.layers[idx].show_kde {
                     if let Some(kde) = &self.layers[idx].kde_cache {
                         let roi_bboxes = &self.layers[idx].roi_bboxes;

@@ -283,7 +283,6 @@ pub fn decode_vector_layer(bytes: &[u8], name: String) -> Result<GisLayer> {
         field_names,
         extra_field_names: Vec::new(),
         quadtree: None,
-        hilbert: None,
         point_only: false,
         world_bbox,
     })
@@ -423,6 +422,9 @@ pub fn layer_entry_for(name: String, data: LayerKind) -> LayerEntry {
         kde_cache: None,
         saved_heatmaps: Vec::new(),
         active_saved_heatmap: None,
+        show_gridbin: false,
+        gridbin_cache: None,
+        gridbin_metric: crate::heatmap::HeatmapMetric::Density,
         show_bivariate_grid: false,
         bivariate_grid_cache: None,
         saved_bivariate_grids: Vec::new(),
@@ -457,7 +459,6 @@ mod tests {
             field_names: vec!["name".into(), "count".into(), "score".into()],
             extra_field_names: Vec::new(),
             quadtree: None,
-            hilbert: None,
             point_only: true,
             world_bbox: [1.0, 2.0, 3.0, 4.0],
         }

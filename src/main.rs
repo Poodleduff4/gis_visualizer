@@ -9,9 +9,8 @@ mod gpu_collect;
 mod histogram;
 mod gis_layer;
 mod gis_reader;
+mod gridbin;
 mod heatmap;
-mod hilbert_curve;
-mod hilbert_r_tree;
 mod kde;
 mod map_view;
 #[cfg(not(target_arch = "wasm32"))]

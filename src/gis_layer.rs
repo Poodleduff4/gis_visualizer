@@ -7,7 +7,6 @@ use std::sync::mpsc;
 
 use crate::filter::{FilterLogic, LayerAttributeFilter};
 use crate::gis_reader::LayerDescriptor;
-use crate::hilbert_r_tree::HilbertRTree;
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 use crate::quadtree::Quadtree;
 use crate::spatial_index::{IndexKind, SpatialIndex};
@@ -601,6 +600,16 @@ pub struct LayerEntry {
     /// Index into `saved_heatmaps` currently loaded into `kde_cache` for
     /// display, if any — drives the selected-row highlight in the layer panel.
     pub active_saved_heatmap: Option<usize>,
+    /// Whether the uniform-grid binning overlay is shown. Independent of
+    /// `show_heatmap` (adaptive-quadtree-based, near-uniform leaf counts) and
+    /// `show_kde` — a fixed cell size, so raw count-per-cell is a real
+    /// density signal.
+    pub show_gridbin: bool,
+    pub gridbin_cache: Option<crate::heatmap::HeatmapLayer>,
+    /// Which of `gridbin_cache`'s metrics colors the overlay — only
+    /// `Density`/`AttributeMean` are meaningful (no per-cell samples for
+    /// `Unpredictability`).
+    pub gridbin_metric: crate::heatmap::HeatmapMetric,
     /// Whether the bivariate grid overlay is shown.
     pub show_bivariate_grid: bool,
     pub bivariate_grid_cache: Option<crate::bivariate::BivariateGridLayer>,
@@ -629,7 +638,6 @@ pub struct GisLayer {
     pub field_names: Vec<String>,
     pub extra_field_names: Vec<String>,
     pub quadtree: Option<SpatialIndex>,
-    pub hilbert: Option<SpatialIndex>,
     pub point_only: bool,
     pub world_bbox: [f64; 4],
 }
@@ -638,7 +646,6 @@ impl GisLayer {
     pub fn index(&self, kind: IndexKind) -> Option<&SpatialIndex> {
         match kind {
             IndexKind::Quadtree => self.quadtree.as_ref(),
-            IndexKind::Hilbert => self.hilbert.as_ref(),
         }
     }
 
@@ -667,15 +674,6 @@ impl GisLayer {
             qt.insert(f.id, f.bbox());
         }
         self.quadtree = Some(qt);
-    }
-
-    pub fn rebuild_hilbert_tree(&mut self, order: u32) {
-        self.ensure_world_bbox();
-        let mut ht = SpatialIndex::HilbertCurve(HilbertRTree::new(self.world_bbox, order));
-        for f in &self.features {
-            ht.insert(f.id, f.bbox());
-        }
-        self.hilbert = Some(ht);
     }
 }
 

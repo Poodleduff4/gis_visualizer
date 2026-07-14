@@ -128,8 +128,6 @@ pub struct GisEditorApp {
     pub(super) gpu_vector_line_verts_buf: Vec<GpuVertex>,
     pub(super) spatial_index_split_density: usize,
     pub(super) last_split_density: usize,
-    pub(super) hilbert_order: u32,
-    pub(super) last_hilbert_order: u32,
     pub(super) last_viewport_center: [f64; 2],
     pub(super) last_viewport_ppu: f64,
     pub(super) last_canvas_rect: Option<Rect>,
@@ -182,6 +180,15 @@ pub struct GisEditorApp {
     pub(super) kde_weight_field: Option<String>,
     pub(super) kde_running: bool,
     pub(super) kde_rx: Option<
+        oneshot::Receiver<(usize, crate::heatmap::HeatmapLayer, crate::heatmap::SavedHeatmap)>,
+    >,
+
+    // ── Uniform grid binning (fixed-size hexbin/gridbin) ───────────────────
+    pub(super) gridbin_window_open: bool,
+    pub(super) gridbin_cell_size: f64,
+    pub(super) gridbin_field: Option<String>,
+    pub(super) gridbin_running: bool,
+    pub(super) gridbin_rx: Option<
         oneshot::Receiver<(usize, crate::heatmap::HeatmapLayer, crate::heatmap::SavedHeatmap)>,
     >,
 
@@ -310,8 +317,6 @@ impl GisEditorApp {
             gpu_vector_line_verts_buf: Vec::new(),
             spatial_index_split_density: 10000,
             last_split_density: 10000,
-            hilbert_order: 6,
-            last_hilbert_order: 6,
             load_rx: None,
             load_layer_descriptor_rx: ld_rx,
             load_layer_descriptor_tx: ld_tx,
@@ -373,6 +378,11 @@ impl GisEditorApp {
             kde_weight_field: None,
             kde_running: false,
             kde_rx: None,
+            gridbin_window_open: false,
+            gridbin_cell_size: 0.01,
+            gridbin_field: None,
+            gridbin_running: false,
+            gridbin_rx: None,
             bivariate_grid_window_open: false,
             bivariate_grid_cell_size: 0.01,
             bivariate_grid_field_a: None,
@@ -425,30 +435,18 @@ impl GisEditorApp {
             .layers
             .iter()
             .map(|le| {
-                let (quadtree_capacity, hilbert_order, built_rtree, uncertainty) = match &le.data {
+                let (quadtree_capacity, built_rtree, uncertainty) = match &le.data {
                     LayerKind::Vector(gl) => {
                         let quadtree_capacity =
                             gl.quadtree.as_ref().and_then(|si| si.get_capacity());
-                        let hilbert_order = match &gl.hilbert {
-                            Some(crate::spatial_index::SpatialIndex::HilbertCurve(ht)) => {
-                                Some(ht.get_order())
-                            }
-                            _ => None,
-                        };
-                        (quadtree_capacity, hilbert_order, false, None)
+                        (quadtree_capacity, false, None)
                     }
                     LayerKind::Points(pc) => match pc.index.as_deref() {
                         Some(crate::spatial_index::SpatialIndex::Quadtree(qt)) => {
-                            (qt.get_capacity(), None, false, None)
+                            (qt.get_capacity(), false, None)
                         }
-                        Some(crate::spatial_index::SpatialIndex::HilbertCurve(ht)) => {
-                            (None, Some(ht.get_order()), false, None)
-                        }
-                        Some(crate::spatial_index::SpatialIndex::RTree(_)) => {
-                            (None, None, true, None)
-                        }
+                        Some(crate::spatial_index::SpatialIndex::RTree(_)) => (None, true, None),
                         Some(crate::spatial_index::SpatialIndex::UncertaintyQuadtree(uq)) => (
-                            None,
                             None,
                             false,
                             Some(crate::snapshot::UncertaintySnapshot {
@@ -460,9 +458,9 @@ impl GisEditorApp {
                                 max_depth: uq.max_depth(),
                             }),
                         ),
-                        None => (None, None, false, None),
+                        None => (None, false, None),
                     },
-                    LayerKind::Raster(_) => (None, None, false, None),
+                    LayerKind::Raster(_) => (None, false, None),
                 };
                 LayerSnapshot {
                     file_path: le.descriptor.location.to_string(),
@@ -475,7 +473,6 @@ impl GisEditorApp {
                     filter_logic: filter_logic_to_str(le.filter_logic),
                     filters: le.filters.iter().filter_map(filter_to_snapshot).collect(),
                     quadtree_capacity,
-                    hilbert_order,
                     built_rtree,
                     uncertainty,
                     selections: le
@@ -551,15 +548,10 @@ impl GisEditorApp {
                         if let Some(cap) = layer_snap.quadtree_capacity {
                             gl.rebuild_quadtree(cap);
                         }
-                        if let Some(order) = layer_snap.hilbert_order {
-                            gl.rebuild_hilbert_tree(order);
-                        }
                     }
                     LayerKind::Points(pc) => {
                         if let Some(cap) = layer_snap.quadtree_capacity {
                             pc.rebuild_quadtree(cap);
-                        } else if let Some(order) = layer_snap.hilbert_order {
-                            pc.rebuild_hilbert_tree(order);
                         } else if layer_snap.built_rtree {
                             pc.rebuild_rtree();
                         } else if let Some(u) = &layer_snap.uncertainty {

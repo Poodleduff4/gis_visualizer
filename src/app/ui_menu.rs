@@ -23,7 +23,7 @@ impl GisEditorApp {
                     ui.horizontal(|ui| {
                         ui.label("Quadtree Split Density:");
                         ui.add(
-                            egui::Slider::new(&mut self.spatial_index_split_density, 100..=10000)
+                            egui::Slider::new(&mut self.spatial_index_split_density, 100..=50000)
                                 .step_by(5.0),
                         );
                     });
@@ -51,10 +51,6 @@ impl GisEditorApp {
                         ui.add(
                             egui::Slider::new(&mut self.uncertainty_max_depth, 1..=20).step_by(1.0),
                         );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Heatmap Opacity:");
-                        ui.add(egui::Slider::new(&mut self.hilbert_order, 1..=12).step_by(1.0));
                     });
                     ui.horizontal(|ui| {
                         ui.label("Heatmap Opacity:");
@@ -121,6 +117,10 @@ impl GisEditorApp {
                     }
                     if ui.button("Bivariate Grid Analysis…").clicked() {
                         self.bivariate_grid_window_open = true;
+                        ui.close_kind(UiKind::Menu);
+                    }
+                    if ui.button("Grid Binning (Hexbin)…").clicked() {
+                        self.gridbin_window_open = true;
                         ui.close_kind(UiKind::Menu);
                     }
                 });

@@ -34,7 +34,6 @@ fn sample_layer() -> GisLayer {
         field_names: vec!["label".into(), "count".into()],
         extra_field_names: Vec::new(),
         quadtree: None,
-        hilbert: None,
         point_only: true,
         world_bbox: [10.0, 20.0, 30.0, 40.0],
     }
@@ -135,7 +134,6 @@ fn buffer_tool_plugin_receives_its_distance_param_via_init() {
         field_names: Vec::new(),
         extra_field_names: Vec::new(),
         quadtree: None,
-        hilbert: None,
         point_only: true,
         world_bbox: [0.0, 0.0, 0.0, 0.0],
     };
