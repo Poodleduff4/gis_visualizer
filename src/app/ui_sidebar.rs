@@ -105,6 +105,60 @@ fn evaluate_filters_in_memory(
         .collect()
 }
 
+/// Evaluates `filters` against `gl`'s in-memory feature attributes, returning
+/// the ids (== index in `gl.features`) of features that pass. Vector features
+/// live fully in memory already (unlike points, which may stream from
+/// parquet), so this is the only evaluation path — no backing-file query.
+fn evaluate_filters_in_memory_vector(
+    gl: &crate::gis_layer::GisLayer,
+    filters: &[LayerAttributeFilter],
+    use_and: bool,
+) -> Vec<u32> {
+    gl.features
+        .iter()
+        .filter_map(|feature| {
+            let eval = |f: &LayerAttributeFilter| {
+                let Some(attr) = f.attribute.as_deref() else {
+                    return false;
+                };
+                let Some(value) = feature.attributes.get(attr) else {
+                    return false;
+                };
+                let raw = &f.comparitor_raw;
+                match (&f.operation, value) {
+                    (Some(FilterOperation::GreaterThan), AttributeValue::Float(v)) => {
+                        raw.parse::<f64>().map(|t| *v > t).unwrap_or(false)
+                    }
+                    (Some(FilterOperation::LessThan), AttributeValue::Float(v)) => {
+                        raw.parse::<f64>().map(|t| *v < t).unwrap_or(false)
+                    }
+                    (Some(FilterOperation::Equal), AttributeValue::Float(v)) => raw
+                        .parse::<f64>()
+                        .map(|t| (*v - t).abs() < 1e-9)
+                        .unwrap_or(false),
+                    (Some(FilterOperation::GreaterThan), AttributeValue::Integer(v)) => {
+                        raw.parse::<i64>().map(|t| *v > t).unwrap_or(false)
+                    }
+                    (Some(FilterOperation::LessThan), AttributeValue::Integer(v)) => {
+                        raw.parse::<i64>().map(|t| *v < t).unwrap_or(false)
+                    }
+                    (Some(FilterOperation::Equal), AttributeValue::Integer(v)) => {
+                        raw.parse::<i64>().map(|t| *v == t).unwrap_or(false)
+                    }
+                    (Some(FilterOperation::Equal), AttributeValue::Text(v)) => v == raw,
+                    _ => false,
+                }
+            };
+            let passes = if use_and {
+                filters.iter().all(|f| eval(f))
+            } else {
+                filters.iter().any(|f| eval(f))
+            };
+            passes.then_some(feature.id as u32)
+        })
+        .collect()
+}
+
 fn union_bboxes(bboxes: &[[f64; 4]]) -> Option<[f64; 4]> {
     bboxes.iter().copied().reduce(|a, b| {
         [
@@ -565,6 +619,7 @@ impl GisEditorApp {
                                         Some(LayerKind::Vector(crate::gis_layer::GisLayer {
                                             name: new_name.clone(),
                                             file_path: String::new(),
+                                            filter_mask: bitvec![1; new_features.len()],
                                             features: new_features,
                                             field_names: gl.field_names.clone(),
                                             extra_field_names: gl.extra_field_names.clone(),
@@ -583,6 +638,7 @@ impl GisEditorApp {
                                         show_points: true,
                                         name: new_name,
                                         color,
+                                        color_by: None,
                                         opacity,
                                         descriptor,
                                         filters: Vec::new(),
@@ -673,6 +729,7 @@ impl GisEditorApp {
                                         show_points: true,
                                         name: new_name,
                                         color,
+                                        color_by: None,
                                         opacity,
                                         descriptor,
                                         filters: Vec::new(),
@@ -871,7 +928,11 @@ impl GisEditorApp {
                     // every point. Evaluate in memory instead, same as wasm
                     // (which has no local DataFusion at all) always does.
                     let file_path = layer.descriptor.location.to_string();
-                    let no_backing_file = file_path.is_empty();
+                    // Vector (FlatGeobuf) layers are never DataFusion/parquet
+                    // backed, regardless of `location` — always evaluate
+                    // those in memory.
+                    let no_backing_file =
+                        file_path.is_empty() || matches!(layer.data, LayerKind::Vector(_));
 
                     #[cfg(not(target_arch = "wasm32"))]
                     if !no_backing_file {
@@ -925,7 +986,10 @@ impl GisEditorApp {
                             LayerKind::Points(pc) => {
                                 evaluate_filters_in_memory(pc, &layer.filters, use_and)
                             }
-                            _ => Vec::new(),
+                            LayerKind::Vector(gl) => {
+                                evaluate_filters_in_memory_vector(gl, &layer.filters, use_and)
+                            }
+                            LayerKind::Raster(_) => Vec::new(),
                         };
                         let (tx, rx) = oneshot::channel::<(usize, Vec<u32>)>();
                         self.filtered_idx_rx = Some(rx);
@@ -961,7 +1025,19 @@ impl GisEditorApp {
                                 self.roi_rebuild_pending = true;
                                 ui.request_repaint();
                             }
-                            LayerKind::Vector(_) | LayerKind::Raster(_) => {}
+                            LayerKind::Vector(gl) => {
+                                let matching: std::collections::HashSet<u32> =
+                                    idx_vec.into_iter().collect();
+                                let mut mask: BitVec = bitvec![0; gl.features.len()];
+                                for feature in &gl.features {
+                                    if matching.contains(&(feature.id as u32)) {
+                                        mask.set(feature.id, true);
+                                    }
+                                }
+                                gl.filter_mask = mask;
+                                ui.request_repaint();
+                            }
+                            LayerKind::Raster(_) => {}
                         }
                     }
                 }

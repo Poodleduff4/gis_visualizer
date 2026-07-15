@@ -1490,6 +1490,7 @@ impl GisReader {
                 quadtree: None,
                 point_only: true,
                 world_bbox: [0., 0., 0., 0.],
+                filter_mask: bitvec![1; 0],
             }),
         };
         LayerEntry {
@@ -1498,6 +1499,7 @@ impl GisReader {
             show_points: true,
             name: descriptor.name.clone(),
             color: [0, 0, 255],
+            color_by: None,
             opacity: 255,
             descriptor: descriptor.clone(),
             filters: Vec::new(),

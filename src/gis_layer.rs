@@ -354,6 +354,25 @@ pub fn ramp_rgba(t: f64) -> [u8; 4] {
     [r, g, b, 255]
 }
 
+/// Fixed distinguishable palette for categorical (color-by-attribute)
+/// styling — cycles if there are more distinct values than colors.
+const CATEGORICAL_PALETTE: [[u8; 3]; 10] = [
+    [0x1f, 0x77, 0xb4],
+    [0xff, 0x7f, 0x0e],
+    [0x2c, 0xa0, 0x2c],
+    [0xd6, 0x27, 0x28],
+    [0x94, 0x67, 0xbd],
+    [0x8c, 0x56, 0x4b],
+    [0xe3, 0x77, 0xc2],
+    [0x7f, 0x7f, 0x7f],
+    [0xbc, 0xbd, 0x22],
+    [0x17, 0xbe, 0xcf],
+];
+
+pub fn categorical_color(index: usize) -> [u8; 3] {
+    CATEGORICAL_PALETTE[index % CATEGORICAL_PALETTE.len()]
+}
+
 fn norm_channel(v: f32, lo: f64, hi: f64) -> Option<u8> {
     if v.is_nan() {
         return None;
@@ -408,7 +427,7 @@ impl LayerKind {
     pub fn reset_filter_mask(&mut self) {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.filter_mask.fill(true),
-            LayerKind::Vector(gis_layer) => {}
+            LayerKind::Vector(gis_layer) => gis_layer.filter_mask.fill(true),
             LayerKind::Raster(_) => {}
         }
     }
@@ -569,6 +588,10 @@ pub struct LayerEntry {
     pub show_points: bool,
     pub name: String,
     pub color: [u8; 3],
+    /// When set, vector features are colored by the distinct values of this
+    /// attribute (see `categorical_color`) instead of the uniform `color`
+    /// above. Ignored for Points/Raster layers.
+    pub color_by: Option<String>,
     pub opacity: u8,
     pub descriptor: LayerDescriptor,
     pub filters: Vec<LayerAttributeFilter>,
@@ -640,6 +663,9 @@ pub struct GisLayer {
     pub quadtree: Option<SpatialIndex>,
     pub point_only: bool,
     pub world_bbox: [f64; 4],
+    /// One bit per `features` entry; `false` means filtered out (mirrors
+    /// `PointCloudLayer::filter_mask`). Starts all-`true`.
+    pub filter_mask: bitvec::vec::BitVec,
 }
 
 impl GisLayer {

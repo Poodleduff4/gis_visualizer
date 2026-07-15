@@ -12,6 +12,7 @@ impl GisEditorApp {
             let mut open = true;
             let mut hist_recompute = false;
             let mut hist_apply_filter: Option<(String, f64, f64)> = None;
+            let mut hist_select_on_map: Option<(String, f64, f64)> = None;
 
             egui::Window::new("Histogram")
                 .open(&mut open)
@@ -108,6 +109,17 @@ impl GisEditorApp {
                                 hist_apply_filter =
                                     Some((hist.field.clone(), hist.range_lo, hist.range_hi));
                             }
+                            if ui
+                                .button("🔗 Select on Map")
+                                .on_hover_text(
+                                    "Brush this range: highlights matching points on the map \
+                                     and drives Selection Stats, without hiding the rest.",
+                                )
+                                .clicked()
+                            {
+                                hist_select_on_map =
+                                    Some((hist.field.clone(), hist.range_lo, hist.range_hi));
+                            }
                         });
                         ui.label(format!(
                             "min: {:.4}  max: {:.4}  bins: {}",
@@ -150,6 +162,44 @@ impl GisEditorApp {
                         comparitor_raw: hi.to_string(),
                     });
                     self.updated_filters = true;
+                }
+            }
+            if let Some((field, lo, hi)) = hist_select_on_map {
+                if let Some(idx) = self.active_layer_idx {
+                    if let LayerKind::Points(pc) = &self.layers[idx].data {
+                        if let Some(col_idx) = pc.field_names.iter().position(|n| n == &field) {
+                            let ids: Vec<usize> = pc
+                                .points
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| pc.filter_mask[*i])
+                                .filter_map(|(i, _)| {
+                                    let v = match &pc.attributes[col_idx] {
+                                        crate::point_cloud_layer::AttributeColumn::Float(v) => {
+                                            v[i]
+                                        }
+                                        crate::point_cloud_layer::AttributeColumn::Integer(v) => {
+                                            v[i] as f64
+                                        }
+                                        crate::point_cloud_layer::AttributeColumn::Text(_) => {
+                                            return None
+                                        }
+                                    };
+                                    (v >= lo && v <= hi).then_some(i)
+                                })
+                                .collect();
+                            let bbox = pc.bbox.unwrap_or([0.0, 0.0, 0.0, 0.0]);
+                            let entry = &mut self.layers[idx];
+                            let name = format!("Histogram: {field} ∈ [{lo:.3}, {hi:.3}]");
+                            entry.selections.push(crate::gis_layer::LayerSelection {
+                                name,
+                                bbox,
+                                ids,
+                            });
+                            entry.active_selection = Some(entry.selections.len() - 1);
+                            self.points_dirty = true;
+                        }
+                    }
                 }
             }
         }
@@ -285,7 +335,13 @@ impl GisEditorApp {
                 let name = self.layers[layer_idx].name.clone();
                 let mut color = self.layers[layer_idx].color;
                 let mut opacity = self.layers[layer_idx].opacity;
+                let mut color_by = self.layers[layer_idx].color_by.clone();
+                let vector_fields = match &self.layers[layer_idx].data {
+                    crate::gis_layer::LayerKind::Vector(gl) => Some(gl.field_names.clone()),
+                    _ => None,
+                };
                 let mut changed = false;
+                let mut color_by_changed = false;
                 egui::Window::new("Layer Color")
                     .open(&mut open)
                     .resizable(false)
@@ -302,12 +358,44 @@ impl GisEditorApp {
                         if ui.add(egui::Slider::new(&mut opacity, 0..=255)).changed() {
                             changed = true;
                         }
+                        if let Some(fields) = &vector_fields {
+                            ui.separator();
+                            ui.label("Color by attribute:");
+                            egui::ComboBox::from_id_salt("color_by_attr")
+                                .selected_text(color_by.as_deref().unwrap_or("(fixed color)"))
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(color_by.is_none(), "(fixed color)")
+                                        .clicked()
+                                    {
+                                        color_by = None;
+                                        color_by_changed = true;
+                                    }
+                                    for field in fields {
+                                        if ui
+                                            .selectable_label(
+                                                color_by.as_deref() == Some(field.as_str()),
+                                                field,
+                                            )
+                                            .clicked()
+                                        {
+                                            color_by = Some(field.clone());
+                                            color_by_changed = true;
+                                        }
+                                    }
+                                });
+                        }
                     });
                 if changed {
                     self.layers[layer_idx].color = color;
                     self.layers[layer_idx].opacity = opacity;
                     self.points_dirty = true;
                     self.globe_points_dirty = true;
+                    self.map_render_ttl = 3;
+                }
+                if color_by_changed {
+                    self.layers[layer_idx].color_by = color_by;
+                    self.points_dirty = true;
                     self.map_render_ttl = 3;
                 }
                 if !open {

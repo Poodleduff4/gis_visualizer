@@ -199,6 +199,7 @@ pub fn build_layer_entry(
         show_points: true,
         name: name.clone(),
         color: [255, 255, 255],
+        color_by: None,
         opacity: 255,
         descriptor: LayerDescriptor {
             name,

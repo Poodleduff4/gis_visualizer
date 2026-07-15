@@ -276,6 +276,7 @@ pub fn decode_vector_layer(bytes: &[u8], name: String) -> Result<GisLayer> {
         })
         .unwrap_or([0.0, 0.0, 0.0, 0.0]);
 
+    let filter_mask = bitvec::bitvec![1; features.len()];
     Ok(GisLayer {
         name,
         file_path: String::new(),
@@ -284,6 +285,7 @@ pub fn decode_vector_layer(bytes: &[u8], name: String) -> Result<GisLayer> {
         extra_field_names: Vec::new(),
         quadtree: None,
         point_only: false,
+        filter_mask,
         world_bbox,
     })
 }
@@ -404,6 +406,7 @@ pub fn layer_entry_for(name: String, data: LayerKind) -> LayerEntry {
         show_points: true,
         name,
         color: [0, 128, 255],
+        color_by: None,
         opacity: 255,
         descriptor,
         filters: Vec::new(),
@@ -461,6 +464,7 @@ mod tests {
             quadtree: None,
             point_only: true,
             world_bbox: [1.0, 2.0, 3.0, 4.0],
+            filter_mask: bitvec::bitvec![1; 2],
         }
     }
 

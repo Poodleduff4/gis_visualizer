@@ -1,0 +1,39 @@
+name = "od-flow-lines"
+entrypoint = "main.py"
+capabilities = ["read_layers", "add_layer"]
+
+[[params]]
+name = "od_layer"
+label = "OD points layer (geometry = origin)"
+kind = "layer"
+layer_kind = "points"
+
+[[params]]
+name = "dest_lat_col"
+label = "Destination latitude column"
+kind = "text"
+default = "d_lat"
+
+[[params]]
+name = "dest_lon_col"
+label = "Destination longitude column"
+kind = "text"
+default = "d_lon"
+
+[[params]]
+name = "mode_col"
+label = "Mode choice column (optional)"
+kind = "text"
+default = "mode"
+
+[[params]]
+name = "activity_col"
+label = "Activity type column (optional)"
+kind = "text"
+default = "activity_type"
+
+[[params]]
+name = "bin_size"
+label = "Zone bin size, coordinate units (0 = no aggregation)"
+kind = "float"
+default = 0.0

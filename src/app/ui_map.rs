@@ -76,6 +76,7 @@ impl GisEditorApp {
                         ids,
                     });
                     entry.active_selection = Some(entry.selections.len() - 1);
+                    self.points_dirty = true;
                 }
             }
             if let Some(idx) = self.active_layer_idx {
