@@ -5,6 +5,10 @@ mod ui_layer_panel;
 mod ui_loading;
 mod ui_map;
 mod ui_menu;
+#[cfg(not(target_arch = "wasm32"))]
+mod plugin_bridge;
+#[cfg(not(target_arch = "wasm32"))]
+mod ui_plugins;
 mod ui_sidebar;
 mod ui_windows;
 
@@ -62,6 +66,12 @@ pub enum ClickTarget {
     HeatmapRoi,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectShape {
+    Rectangle,
+    Polygon,
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(super) fn now_ms() -> f64 {
     web_sys::window().unwrap().performance().unwrap().now()
@@ -97,7 +107,10 @@ pub struct GisEditorApp {
     pub(super) roi_rebuild_pending: bool,
     pub(super) click_target: ClickTarget,
     pub(super) select_mode: bool,
+    pub(super) select_shape: SelectShape,
     pub(super) select_drag_start: Option<egui::Pos2>,
+    /// World-space vertices of the polygon select tool's in-progress ring.
+    pub(super) select_polygon: Vec<[f64; 2]>,
 
     pub(super) pending_file: Option<GisFilePath>,
     pub(super) pending_file_descriptor: Option<LayerDescriptor>,
@@ -105,6 +118,36 @@ pub struct GisEditorApp {
     pub(super) pending_layers: Vec<(LayerDescriptor, bool, bool)>,
     pub(super) pending_load_mode: LoadMode,
     pub(super) pending_field_selection: Vec<(String, bool)>,
+    /// "Batch load" checkbox + batch size (features) in the Select Layers window.
+    pub(super) pending_batch_load: bool,
+    pub(super) pending_batch_size: u64,
+    /// On-demand batch loads (from the batch manager window), drained one at a
+    /// time — kept separate from `load_rx` so a follow-up batch load can't
+    /// collide with an in-progress initial stream. Entries are
+    /// (dest_idx, batch_idx, offset, limit).
+    pub(super) batch_rx: Option<mpsc::Receiver<BatchMessage>>,
+    pub(super) pending_batch_jobs: std::collections::VecDeque<(usize, u64, u64, u64)>,
+    /// The (dest_idx, batch_idx, offset, limit) job currently running in `batch_rx`.
+    pub(super) current_batch_job: Option<(usize, u64, u64, u64)>,
+    /// How many jobs are left in the currently-submitted batch group (one
+    /// "Load next batch" click = 1, one "Load range" click = the whole
+    /// range). Incoming batch messages are staged (cheap plain-Vec
+    /// extends) rather than merged into the layer's shared `Arc` points
+    /// vector until this hits 0 — merging per-job would re-clone the
+    /// entire already-loaded points vector once per batch in the range,
+    /// getting slower the more of the file is already loaded.
+    pub(super) pending_batch_group_remaining: u32,
+    pub(super) batch_staging_points: std::collections::HashMap<
+        usize,
+        (Vec<(u32, [f64; 2])>, Vec<(String, crate::point_cloud_layer::AttributeColumn)>),
+    >,
+    pub(super) batch_staging_vector:
+        std::collections::HashMap<usize, Vec<crate::gis_layer::GisFeature>>,
+    /// Which layer's Batch Load Manager window is open, if any.
+    pub(super) batch_load_window_idx: Option<usize>,
+    /// "From"/"to" batch index inputs in the Batch Load Manager window.
+    pub(super) batch_range_from: u64,
+    pub(super) batch_range_to: u64,
     pub(super) load_rx: Option<mpsc::Receiver<BatchMessage>>,
     pub(super) load_layer_descriptor_rx: mpsc::Receiver<LayerDescriptor>,
     pub(super) load_layer_descriptor_tx: mpsc::SyncSender<LayerDescriptor>,
@@ -113,9 +156,11 @@ pub struct GisEditorApp {
 
     pub(super) has_gpu: bool,
     pub point_size: f32,
+    pub vector_line_width: f32,
     pub(super) points_dirty: bool,
     pub(super) last_selected_id: Option<usize>,
     pub(super) last_point_size: f32,
+    pub(super) last_vector_line_width: f32,
     pub(super) last_layer_count: usize,
     pub(super) heatmap_opacity: u8,
     pub(super) gpu_points_buf: Vec<GpuPoint>,
@@ -124,8 +169,6 @@ pub struct GisEditorApp {
     pub(super) gpu_vector_line_verts_buf: Vec<GpuVertex>,
     pub(super) spatial_index_split_density: usize,
     pub(super) last_split_density: usize,
-    pub(super) hilbert_order: u32,
-    pub(super) last_hilbert_order: u32,
     pub(super) last_viewport_center: [f64; 2],
     pub(super) last_viewport_ppu: f64,
     pub(super) last_canvas_rect: Option<Rect>,
@@ -149,17 +192,41 @@ pub struct GisEditorApp {
     pub(super) histogram_field: String,
     pub(super) field_stats: Option<FieldStats>,
     pub(super) last_stats_field: String,
+    /// Which layer `field_stats` was last computed for — a sampled/selected
+    /// layer switches `active_layer_idx` without necessarily changing
+    /// `histogram_field`, so the field alone isn't enough to detect staleness.
+    pub(super) last_stats_layer: Option<usize>,
+    /// Set whenever a layer's `filter_mask` actually changes (filter results
+    /// landing, deselect, etc) — `updated_filters` alone isn't enough since
+    /// it flips back to `false` the moment an async filter query is
+    /// *dispatched*, well before the result lands and mutates the mask.
+    pub(super) stats_dirty: bool,
     pub(super) bivariate: Option<BivariateStats>,
     pub(super) show_bivariate: bool,
     pub(super) bivariate_y_field: String,
+    /// Lasso/polygon select on the scatter plot, in (x_field, y_field) plot
+    /// units — mirrors the map's polygon select tool but over attribute
+    /// space instead of world space.
+    pub(super) bivariate_lasso_active: bool,
+    /// In-progress ring being clicked out on the plot.
+    pub(super) bivariate_lasso: Vec<[f64; 2]>,
+    /// Closed ring awaiting "Select on Map".
+    pub(super) bivariate_lasso_ready: Vec<[f64; 2]>,
     pub(super) selection_field_a: String,
     pub(super) selection_field_b: String,
     pub(super) selection_bivariate: Option<SelectionBivariate>,
     pub(super) selection_histogram: Option<SelectionHistogram>,
     pub(super) selection_field_stats: Option<SelectionFieldStats>,
+    /// (layer idx, selection idx, field) the histogram/field-stats above were
+    /// last computed for — recompute only when this changes, not every frame.
+    pub(super) last_selection_stats_key: Option<(usize, usize, String)>,
+    /// Same idea for the bivariate scatter, keyed on both fields.
+    pub(super) last_selection_bivariate_key: Option<(usize, usize, String, String)>,
     /// Counts down from N after any map-relevant change; GPU callback runs while > 0 or cursor is in map.
     pub(super) map_render_ttl: u32,
     pub(super) color_picker_layer: Option<usize>,
+    pub(super) rename_layer_idx: Option<usize>,
+    pub(super) rename_layer_buffer: String,
 
     pub(super) spatial_field: String,
     pub(super) spatial_radius: f64,
@@ -176,12 +243,50 @@ pub struct GisEditorApp {
     pub(super) kde_radius: f64,
     pub(super) kde_kernel: crate::kde::KdeKernel,
     pub(super) kde_weight_field: Option<String>,
+    pub(super) kde_normalize: bool,
+    /// Window radius (in grid cells) for local Shannon entropy — `1` uses a
+    /// 3x3 neighborhood around each cell.
+    pub(super) kde_entropy_window: usize,
     pub(super) kde_running: bool,
     pub(super) kde_rx: Option<
         oneshot::Receiver<(usize, crate::heatmap::HeatmapLayer, crate::heatmap::SavedHeatmap)>,
     >,
 
+    // ── Sampling (sub-population from the active layer's features) ───────
+    pub(super) sampling_window_open: bool,
+    pub(super) sampling_method: crate::sampling::SamplingMethod,
+    pub(super) sampling_fraction: f64,
+    pub(super) sampling_stratify_field: Option<String>,
+
+    // ── Uniform grid binning (fixed-size hexbin/gridbin) ───────────────────
+    pub(super) gridbin_window_open: bool,
+    pub(super) gridbin_cell_size: f64,
+    pub(super) gridbin_field: Option<String>,
+    pub(super) gridbin_running: bool,
+    pub(super) gridbin_rx: Option<
+        oneshot::Receiver<(usize, crate::heatmap::HeatmapLayer, crate::heatmap::SavedHeatmap)>,
+    >,
+
+    // ── Bivariate grid analysis (2-attribute choropleth) ──────────────────
+    pub(super) bivariate_grid_window_open: bool,
+    pub(super) bivariate_grid_cell_size: f64,
+    pub(super) bivariate_grid_field_a: Option<String>,
+    pub(super) bivariate_grid_field_b: Option<String>,
+    pub(super) bivariate_grid_running: bool,
+    pub(super) bivariate_grid_rx: Option<
+        oneshot::Receiver<(
+            usize,
+            crate::bivariate::BivariateGridLayer,
+            crate::bivariate::SavedBivariateGrid,
+        )>,
+    >,
+
     pub(super) export_window_open: bool,
+    /// Path a background raster export thread just wrote to, sent back so
+    /// `poll_spatial_analysis` can update that layer's `descriptor.location`
+    /// — otherwise a promoted (synthetic) raster layer keeps its empty path
+    /// forever and a later snapshot save/restore fails with "No such file".
+    pub(super) raster_export_rx: Option<oneshot::Receiver<(usize, String)>>,
 
     // ── Globe view + raster ──────────────────────────────────────────────
     pub(super) map_view: MapView,
@@ -194,7 +299,10 @@ pub struct GisEditorApp {
     /// separate from `raster_dirty` so switching views doesn't miss a rebake
     /// that the other view already consumed this frame.
     pub(super) flat_raster_dirty: bool,
-    pub(super) raster_texture: Option<egui::TextureHandle>,
+    /// Keyed by layer index — one baked texture per visible raster layer, so
+    /// all of them can be drawn (and alpha-blended) in the same frame instead
+    /// of just the first one found.
+    pub(super) raster_textures: std::collections::HashMap<usize, egui::TextureHandle>,
     pub(super) raster_descriptor_rx: Option<mpsc::Receiver<RasterDescriptor>>,
     pub(super) pending_raster_descriptor: Option<RasterDescriptor>,
     pub(super) raster_load_rx: Option<mpsc::Receiver<Result<LayerEntry, String>>>,
@@ -209,6 +317,33 @@ pub struct GisEditorApp {
     pub(super) snapshot_restore: Option<PendingSnapshotRestore>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) snapshot_pick_rx: Option<std::sync::mpsc::Receiver<std::path::PathBuf>>,
+
+    // ── Plugins (subprocess + msgpack protocol; native-only) ──────────────
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_window_open: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugins_dir: std::path::PathBuf,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) available_plugins: Vec<crate::plugin::PluginManifest>,
+    /// Name of the plugin currently running, if any — drives the spinner
+    /// and disables concurrent runs (one plugin process at a time for now).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_running: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_handle: Option<crate::plugin::PluginHandle>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_log: Vec<(crate::plugin::LogLevel, String)>,
+    /// Current values for each plugin's `[[params]]`, keyed by plugin name
+    /// then param name. Populated (from each param's `default`) the first
+    /// time a plugin with params is shown in the list.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_param_values:
+        std::collections::HashMap<String, std::collections::HashMap<String, ui_plugins::ParamEditValue>>,
+    /// Name of the plugin whose "Run plugin" config window (params + Run/
+    /// Cancel) is currently open, if any — set by clicking a plugin in the
+    /// list.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_config_open: Option<String>,
 }
 
 impl GisEditorApp {
@@ -235,6 +370,17 @@ impl GisEditorApp {
             pending_layers: Vec::new(),
             pending_load_mode: LoadMode::default(),
             pending_field_selection: Vec::new(),
+            pending_batch_load: false,
+            pending_batch_size: 100_000,
+            batch_rx: None,
+            pending_batch_jobs: std::collections::VecDeque::new(),
+            current_batch_job: None,
+            pending_batch_group_remaining: 0,
+            batch_staging_points: std::collections::HashMap::new(),
+            batch_staging_vector: std::collections::HashMap::new(),
+            batch_load_window_idx: None,
+            batch_range_from: 0,
+            batch_range_to: 0,
             viewport: Viewport::default(),
             selected_id: None,
             add_form: AddAttributeForm::default(),
@@ -246,12 +392,16 @@ impl GisEditorApp {
             roi_rebuild_pending: false,
             click_target: ClickTarget::GridCell,
             select_mode: false,
+            select_shape: SelectShape::Rectangle,
             select_drag_start: None,
+            select_polygon: Vec::new(),
             has_gpu,
             point_size: 5.0,
+            vector_line_width: 1.0,
             points_dirty: false,
             last_selected_id: None,
             last_point_size: 5.0,
+            last_vector_line_width: 1.0,
             last_layer_count: 0,
             heatmap_opacity: 255,
             gpu_points_buf: Vec::new(),
@@ -260,8 +410,6 @@ impl GisEditorApp {
             gpu_vector_line_verts_buf: Vec::new(),
             spatial_index_split_density: 10000,
             last_split_density: 10000,
-            hilbert_order: 6,
-            last_hilbert_order: 6,
             load_rx: None,
             load_layer_descriptor_rx: ld_rx,
             load_layer_descriptor_tx: ld_tx,
@@ -298,16 +446,25 @@ impl GisEditorApp {
             histogram_field: String::new(),
             field_stats: None,
             last_stats_field: String::new(),
+            last_stats_layer: None,
+            stats_dirty: false,
             bivariate: None,
             show_bivariate: false,
             bivariate_y_field: String::new(),
+            bivariate_lasso_active: false,
+            bivariate_lasso: Vec::new(),
+            bivariate_lasso_ready: Vec::new(),
             selection_field_a: String::new(),
             selection_field_b: String::new(),
             selection_bivariate: None,
+            last_selection_stats_key: None,
+            last_selection_bivariate_key: None,
             selection_histogram: None,
             selection_field_stats: None,
             map_render_ttl: 0,
             color_picker_layer: None,
+            rename_layer_idx: None,
+            rename_layer_buffer: String::new(),
             spatial_field: String::new(),
             spatial_radius: 0.01,
             local_variance_results: None,
@@ -321,16 +478,34 @@ impl GisEditorApp {
             kde_radius: 0.05,
             kde_kernel: crate::kde::KdeKernel::Quartic,
             kde_weight_field: None,
+            kde_normalize: false,
+            kde_entropy_window: 1,
             kde_running: false,
             kde_rx: None,
+            sampling_window_open: false,
+            sampling_method: crate::sampling::SamplingMethod::default(),
+            sampling_fraction: 0.1,
+            sampling_stratify_field: None,
+            gridbin_window_open: false,
+            gridbin_cell_size: 0.01,
+            gridbin_field: None,
+            gridbin_running: false,
+            gridbin_rx: None,
+            bivariate_grid_window_open: false,
+            bivariate_grid_cell_size: 0.01,
+            bivariate_grid_field_a: None,
+            bivariate_grid_field_b: None,
+            bivariate_grid_running: false,
+            bivariate_grid_rx: None,
             export_window_open: false,
+            raster_export_rx: None,
             map_view: MapView::default(),
             globe_camera: GlobeCamera::default(),
             globe_points_buf: Vec::new(),
             globe_points_dirty: false,
             raster_dirty: false,
             flat_raster_dirty: false,
-            raster_texture: None,
+            raster_textures: std::collections::HashMap::new(),
             raster_descriptor_rx: None,
             pending_raster_descriptor: None,
             raster_load_rx: None,
@@ -341,6 +516,22 @@ impl GisEditorApp {
             snapshot_restore: None,
             #[cfg(not(target_arch = "wasm32"))]
             snapshot_pick_rx: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_window_open: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugins_dir: std::path::PathBuf::from("plugins"),
+            #[cfg(not(target_arch = "wasm32"))]
+            available_plugins: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_running: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_handle: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_log: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_param_values: std::collections::HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_config_open: None,
         }
     }
 }
@@ -352,30 +543,18 @@ impl GisEditorApp {
             .layers
             .iter()
             .map(|le| {
-                let (quadtree_capacity, hilbert_order, built_rtree, uncertainty) = match &le.data {
+                let (quadtree_capacity, built_rtree, uncertainty) = match &le.data {
                     LayerKind::Vector(gl) => {
                         let quadtree_capacity =
                             gl.quadtree.as_ref().and_then(|si| si.get_capacity());
-                        let hilbert_order = match &gl.hilbert {
-                            Some(crate::spatial_index::SpatialIndex::HilbertCurve(ht)) => {
-                                Some(ht.get_order())
-                            }
-                            _ => None,
-                        };
-                        (quadtree_capacity, hilbert_order, false, None)
+                        (quadtree_capacity, false, None)
                     }
                     LayerKind::Points(pc) => match pc.index.as_deref() {
                         Some(crate::spatial_index::SpatialIndex::Quadtree(qt)) => {
-                            (qt.get_capacity(), None, false, None)
+                            (qt.get_capacity(), false, None)
                         }
-                        Some(crate::spatial_index::SpatialIndex::HilbertCurve(ht)) => {
-                            (None, Some(ht.get_order()), false, None)
-                        }
-                        Some(crate::spatial_index::SpatialIndex::RTree(_)) => {
-                            (None, None, true, None)
-                        }
+                        Some(crate::spatial_index::SpatialIndex::RTree(_)) => (None, true, None),
                         Some(crate::spatial_index::SpatialIndex::UncertaintyQuadtree(uq)) => (
-                            None,
                             None,
                             false,
                             Some(crate::snapshot::UncertaintySnapshot {
@@ -387,9 +566,9 @@ impl GisEditorApp {
                                 max_depth: uq.max_depth(),
                             }),
                         ),
-                        None => (None, None, false, None),
+                        None => (None, false, None),
                     },
-                    LayerKind::Raster(_) => (None, None, false, None),
+                    LayerKind::Raster(_) => (None, false, None),
                 };
                 LayerSnapshot {
                     file_path: le.descriptor.location.to_string(),
@@ -402,7 +581,6 @@ impl GisEditorApp {
                     filter_logic: filter_logic_to_str(le.filter_logic),
                     filters: le.filters.iter().filter_map(filter_to_snapshot).collect(),
                     quadtree_capacity,
-                    hilbert_order,
                     built_rtree,
                     uncertainty,
                     selections: le
@@ -462,6 +640,7 @@ impl GisEditorApp {
             .take()
         {
             let has_filters = !layer_snap.filters.is_empty();
+            let layer_idx = self.layers.len().saturating_sub(1);
             if let Some(layer) = self.layers.last_mut() {
                 layer.visible = layer_snap.visible;
                 layer.color = layer_snap.color;
@@ -477,15 +656,10 @@ impl GisEditorApp {
                         if let Some(cap) = layer_snap.quadtree_capacity {
                             gl.rebuild_quadtree(cap);
                         }
-                        if let Some(order) = layer_snap.hilbert_order {
-                            gl.rebuild_hilbert_tree(order);
-                        }
                     }
                     LayerKind::Points(pc) => {
                         if let Some(cap) = layer_snap.quadtree_capacity {
                             pc.rebuild_quadtree(cap);
-                        } else if let Some(order) = layer_snap.hilbert_order {
-                            pc.rebuild_hilbert_tree(order);
                         } else if layer_snap.built_rtree {
                             pc.rebuild_rtree();
                         } else if let Some(u) = &layer_snap.uncertainty {
@@ -499,15 +673,6 @@ impl GisEditorApp {
                     }
                     LayerKind::Raster(_) => {}
                 }
-                for s in &layer_snap.selections {
-                    let ids = layer.data.ids_in_bbox_with_fallback(s.bbox);
-                    layer.selections.push(crate::gis_layer::LayerSelection {
-                        name: s.name.clone(),
-                        bbox: s.bbox,
-                        ids,
-                    });
-                }
-                layer.active_selection = layer_snap.active_selection;
                 layer.show_index = layer_snap.show_index;
                 layer.index_kind = crate::snapshot::str_to_index_kind(&layer_snap.index_kind);
                 layer.show_heatmap = layer_snap.show_heatmap;
@@ -515,6 +680,13 @@ impl GisEditorApp {
                     crate::snapshot::str_to_heatmap_metric(&layer_snap.heatmap_metric);
                 layer.heatmap_dirty = layer_snap.show_heatmap;
                 layer.show_points = layer_snap.show_points;
+            }
+            if !layer_snap.selections.is_empty() {
+                self.snapshot_restore
+                    .as_mut()
+                    .unwrap()
+                    .pending_selections
+                    .push((layer_idx, layer_snap.selections.clone(), layer_snap.active_selection));
             }
             if has_filters {
                 self.updated_filters = true;

@@ -188,6 +188,62 @@ impl HeatmapLayer {
         }
     }
 
+    /// Wraps a uniform-grid binning (`gridbin::build_gridbin`) as a
+    /// `HeatmapLayer`, supporting both `Density` (points/area, real density
+    /// since every cell is the same size — unlike an adaptive quadtree's
+    /// leaves) and `AttributeMean` when the caller supplied per-point values.
+    /// No `Unpredictability`: that needs per-cell samples, not just a sum.
+    pub fn from_grid_cells(cells: Vec<crate::gridbin::GridBinCell>, attribute_name: String) -> Self {
+        let max_density = cells
+            .iter()
+            .map(|c| c.count as f32)
+            .fold(0.0_f32, f32::max);
+        let min_attribute_value = cells
+            .iter()
+            .filter_map(|c| c.mean)
+            .fold(f32::MAX, f32::min);
+        let max_attribute_value = cells
+            .iter()
+            .filter_map(|c| c.mean)
+            .fold(f32::MIN, f32::max);
+        let attribute_range = max_attribute_value - min_attribute_value;
+
+        let cells = cells
+            .into_iter()
+            .map(|c| ScoredCell {
+                bbox: c.bbox,
+                density: if max_density > 0.0 {
+                    c.count as f32 / max_density
+                } else {
+                    0.0
+                },
+                unpredictability: 0.0,
+                attribute_mean: match c.mean {
+                    Some(m) if attribute_range > 0.0 => (m - min_attribute_value) / attribute_range,
+                    _ => 0.0,
+                },
+            })
+            .collect();
+
+        Self {
+            cells,
+            max_density,
+            max_unpredictability: 0.0,
+            min_attribute_value: if min_attribute_value.is_finite() {
+                min_attribute_value
+            } else {
+                0.0
+            },
+            max_attribute_value: if max_attribute_value.is_finite() {
+                max_attribute_value
+            } else {
+                0.0
+            },
+            attribute_name,
+            measurement_type: MeasurementType::Variance,
+        }
+    }
+
     /// Recovers raw (un-normalized) per-cell values for `metric` — inverts the
     /// normalization `build`/`from_kde_cells` applies, so a saved snapshot
     /// carries physical-unit magnitudes rather than 0..1 scores.
@@ -229,6 +285,8 @@ impl HeatmapLayer {
 pub enum HeatmapKind {
     Quadtree,
     Kde,
+    KdeEntropy,
+    GridBin,
 }
 
 /// A named, persisted snapshot of a built heatmap/KDE grid, stored under the

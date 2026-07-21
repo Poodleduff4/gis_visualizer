@@ -48,6 +48,7 @@ impl GisEditorApp {
             let render_points = !self.has_gpu;
             let mut roi_toggle: Option<[f64; 4]> = None;
             let mut pending_selection: Option<[f64; 4]> = None;
+            let mut pending_polygon_selection: Option<Vec<[f64; 2]>> = None;
             show_map(
                 ui,
                 &response,
@@ -62,8 +63,12 @@ impl GisEditorApp {
                 &mut self.selected_index_cell_data,
                 &mut roi_toggle,
                 self.select_mode,
+                self.select_shape,
                 &mut self.select_drag_start,
+                &mut self.select_polygon,
                 &mut pending_selection,
+                &mut pending_polygon_selection,
+                self.vector_line_width,
             );
             if let Some(bbox) = pending_selection {
                 if let Some(idx) = self.active_layer_idx {
@@ -76,6 +81,32 @@ impl GisEditorApp {
                         ids,
                     });
                     entry.active_selection = Some(entry.selections.len() - 1);
+                    self.points_dirty = true;
+                }
+            }
+            if let Some(polygon) = pending_polygon_selection {
+                if let Some(idx) = self.active_layer_idx {
+                    let ids = self.layers[idx].data.ids_in_polygon(&polygon);
+                    let bbox = polygon.iter().fold(
+                        [f64::MAX, f64::MAX, f64::MIN, f64::MIN],
+                        |acc, p| {
+                            [
+                                acc[0].min(p[0]),
+                                acc[1].min(p[1]),
+                                acc[2].max(p[0]),
+                                acc[3].max(p[1]),
+                            ]
+                        },
+                    );
+                    let entry = &mut self.layers[idx];
+                    let name = format!("Selection {}", entry.selections.len() + 1);
+                    entry.selections.push(LayerSelection {
+                        name,
+                        bbox,
+                        ids,
+                    });
+                    entry.active_selection = Some(entry.selections.len() - 1);
+                    self.points_dirty = true;
                 }
             }
             if let Some(idx) = self.active_layer_idx {
@@ -131,6 +162,7 @@ impl GisEditorApp {
                             screen_min: [rect.left(), rect.top()],
                             screen_size: [rect.width(), rect.height()],
                             render_dirty,
+                            line_width: self.vector_line_width,
                         },
                     ),
                 ));
@@ -148,29 +180,29 @@ impl GisEditorApp {
                 ));
             }
 
-            let visible_raster = self.layers.iter().find_map(|l| {
+            // Every visible raster layer gets its own draw call (in layer
+            // order) so they alpha-blend on top of each other via egui's own
+            // blending, instead of only the first one being drawn at all.
+            for (i, l) in self.layers.iter().enumerate() {
                 if !l.visible {
-                    return None;
+                    continue;
                 }
-                if let LayerKind::Raster(r) = &l.data {
-                    Some((r, l.opacity))
-                } else {
-                    None
-                }
-            });
-            if let Some((raster, opacity)) = visible_raster {
+                let LayerKind::Raster(raster) = &l.data else {
+                    continue;
+                };
                 render_raster_overlay(
                     ui,
                     &painter,
                     raster,
                     &self.viewport,
                     response.rect,
-                    &mut self.raster_texture,
+                    &mut self.raster_textures,
+                    i,
                     self.flat_raster_dirty,
-                    opacity,
+                    l.opacity,
                 );
-                self.flat_raster_dirty = false;
             }
+            self.flat_raster_dirty = false;
 
             if self.selected_id != self.last_selected_id {
                 self.points_dirty = true;
@@ -303,6 +335,85 @@ impl GisEditorApp {
                     }
                 }
 
+                if self.layers[idx].show_gridbin {
+                    if let Some(gridbin) = &self.layers[idx].gridbin_cache {
+                        let gridbin_metric = self.layers[idx].gridbin_metric;
+                        let roi_bboxes = &self.layers[idx].roi_bboxes;
+                        show_quadtree_heatmap(
+                            &painter,
+                            gridbin,
+                            gridbin_metric,
+                            roi_bboxes,
+                            &self.viewport,
+                            response.rect,
+                            self.heatmap_opacity,
+                        );
+
+                        // ── Legend: gradient bar + range + meaning ──────────────
+                        let (title, min_val, max_val) = match gridbin_metric {
+                            HeatmapMetric::AttributeMean => (
+                                format!("Gridbin: {} (avg)", gridbin.attribute_name),
+                                gridbin.min_attribute_value,
+                                gridbin.max_attribute_value,
+                            ),
+                            _ => (
+                                "Gridbin: Density (points/cell)".to_string(),
+                                0.0,
+                                gridbin.max_density,
+                            ),
+                        };
+                        let r = response.rect;
+                        let bar_w = 200.0_f32;
+                        let bar_h = 14.0_f32;
+                        let x = r.min.x + 10.0;
+                        let y = r.max.y - 46.0 - (heatmap_legend_slot as f32) * 66.0;
+                        heatmap_legend_slot += 1;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x - 4.0, y - 18.0),
+                                egui::vec2(bar_w + 8.0, bar_h + 40.0),
+                            ),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                        );
+                        painter.text(
+                            egui::pos2(x, y - 16.0),
+                            egui::Align2::LEFT_TOP,
+                            &title,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        let steps = 40;
+                        for i in 0..steps {
+                            let t0 = i as f32 / steps as f32;
+                            let t1 = (i + 1) as f32 / steps as f32;
+                            let color = crate::map_view::heat_color(t0, 255);
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(x + t0 * bar_w, y),
+                                    egui::pos2(x + t1 * bar_w, y + bar_h),
+                                ),
+                                0.0,
+                                color,
+                            );
+                        }
+                        painter.text(
+                            egui::pos2(x, y + bar_h + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{:.3}", min_val),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x + bar_w, y + bar_h + 2.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{:.3}", max_val),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+
                 if self.layers[idx].show_kde {
                     if let Some(kde) = &self.layers[idx].kde_cache {
                         let roi_bboxes = &self.layers[idx].roi_bboxes;
@@ -364,6 +475,120 @@ impl GisEditorApp {
                             egui::Align2::RIGHT_TOP,
                             format!("{:.3}", kde.max_density),
                             egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+
+                if self.layers[idx].show_bivariate_grid {
+                    if let Some(grid) = &self.layers[idx].bivariate_grid_cache {
+                        let vp = self.viewport.viewport_bbox(response.rect);
+                        let visible = grid.cells.iter().filter(|c| {
+                            c.bbox[0] <= vp[2]
+                                && c.bbox[2] >= vp[0]
+                                && c.bbox[1] <= vp[3]
+                                && c.bbox[3] >= vp[1]
+                        });
+                        for cell in visible {
+                            let color = crate::bivariate::bivariate_color(
+                                cell.class_a,
+                                cell.class_b,
+                                self.heatmap_opacity,
+                            );
+                            let p1 =
+                                self.viewport
+                                    .world_to_screen(cell.bbox[0], cell.bbox[1], response.rect);
+                            let p2 =
+                                self.viewport
+                                    .world_to_screen(cell.bbox[2], cell.bbox[3], response.rect);
+                            painter.rect_filled(egui::Rect::from_two_pos(p1, p2), 0.0, color);
+                        }
+
+                        // ── Legend: 3x3 swatch grid + attribute labels ─────────
+                        let r = response.rect;
+                        let swatch = 18.0_f32;
+                        let grid_w = swatch * 3.0;
+                        let x = r.min.x + 10.0 + 34.0; // leave room for y-axis "High"/"Low" labels
+                        // Box spans y-18 .. y+80 (swatch*3 + 44 = 98px tall) — offset by
+                        // 90 so the bottom lands at r.max.y - 10, matching the other legends'
+                        // bottom margin instead of spilling past the viewport edge.
+                        let y = r.max.y - 90.0 - (heatmap_legend_slot as f32) * 100.0;
+                        heatmap_legend_slot += 1;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(x - 38.0, y - 18.0),
+                                egui::vec2(grid_w + 38.0 + 10.0, swatch * 3.0 + 44.0),
+                            ),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+                        );
+                        painter.text(
+                            egui::pos2(x - 34.0, y - 16.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{} x {}", grid.attr_a, grid.attr_b),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::WHITE,
+                        );
+                        for row in 0..3u8 {
+                            for col in 0..3u8 {
+                                // row 0 (bottom) = low attr_b, matches screen-down = low.
+                                let class_b = 2 - row;
+                                let color =
+                                    crate::bivariate::bivariate_color(col, class_b, 255);
+                                let cx = x + col as f32 * swatch;
+                                let cy = y + row as f32 * swatch;
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(cx, cy),
+                                        egui::vec2(swatch, swatch),
+                                    ),
+                                    0.0,
+                                    color,
+                                );
+                            }
+                        }
+                        // y-axis (attr_b): "High" at top, "Low" at bottom, to the left of the grid.
+                        painter.text(
+                            egui::pos2(x - 4.0, y),
+                            egui::Align2::RIGHT_TOP,
+                            "High",
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x - 4.0, y + grid_w),
+                            egui::Align2::RIGHT_BOTTOM,
+                            "Low",
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x - 34.0, y + grid_w / 2.0),
+                            egui::Align2::LEFT_CENTER,
+                            &grid.attr_b,
+                            egui::FontId::proportional(10.0),
+                            egui::Color32::WHITE,
+                        );
+                        // x-axis (attr_a): "Low" at left, "High" at right, below the grid.
+                        painter.text(
+                            egui::pos2(x, y + grid_w + 2.0),
+                            egui::Align2::LEFT_TOP,
+                            "Low",
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x + grid_w, y + grid_w + 2.0),
+                            egui::Align2::RIGHT_TOP,
+                            "High",
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            egui::pos2(x + grid_w / 2.0, y + grid_w + 15.0),
+                            egui::Align2::CENTER_TOP,
+                            &grid.attr_a,
+                            egui::FontId::proportional(10.0),
                             egui::Color32::WHITE,
                         );
                     }

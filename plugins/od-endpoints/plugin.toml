@@ -1,0 +1,27 @@
+name = "od-endpoints"
+entrypoint = "main.py"
+capabilities = ["read_layers", "add_layer"]
+
+[[params]]
+name = "od_layer"
+label = "OD points layer (geometry = origin)"
+kind = "layer"
+layer_kind = "points"
+
+[[params]]
+name = "dest_lat_col"
+label = "Destination latitude column"
+kind = "attribute"
+attribute_of = "od_layer"
+
+[[params]]
+name = "dest_lon_col"
+label = "Destination longitude column"
+kind = "attribute"
+attribute_of = "od_layer"
+
+[[params]]
+name = "endpoint_set"
+label = "Endpoints to output: origin, destination, or both"
+kind = "text"
+default = "both"

@@ -1,0 +1,10 @@
+name = "point-convex-hull"
+entrypoint = "main.py"
+python = "python3"
+capabilities = ["read_layers", "add_layer"]
+
+[[params]]
+name = "layer"
+label = "Points layer"
+kind = "layer"
+layer_kind = "points"

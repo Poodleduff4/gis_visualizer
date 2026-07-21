@@ -5,6 +5,17 @@ use crate::spatial_index::IndexKind;
 
 use super::{GisEditorApp, LAYER_PANEL_WIDTH};
 
+/// Manually truncated (rather than relying on egui's shrink-to-fit) so a
+/// long name can't blow out the layer panel's max width and squeeze the map
+/// view — an unbounded `selectable_label`/`Label` does exactly that.
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        s.chars().take(max_chars.saturating_sub(1)).collect::<String>() + "…"
+    } else {
+        s.to_string()
+    }
+}
+
 impl GisEditorApp {
     pub(super) fn show_status_bar(&mut self, ui: &mut egui::Ui) {
         // ── Status bar ────────────────────────────────────────────────────────
@@ -34,15 +45,20 @@ impl GisEditorApp {
                     let mut rebuild_quadtree_idx: Option<usize> = None;
                     let mut rebuild_rtree_idx: Option<usize> = None;
                     let mut rebuild_uncertainty_quadtree_idx: Option<usize> = None;
-                    let mut rebuild_hilbert_idx: Option<usize> = None;
                     let mut visibility_changed = false;
                     let mut set_active_selection: Option<(usize, usize)> = None;
                     let mut remove_selection: Option<(usize, usize)> = None;
                     let mut save_heatmap_idx: Option<usize> = None;
+                    let mut save_gridbin_idx: Option<usize> = None;
                     let mut export_heatmap: Option<(usize, usize)> = None;
                     let mut promote_heatmap: Option<(usize, usize)> = None;
                     let mut remove_heatmap: Option<(usize, usize)> = None;
                     let mut select_heatmap: Option<(usize, usize)> = None;
+                    let mut save_bivariate_idx: Option<usize> = None;
+                    let mut remove_bivariate: Option<(usize, usize)> = None;
+                    let mut select_bivariate: Option<(usize, usize)> = None;
+                    let mut export_bivariate: Option<(usize, usize)> = None;
+                    let mut promote_bivariate: Option<(usize, usize)> = None;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -62,12 +78,14 @@ impl GisEditorApp {
                                     }
                                 }
                                 let is_active = self.active_layer_idx == Some(i);
+                                let short_name = truncate_label(&entry.name, 28);
                                 let label = if is_active {
-                                    egui::RichText::new(&entry.name).strong()
+                                    egui::RichText::new(&short_name).strong()
                                 } else {
-                                    egui::RichText::new(&entry.name)
+                                    egui::RichText::new(&short_name)
                                 };
-                                let label_resp = ui.selectable_label(is_active, label);
+                                let label_resp =
+                                    ui.selectable_label(is_active, label).on_hover_text(&entry.name);
                                 if label_resp.clicked() {
                                     if !is_active {
                                         self.active_layer_idx = Some(i);
@@ -121,34 +139,18 @@ impl GisEditorApp {
                                         ui.close_kind(egui::UiKind::Menu);
                                     }
                                     ui.separator();
-                                    if ui.button("Build Hilbert").clicked() {
-                                        rebuild_hilbert_idx = Some(i);
-                                        ui.close_kind(egui::UiKind::Menu);
-                                    }
-                                    ui.separator();
 
                                     let has_quadtree =
                                         entry.data.index(IndexKind::Quadtree).is_some();
-                                    let has_hilbert =
-                                        entry.data.index(IndexKind::Hilbert).is_some();
-                                    if has_quadtree || has_hilbert {
+                                    if has_quadtree {
                                         ui.checkbox(&mut entry.show_index, "Show Spatial Index");
                                         if entry.show_index {
                                             ui.indent("layer_index_kind", |ui| {
-                                                if has_quadtree {
-                                                    ui.radio_value(
-                                                        &mut entry.index_kind,
-                                                        IndexKind::Quadtree,
-                                                        "Quadtree",
-                                                    );
-                                                }
-                                                if has_hilbert {
-                                                    ui.radio_value(
-                                                        &mut entry.index_kind,
-                                                        IndexKind::Hilbert,
-                                                        "Hilbert R-Tree",
-                                                    );
-                                                }
+                                                ui.radio_value(
+                                                    &mut entry.index_kind,
+                                                    IndexKind::Quadtree,
+                                                    "Quadtree",
+                                                );
                                             });
                                         }
                                         ui.separator();
@@ -198,15 +200,61 @@ impl GisEditorApp {
                                         ui.separator();
                                     }
 
+                                    if entry.gridbin_cache.is_some() {
+                                        ui.checkbox(&mut entry.show_gridbin, "Show Grid Binning");
+                                        if entry.show_gridbin {
+                                            ui.indent("layer_gridbin_metric", |ui| {
+                                                ui.radio_value(
+                                                    &mut entry.gridbin_metric,
+                                                    crate::heatmap::HeatmapMetric::Density,
+                                                    "Density",
+                                                );
+                                                ui.radio_value(
+                                                    &mut entry.gridbin_metric,
+                                                    crate::heatmap::HeatmapMetric::AttributeMean,
+                                                    "Attribute Average",
+                                                );
+                                                if ui.button("💾 Save this grid").clicked() {
+                                                    save_gridbin_idx = Some(i);
+                                                }
+                                            });
+                                        }
+                                        ui.separator();
+                                    }
+
+                                    if entry.bivariate_grid_cache.is_some() {
+                                        ui.checkbox(
+                                            &mut entry.show_bivariate_grid,
+                                            "Show Bivariate Grid",
+                                        );
+                                        if entry.show_bivariate_grid
+                                            && ui.button("💾 Save this grid").clicked()
+                                        {
+                                            save_bivariate_idx = Some(i);
+                                        }
+                                        ui.separator();
+                                    }
+
                                     if ui.button("Change Color…").clicked() {
                                         self.color_picker_layer = Some(i);
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
+                                    if ui.button("Rename…").clicked() {
+                                        self.rename_layer_idx = Some(i);
+                                        self.rename_layer_buffer = entry.name.clone();
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
+                                    if entry.batch_load.is_some()
+                                        && ui.button("Batch Load Manager…").clicked()
+                                    {
+                                        self.batch_load_window_idx = Some(i);
                                         ui.close_kind(egui::UiKind::Menu);
                                     }
                                 });
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.small_button("✕").clicked() {
+                                        if ui.small_button("X").clicked() {
                                             remove_idx = Some(i);
                                         }
                                     },
@@ -224,20 +272,22 @@ impl GisEditorApp {
                                         ui.horizontal(|ui| {
                                             let is_active_sel =
                                                 entry.active_selection == Some(sidx);
+                                            let full = format!(
+                                                "{} ({} feat.)",
+                                                sel.name,
+                                                sel.ids.len()
+                                            );
                                             if ui
                                                 .selectable_label(
                                                     is_active_sel,
-                                                    format!(
-                                                        "{} ({} feat.)",
-                                                        sel.name,
-                                                        sel.ids.len()
-                                                    ),
+                                                    truncate_label(&full, 34),
                                                 )
+                                                .on_hover_text(&full)
                                                 .clicked()
                                             {
                                                 set_active_selection = Some((i, sidx));
                                             }
-                                            if ui.small_button("✕").clicked() {
+                                            if ui.small_button("X").clicked() {
                                                 remove_selection = Some((i, sidx));
                                             }
                                         });
@@ -258,7 +308,7 @@ impl GisEditorApp {
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    if ui.small_button("✕").clicked() {
+                                                    if ui.small_button("X").clicked() {
                                                         remove_heatmap = Some((i, hidx));
                                                     }
                                                     if ui
@@ -280,19 +330,19 @@ impl GisEditorApp {
                                                             "🔲"
                                                         }
                                                         crate::heatmap::HeatmapKind::Kde => "🎯",
+                                                        crate::heatmap::HeatmapKind::KdeEntropy => {
+                                                            "🌡"
+                                                        }
+                                                        crate::heatmap::HeatmapKind::GridBin => {
+                                                            "🟩"
+                                                        }
                                                     };
-                                                    // Manually truncated (rather than relying on
-                                                    // egui's shrink-to-fit) so a long name can't
-                                                    // blow out the panel's max width and squeeze
-                                                    // the map view — it did before this was added.
                                                     let full = format!("{icon} {}", saved.name);
-                                                    let short: String = if full.chars().count() > 34 {
-                                                        full.chars().take(31).collect::<String>() + "…"
-                                                    } else {
-                                                        full.clone()
-                                                    };
                                                     if ui
-                                                        .selectable_label(is_active, short)
+                                                        .selectable_label(
+                                                            is_active,
+                                                            truncate_label(&full, 34),
+                                                        )
                                                         .on_hover_text(format!(
                                                             "{full} ({} cells)",
                                                             saved.cells.len()
@@ -300,6 +350,65 @@ impl GisEditorApp {
                                                         .clicked()
                                                     {
                                                         select_heatmap = Some((i, hidx));
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                            }
+                            if !entry.saved_bivariate_grids.is_empty() {
+                                egui::CollapsingHeader::new(format!(
+                                    "Saved Bivariate Grids ({})",
+                                    entry.saved_bivariate_grids.len()
+                                ))
+                                .id_salt(("saved_bivariate_hdr", i))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for (bidx, saved) in
+                                        entry.saved_bivariate_grids.iter().enumerate()
+                                    {
+                                        let is_active =
+                                            entry.active_saved_bivariate_grid == Some(bidx);
+                                        ui.horizontal(|ui| {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("X").clicked() {
+                                                        remove_bivariate = Some((i, bidx));
+                                                    }
+                                                    if ui
+                                                        .small_button("➕")
+                                                        .on_hover_text(
+                                                            "Add as a raster layer (3 bands: mean A, mean B, class)",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        promote_bivariate = Some((i, bidx));
+                                                    }
+                                                    #[cfg(not(target_arch = "wasm32"))]
+                                                    if ui
+                                                        .small_button("📄")
+                                                        .on_hover_text(
+                                                            "Export as 3-band GeoTIFF (mean A, mean B, class)",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        export_bivariate = Some((i, bidx));
+                                                    }
+                                                    let full = format!("🔳 {}", saved.name);
+                                                    if ui
+                                                        .selectable_label(
+                                                            is_active,
+                                                            truncate_label(&full, 34),
+                                                        )
+                                                        .on_hover_text(format!(
+                                                            "{full} ({} cells)",
+                                                            saved.cells.len()
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        select_bivariate = Some((i, bidx));
                                                     }
                                                 },
                                             );
@@ -367,17 +476,6 @@ impl GisEditorApp {
                         }
                         self.layers[idx].heatmap_dirty = true;
                     }
-                    if let Some(idx) = rebuild_hilbert_idx {
-                        let order = self.hilbert_order;
-                        match &mut self.layers[idx].data {
-                            LayerKind::Points(pc) => pc.rebuild_hilbert_tree(order),
-                            LayerKind::Vector(gl) => gl.rebuild_hilbert_tree(order),
-                            LayerKind::Raster(_) => {}
-                        }
-                        self.fitted = true;
-                        self.viewport_load_pending = true;
-                        self.viewport_stable_frames = 0;
-                    }
                     if visibility_changed {
                         self.points_dirty = true;
                         self.globe_points_dirty = true;
@@ -423,6 +521,24 @@ impl GisEditorApp {
                             entry.active_saved_heatmap = Some(entry.saved_heatmaps.len() - 1);
                         }
                     }
+                    if let Some(li) = save_gridbin_idx {
+                        let entry = &self.layers[li];
+                        if let Some(gridbin) = &entry.gridbin_cache {
+                            let metric = entry.gridbin_metric;
+                            let cells = gridbin.raw_cells(metric);
+                            let name = format!("Gridbin {}", gridbin.metric_label(metric));
+                            let units = gridbin.metric_label(metric);
+                            let saved = crate::heatmap::SavedHeatmap::new(
+                                name,
+                                crate::heatmap::HeatmapKind::GridBin,
+                                cells,
+                                units,
+                            );
+                            let entry = &mut self.layers[li];
+                            entry.saved_heatmaps.push(saved);
+                            entry.active_saved_heatmap = Some(entry.saved_heatmaps.len() - 1);
+                        }
+                    }
                     if let Some((li, hidx)) = select_heatmap {
                         if let Some(entry) = self.layers.get_mut(li) {
                             if entry.active_saved_heatmap == Some(hidx) {
@@ -455,6 +571,123 @@ impl GisEditorApp {
                             }
                         }
                     }
+                    if let Some(li) = save_bivariate_idx {
+                        let entry = &self.layers[li];
+                        if let Some(grid) = &entry.bivariate_grid_cache {
+                            let cell_size = grid
+                                .cells
+                                .iter()
+                                .map(|c| (c.bbox[2] - c.bbox[0]).min(c.bbox[3] - c.bbox[1]))
+                                .fold(f64::INFINITY, f64::min);
+                            let name = format!("Bivariate {} x {}", grid.attr_a, grid.attr_b);
+                            let saved = crate::bivariate::SavedBivariateGrid::from_layer(
+                                name, cell_size, grid,
+                            );
+                            let entry = &mut self.layers[li];
+                            entry.saved_bivariate_grids.push(saved);
+                            entry.active_saved_bivariate_grid =
+                                Some(entry.saved_bivariate_grids.len() - 1);
+                        }
+                    }
+                    if let Some((li, bidx)) = select_bivariate {
+                        if let Some(entry) = self.layers.get_mut(li) {
+                            if entry.active_saved_bivariate_grid == Some(bidx) {
+                                entry.active_saved_bivariate_grid = None;
+                                entry.show_bivariate_grid = false;
+                            } else if let Some(saved) = entry.saved_bivariate_grids.get(bidx) {
+                                entry.bivariate_grid_cache = Some(saved.to_layer());
+                                entry.show_bivariate_grid = true;
+                                entry.active_saved_bivariate_grid = Some(bidx);
+                            }
+                        }
+                        self.map_render_ttl = 3;
+                    }
+                    if let Some((li, bidx)) = remove_bivariate {
+                        if let Some(entry) = self.layers.get_mut(li) {
+                            if bidx < entry.saved_bivariate_grids.len() {
+                                entry.saved_bivariate_grids.remove(bidx);
+                                let fixup = |sel: &mut Option<usize>| match *sel {
+                                    Some(s) if s == bidx => *sel = None,
+                                    Some(s) if s > bidx => *sel = Some(s - 1),
+                                    _ => {}
+                                };
+                                fixup(&mut entry.active_saved_bivariate_grid);
+                                if entry.active_saved_bivariate_grid.is_none() {
+                                    entry.show_bivariate_grid = false;
+                                }
+                            }
+                        }
+                    }
+                    if let Some((li, bidx)) = promote_bivariate {
+                        if let Some(saved) =
+                            self.layers.get(li).and_then(|l| l.saved_bivariate_grids.get(bidx))
+                        {
+                            let (width, height, _cs, band_a, band_b, band_class) = saved.rasterize();
+                            let units = format!(
+                                "Band 1 = {} (mean), Band 2 = {} (mean), Band 3 = class (0-8)",
+                                saved.attr_a, saved.attr_b
+                            );
+                            let layer = crate::raster_reader::build_layer_entry(
+                                saved.name.clone(),
+                                width,
+                                height,
+                                vec![band_a, band_b, band_class],
+                                units,
+                                crate::gis_reader::GisFilePath::LocalFile(String::new()),
+                                saved.bbox,
+                            );
+                            self.layers.push(layer);
+                            self.active_layer_idx = Some(self.layers.len() - 1);
+                            self.raster_dirty = true;
+                            self.flat_raster_dirty = true;
+                            self.map_render_ttl = 3;
+
+                            // Promoted to its own layer — drop the source
+                            // snapshot so it doesn't linger duplicated.
+                            let entry = &mut self.layers[li];
+                            entry.saved_bivariate_grids.remove(bidx);
+                            let fixup = |sel: &mut Option<usize>| match *sel {
+                                Some(s) if s == bidx => *sel = None,
+                                Some(s) if s > bidx => *sel = Some(s - 1),
+                                _ => {}
+                            };
+                            fixup(&mut entry.active_saved_bivariate_grid);
+                            if entry.active_saved_bivariate_grid.is_none() {
+                                entry.show_bivariate_grid = false;
+                            }
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some((li, bidx)) = export_bivariate {
+                        if let Some(saved) =
+                            self.layers.get(li).and_then(|l| l.saved_bivariate_grids.get(bidx))
+                        {
+                            let default_name =
+                                format!("{}.tif", saved.name.replace([' ', '/'], "_"));
+                            let bbox = saved.bbox;
+                            let (width, height, _cs, band_a, band_b, band_class) =
+                                saved.rasterize();
+                            std::thread::spawn(move || {
+                                if let Some(f) = pollster::block_on(
+                                    rfd::AsyncFileDialog::new()
+                                        .set_file_name(default_name)
+                                        .add_filter("GeoTIFF", &["tif", "tiff"])
+                                        .save_file(),
+                                ) {
+                                    let bands = vec![band_a, band_b, band_class];
+                                    if let Err(e) = crate::raster_reader::write_geotiff_multiband(
+                                        &f.path().to_path_buf(),
+                                        width,
+                                        height,
+                                        &bands,
+                                        bbox,
+                                    ) {
+                                        eprintln!("[bivariate export] error: {e:#}");
+                                    }
+                                }
+                            });
+                        }
+                    }
                     if let Some((li, hidx)) = promote_heatmap {
                         if let Some(saved) = self.layers.get(li).and_then(|l| l.saved_heatmaps.get(hidx)) {
                             let cell_size = saved
@@ -464,6 +697,7 @@ impl GisEditorApp {
                                 .fold(f64::INFINITY, f64::min);
                             let (width, height, _actual_cell_size, values) =
                                 crate::heatmap::rasterize_cells(&saved.cells, saved.bbox, cell_size);
+                            let kind = saved.kind;
                             let layer = crate::raster_reader::build_layer_entry(
                                 saved.name.clone(),
                                 width,
@@ -478,6 +712,30 @@ impl GisEditorApp {
                             self.raster_dirty = true;
                             self.flat_raster_dirty = true;
                             self.map_render_ttl = 3;
+
+                            // Promoted to its own layer — drop the source
+                            // snapshot so it doesn't linger duplicated, and
+                            // turn off whichever live overlay toggle matches
+                            // this saved heatmap's kind so it doesn't keep
+                            // rendering on top of the new raster layer.
+                            let entry = &mut self.layers[li];
+                            entry.saved_heatmaps.remove(hidx);
+                            let fixup = |sel: &mut Option<usize>| match *sel {
+                                Some(s) if s == hidx => *sel = None,
+                                Some(s) if s > hidx => *sel = Some(s - 1),
+                                _ => {}
+                            };
+                            fixup(&mut entry.active_saved_heatmap);
+                            if entry.active_saved_heatmap.is_none() {
+                                match kind {
+                                    crate::heatmap::HeatmapKind::Quadtree => entry.show_heatmap = false,
+                                    crate::heatmap::HeatmapKind::Kde
+                                    | crate::heatmap::HeatmapKind::KdeEntropy => {
+                                        entry.show_kde = false
+                                    }
+                                    crate::heatmap::HeatmapKind::GridBin => entry.show_gridbin = false,
+                                }
+                            }
                         }
                     }
                     #[cfg(not(target_arch = "wasm32"))]

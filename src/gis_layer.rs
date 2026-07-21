@@ -7,7 +7,6 @@ use std::sync::mpsc;
 
 use crate::filter::{FilterLogic, LayerAttributeFilter};
 use crate::gis_reader::LayerDescriptor;
-use crate::hilbert_r_tree::HilbertRTree;
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 use crate::quadtree::Quadtree;
 use crate::spatial_index::{IndexKind, SpatialIndex};
@@ -240,10 +239,10 @@ impl GisFeature {
         geometry: Geometry<f64>,
         attributes: HashMap<String, AttributeValue>,
     ) -> Self {
-        let tessellated = match &geometry {
-            Geometry::Point(_) | Geometry::MultiPoint(_) => TessellatedGeom::empty(),
-            _ => tessellate(&geometry),
-        };
+        // `tessellate` already handles Point/MultiPoint (via `from_point`/
+        // `from_multipoint`, populating `TessellatedGeom.points`) — no
+        // special-casing needed here.
+        let tessellated = tessellate(&geometry);
         GisFeature {
             id,
             geometry,
@@ -355,6 +354,25 @@ pub fn ramp_rgba(t: f64) -> [u8; 4] {
     [r, g, b, 255]
 }
 
+/// Fixed distinguishable palette for categorical (color-by-attribute)
+/// styling — cycles if there are more distinct values than colors.
+const CATEGORICAL_PALETTE: [[u8; 3]; 10] = [
+    [0x1f, 0x77, 0xb4],
+    [0xff, 0x7f, 0x0e],
+    [0x2c, 0xa0, 0x2c],
+    [0xd6, 0x27, 0x28],
+    [0x94, 0x67, 0xbd],
+    [0x8c, 0x56, 0x4b],
+    [0xe3, 0x77, 0xc2],
+    [0x7f, 0x7f, 0x7f],
+    [0xbc, 0xbd, 0x22],
+    [0x17, 0xbe, 0xcf],
+];
+
+pub fn categorical_color(index: usize) -> [u8; 3] {
+    CATEGORICAL_PALETTE[index % CATEGORICAL_PALETTE.len()]
+}
+
 fn norm_channel(v: f32, lo: f64, hi: f64) -> Option<u8> {
     if v.is_nan() {
         return None;
@@ -409,7 +427,7 @@ impl LayerKind {
     pub fn reset_filter_mask(&mut self) {
         match self {
             LayerKind::Points(point_cloud_layer) => point_cloud_layer.filter_mask.fill(true),
-            LayerKind::Vector(gis_layer) => {}
+            LayerKind::Vector(gis_layer) => gis_layer.filter_mask.fill(true),
             LayerKind::Raster(_) => {}
         }
     }
@@ -431,30 +449,95 @@ impl LayerKind {
     /// built, else a linear scan (mirrors `PointCloudLayer::hit_test`'s
     /// index-or-scan fallback). Used by box-select and snapshot restore.
     pub fn ids_in_bbox_with_fallback(&self, bbox: [f64; 4]) -> Vec<usize> {
-        if let Some(idx) = self.index(IndexKind::Quadtree) {
-            return idx.search(&bbox);
+        let ids = if let Some(idx) = self.index(IndexKind::Quadtree) {
+            idx.search(&bbox)
+        } else {
+            let [xmin, ymin, xmax, ymax] = bbox;
+            match self {
+                LayerKind::Vector(gl) => gl
+                    .features
+                    .iter()
+                    .filter(|f| {
+                        let b = f.bbox();
+                        b[0] <= xmax && b[2] >= xmin && b[1] <= ymax && b[3] >= ymin
+                    })
+                    .map(|f| f.id)
+                    .collect(),
+                LayerKind::Points(pc) => pc
+                    .points
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, p))| {
+                        p[0] >= xmin && p[0] <= xmax && p[1] >= ymin && p[1] <= ymax
+                    })
+                    .map(|(i, _)| i)
+                    .collect(),
+                LayerKind::Raster(_) => Vec::new(),
+            }
+        };
+        // The quadtree path above doesn't re-check the filter mask (it's
+        // built excluding filtered-out points already, when up to date), but
+        // a caller building a selection right after a filter change — before
+        // the index has been rebuilt — would otherwise get stale ids back.
+        // Filtering here makes the result correct regardless of index freshness.
+        if let LayerKind::Points(pc) = self {
+            ids.into_iter().filter(|&i| pc.filter_mask[i]).collect()
+        } else {
+            ids
         }
-        let [xmin, ymin, xmax, ymax] = bbox;
+    }
+
+    /// Ids of features/points inside the polygon ring `polygon` (world-space
+    /// vertices, implicitly closed). Prunes candidates via the polygon's
+    /// bbox (reusing `ids_in_bbox_with_fallback`, so it gets the same
+    /// index-or-scan fallback and filter-mask handling), then tests each
+    /// candidate exactly: point-in-polygon for a Points layer, geometry
+    /// intersection for a Vector layer. Empty for fewer than 3 vertices.
+    pub fn ids_in_polygon(&self, polygon: &[[f64; 2]]) -> Vec<usize> {
+        use geo::{Contains, Intersects};
+
+        if polygon.len() < 3 {
+            return Vec::new();
+        }
+        let bbox = polygon.iter().fold(
+            [f64::MAX, f64::MAX, f64::MIN, f64::MIN],
+            |acc, p| {
+                [
+                    acc[0].min(p[0]),
+                    acc[1].min(p[1]),
+                    acc[2].max(p[0]),
+                    acc[3].max(p[1]),
+                ]
+            },
+        );
+        let candidates = self.ids_in_bbox_with_fallback(bbox);
+        let ring: geo_types::LineString<f64> =
+            polygon.iter().map(|p| (p[0], p[1])).collect();
+        let poly = geo_types::Polygon::new(ring, vec![]);
+
         match self {
-            LayerKind::Vector(gl) => gl
-                .features
-                .iter()
-                .filter(|f| {
-                    let b = f.bbox();
-                    b[0] <= xmax && b[2] >= xmin && b[1] <= ymax && b[3] >= ymin
+            LayerKind::Vector(gl) => candidates
+                .into_iter()
+                .filter(|&id| {
+                    gl.features
+                        .get(id)
+                        .map(|f| f.geometry.intersects(&poly))
+                        .unwrap_or(false)
                 })
-                .map(|f| f.id)
                 .collect(),
-            LayerKind::Points(pc) => pc
-                .points
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, p))| p[0] >= xmin && p[0] <= xmax && p[1] >= ymin && p[1] <= ymax)
-                .map(|(i, _)| i)
+            LayerKind::Points(pc) => candidates
+                .into_iter()
+                .filter(|&i| {
+                    pc.points
+                        .get(i)
+                        .map(|(_, p)| poly.contains(&geo_types::Point::new(p[0], p[1])))
+                        .unwrap_or(false)
+                })
                 .collect(),
             LayerKind::Raster(_) => Vec::new(),
         }
     }
+
     pub fn feature_count(&self) -> usize {
         match self {
             LayerKind::Vector(gis_layer) => gis_layer.features.len(),
@@ -557,6 +640,10 @@ pub struct LayerEntry {
     pub show_points: bool,
     pub name: String,
     pub color: [u8; 3],
+    /// When set, vector features are colored by the distinct values of this
+    /// attribute (see `categorical_color`) instead of the uniform `color`
+    /// above. Ignored for Points/Raster layers.
+    pub color_by: Option<String>,
     pub opacity: u8,
     pub descriptor: LayerDescriptor,
     pub filters: Vec<LayerAttributeFilter>,
@@ -588,8 +675,150 @@ pub struct LayerEntry {
     /// Index into `saved_heatmaps` currently loaded into `kde_cache` for
     /// display, if any — drives the selected-row highlight in the layer panel.
     pub active_saved_heatmap: Option<usize>,
+    /// Whether the uniform-grid binning overlay is shown. Independent of
+    /// `show_heatmap` (adaptive-quadtree-based, near-uniform leaf counts) and
+    /// `show_kde` — a fixed cell size, so raw count-per-cell is a real
+    /// density signal.
+    pub show_gridbin: bool,
+    pub gridbin_cache: Option<crate::heatmap::HeatmapLayer>,
+    /// Which of `gridbin_cache`'s metrics colors the overlay — only
+    /// `Density`/`AttributeMean` are meaningful (no per-cell samples for
+    /// `Unpredictability`).
+    pub gridbin_metric: crate::heatmap::HeatmapMetric,
+    /// Whether the bivariate grid overlay is shown.
+    pub show_bivariate_grid: bool,
+    pub bivariate_grid_cache: Option<crate::bivariate::BivariateGridLayer>,
+    /// Named bivariate grid snapshots saved under this layer — mirrors `saved_heatmaps`.
+    pub saved_bivariate_grids: Vec<crate::bivariate::SavedBivariateGrid>,
+    /// Index into `saved_bivariate_grids` currently loaded into `bivariate_grid_cache`.
+    pub active_saved_bivariate_grid: Option<usize>,
+    /// Set when this layer was loaded with "Batch load" on — tracks which
+    /// batches have been pulled in so far, so the batch manager window can
+    /// offer "load next" / "load range" for the rest of the file.
+    pub batch_load: Option<BatchLoadState>,
 }
-impl LayerEntry {}
+
+/// Progressive-load bookkeeping for a layer loaded via `ReadOp::Range`.
+/// `batch_size`/`selected_fields` are captured from the initial load so
+/// later batches use the same schema; `loaded` records which 0-based batch
+/// indices have been pulled in (out-of-order range loads leave gaps).
+pub struct BatchLoadState {
+    pub batch_size: u64,
+    pub is_points: bool,
+    pub selected_fields: Option<Vec<String>>,
+    pub total_batches: u64,
+    pub loaded: std::collections::HashSet<u64>,
+}
+
+impl LayerEntry {
+    /// Builds a new layer containing only `ids` (positions into this
+    /// layer's points/features) — the shared subsetting logic behind
+    /// "create layer from selection" and "create layer from sample".
+    /// `None` for a Raster source (rasters aren't feature-indexed).
+    pub fn subset_by_ids(&self, ids: &[usize], new_name: String) -> Option<LayerEntry> {
+        let mut descriptor = self.descriptor.clone();
+        descriptor.name = new_name.clone();
+        descriptor.num_features = ids.len() as u64;
+
+        let data = match &self.data {
+            LayerKind::Points(pc) => {
+                let n = ids.len();
+                let new_points: Vec<(u32, [f64; 2])> =
+                    ids.iter().map(|&id| pc.points[id]).collect();
+                let new_attrs: Vec<AttributeColumn> = pc
+                    .attributes
+                    .iter()
+                    .map(|col| match col {
+                        AttributeColumn::Text(v) => {
+                            AttributeColumn::Text(ids.iter().map(|&id| v[id].clone()).collect())
+                        }
+                        AttributeColumn::Integer(v) => {
+                            AttributeColumn::Integer(ids.iter().map(|&id| v[id]).collect())
+                        }
+                        AttributeColumn::Float(v) => {
+                            AttributeColumn::Float(ids.iter().map(|&id| v[id]).collect())
+                        }
+                    })
+                    .collect();
+                let mut new_pc = PointCloudLayer {
+                    points: std::sync::Arc::new(new_points),
+                    attributes: new_attrs,
+                    field_names: pc.field_names.clone(),
+                    index: None,
+                    bbox: None,
+                    viewport_mask: bitvec::bitvec![0; n],
+                    filter_mask: bitvec::bitvec![1; n],
+                };
+                new_pc.ensure_bbox();
+                LayerKind::Points(new_pc)
+            }
+            LayerKind::Vector(gl) => {
+                let new_features: Vec<GisFeature> = ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(new_id, &old_id)| {
+                        gl.features.get(old_id).map(|f| {
+                            GisFeature::new(new_id, f.geometry.clone(), f.attributes.clone())
+                        })
+                    })
+                    .collect();
+                let world_bbox = new_features.iter().map(|f| f.bbox()).fold(
+                    [f64::MAX, f64::MAX, f64::MIN, f64::MIN],
+                    |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
+                );
+                LayerKind::Vector(GisLayer {
+                    name: new_name.clone(),
+                    file_path: String::new(),
+                    filter_mask: bitvec::bitvec![1; new_features.len()],
+                    features: new_features,
+                    field_names: gl.field_names.clone(),
+                    extra_field_names: gl.extra_field_names.clone(),
+                    quadtree: None,
+                    point_only: gl.point_only,
+                    world_bbox,
+                })
+            }
+            LayerKind::Raster(_) => return None,
+        };
+
+        Some(LayerEntry {
+            data,
+            visible: true,
+            show_points: true,
+            name: new_name,
+            color: self.color,
+            color_by: None,
+            opacity: self.opacity,
+            descriptor,
+            filters: Vec::new(),
+            filter_logic: FilterLogic::default(),
+            roi_bboxes: Vec::new(),
+            selections: Vec::new(),
+            active_selection: None,
+            // Features are already-transformed copies of the source layer's
+            // data, not a fresh streamed load.
+            crs_transform: None,
+            show_index: false,
+            index_kind: IndexKind::Quadtree,
+            show_heatmap: false,
+            heatmap_metric: crate::heatmap::HeatmapMetric::Density,
+            heatmap_cache: None,
+            heatmap_dirty: true,
+            show_kde: false,
+            kde_cache: None,
+            saved_heatmaps: Vec::new(),
+            active_saved_heatmap: None,
+            show_gridbin: false,
+            gridbin_cache: None,
+            gridbin_metric: crate::heatmap::HeatmapMetric::Density,
+            show_bivariate_grid: false,
+            bivariate_grid_cache: None,
+            saved_bivariate_grids: Vec::new(),
+            active_saved_bivariate_grid: None,
+            batch_load: None,
+        })
+    }
+}
 
 /// A saved box-selection: a bbox plus the ids of features/points it captured.
 /// For `LayerKind::Vector`, `ids` are `GisFeature.id` values (== their index in
@@ -609,16 +838,17 @@ pub struct GisLayer {
     pub field_names: Vec<String>,
     pub extra_field_names: Vec<String>,
     pub quadtree: Option<SpatialIndex>,
-    pub hilbert: Option<SpatialIndex>,
     pub point_only: bool,
     pub world_bbox: [f64; 4],
+    /// One bit per `features` entry; `false` means filtered out (mirrors
+    /// `PointCloudLayer::filter_mask`). Starts all-`true`.
+    pub filter_mask: bitvec::vec::BitVec,
 }
 
 impl GisLayer {
     pub fn index(&self, kind: IndexKind) -> Option<&SpatialIndex> {
         match kind {
             IndexKind::Quadtree => self.quadtree.as_ref(),
-            IndexKind::Hilbert => self.hilbert.as_ref(),
         }
     }
 
@@ -647,15 +877,6 @@ impl GisLayer {
             qt.insert(f.id, f.bbox());
         }
         self.quadtree = Some(qt);
-    }
-
-    pub fn rebuild_hilbert_tree(&mut self, order: u32) {
-        self.ensure_world_bbox();
-        let mut ht = SpatialIndex::HilbertCurve(HilbertRTree::new(self.world_bbox, order));
-        for f in &self.features {
-            ht.insert(f.id, f.bbox());
-        }
-        self.hilbert = Some(ht);
     }
 }
 

@@ -23,7 +23,7 @@ anyhow = "1"
 rfd = { version = "0.17", features = ["file-handle-inner"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flatgeobuf = "6.0.1"
-geozero = { version = "0.15", features = ["with-geo"] }
+geozero = { version = "0.15", features = ["with-geo", "with-wkb"] }
 rand = "0.10.1"
 kernel-density-estimation = "0.2.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -32,10 +32,13 @@ bitvec = "1.0.1"
 futures-channel = "0.3"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-arrow = { version = "53", default-features = false }
+arrow = { version = "53", default-features = false, features = ["ipc"] }
 parquet = { version = "53", default-features = false, features = ["arrow", "snap"] }
 geojson = { version = "0.24", features = ["geo-types"] }
 serde_json = "1"
+rmp-serde = "1"
+serde_bytes = "0.11"
+thiserror = "2"
 proj4rs = { version = "0.1", features = ["crs-definitions"] }
 crs-definitions = "0.4"
 

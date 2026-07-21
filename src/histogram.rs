@@ -5,6 +5,7 @@ use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 use crate::spatial_index::SpatialIndex;
 use crate::stats_core;
 
+#[derive(Clone)]
 pub struct BivariateStats {
     pub x_field: String,
     pub y_field: String,

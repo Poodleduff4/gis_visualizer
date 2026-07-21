@@ -1,0 +1,4 @@
+name = "hello-world"
+entrypoint = "main.py"
+python = "python3"
+capabilities = []

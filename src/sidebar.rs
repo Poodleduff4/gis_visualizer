@@ -40,6 +40,7 @@ pub enum SidebarAction {
     ComputeLocalVarianceSelection(String, f64),
     ComputeLisaSelection(String, f64),
     CreateLayerFromSelection,
+    CreateLayerFromFiltered,
 }
 
 // ── Main sidebar widget ───────────────────────────────────────────────────────
@@ -106,7 +107,7 @@ pub fn show_sidebar(
             let val = &filter.comparitor_raw;
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{attr} {op} {val}")).monospace());
-                if ui.small_button("✕").clicked() {
+                if ui.small_button("X").clicked() {
                     to_remove = Some(idx);
                 }
             });
@@ -370,6 +371,13 @@ pub fn show_sidebar(
         };
         if ui.button(label).clicked() {
             action = SidebarAction::ExportFiltered;
+        }
+        if matches!(layer.data, crate::gis_layer::LayerKind::Points(_))
+            && ui
+                .button(format!("Create Layer from Filtered ({} pts)", filtered_count))
+                .clicked()
+        {
+            action = SidebarAction::CreateLayerFromFiltered;
         }
         ui.separator();
     }

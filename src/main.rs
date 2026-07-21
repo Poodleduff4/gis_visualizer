@@ -1,5 +1,6 @@
 mod app;
 mod basemap;
+mod bivariate;
 mod crs;
 mod snapshot;
 mod exporter;
@@ -8,13 +9,14 @@ mod gpu_collect;
 mod histogram;
 mod gis_layer;
 mod gis_reader;
+mod gridbin;
 mod heatmap;
-mod hilbert_curve;
-mod hilbert_r_tree;
 mod kde;
 mod map_view;
 #[cfg(not(target_arch = "wasm32"))]
 mod parquet;
+#[cfg(not(target_arch = "wasm32"))]
+mod plugin;
 mod point_cloud;
 mod point_cloud_layer;
 mod quadtree;
@@ -23,6 +25,7 @@ mod globe;
 mod sidebar;
 mod spatial_index;
 mod rtree_index;
+mod sampling;
 mod selection_stats;
 mod stats_core;
 mod uncertainty_quadtree;

@@ -2,7 +2,6 @@ use bitvec::{array::BitArray, vec::BitVec};
 
 use crate::{
     gis_layer::BatchMessage,
-    hilbert_r_tree::HilbertRTree,
     quadtree::Quadtree,
     spatial_index::SpatialIndex,
     uncertainty_quadtree::{MeasurementType, UncertaintyQuadtree},
@@ -101,17 +100,6 @@ impl PointCloudLayer {
 
     pub fn has_rtree(&self) -> bool {
         matches!(self.index.as_deref(), Some(SpatialIndex::RTree(_)))
-    }
-
-    pub fn rebuild_hilbert_tree(&mut self, order: u32) {
-        self.ensure_bbox();
-        if let Some(bbox) = self.bbox {
-            let mut ht = SpatialIndex::HilbertCurve(HilbertRTree::new(bbox, order));
-            for (pos, (_, p)) in self.points.iter().enumerate() {
-                ht.insert(pos, [p[0], p[1], p[0], p[1]]);
-            }
-            self.index = Some(Arc::new(ht));
-        }
     }
 
     pub fn hit_test(&self, x: f64, y: f64, tolerance: f64) -> Option<usize> {

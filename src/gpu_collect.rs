@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use egui::Color32;
 
-use crate::gis_layer::{LayerEntry, LayerKind};
+use crate::gis_layer::{categorical_color, LayerEntry, LayerKind};
 use crate::point_cloud::GpuPoint;
 use crate::vector_gpu::GpuVertex;
 
@@ -41,21 +43,40 @@ pub fn collect_gpu_points(
                 panic!("Unexpected layer kind in collect_gpu_points!")
             }
         };
+        // Row index into `points`/`attributes` — the same id space
+        // `hit_test` (single-click `selected_id`) and `LayerSelection.ids`
+        // (box-select / histogram-brush) both use, so both highlight paths
+        // below stay correct regardless of what `filter_mask` hides.
         let visible_points = point_cloud_layer
             .points
             .iter()
             .enumerate()
             .filter(|(i, (_pi, _pv))| point_cloud_layer.filter_mask[*i])
-            .map(|(_, (_pi, pv))| *pv)
-            .collect::<Vec<[f64; 2]>>();
+            .map(|(i, (_pi, pv))| (i, *pv))
+            .collect::<Vec<(usize, [f64; 2])>>();
         let layer_color = Color32::from_rgba_unmultiplied(
             entry.color[0],
             entry.color[1],
             entry.color[2],
             entry.opacity,
         );
-        for (idx, &point) in visible_points.iter().enumerate() {
-            let fill = if is_active && selected_id == Some(idx) {
+        // Ids of the active layer's active box-select/histogram-brush
+        // selection, if any — highlighted the same as a single clicked point.
+        let highlight_ids: Option<std::collections::HashSet<usize>> = if is_active {
+            entry
+                .active_selection
+                .and_then(|sidx| entry.selections.get(sidx))
+                .map(|sel| sel.ids.iter().copied().collect())
+        } else {
+            None
+        };
+        for &(row_idx, point) in visible_points.iter() {
+            let fill = if is_active && selected_id == Some(row_idx) {
+                FILL_SELECTED
+            } else if highlight_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&row_idx))
+            {
                 FILL_SELECTED
             } else {
                 layer_color
@@ -110,14 +131,55 @@ pub fn collect_gpu_vector_mesh(
         let stroke_normal =
             pack_color(Color32::from_rgb(entry.color[0], entry.color[1], entry.color[2]));
 
+        // Assign each distinct value of `color_by` a palette slot, in first-seen
+        // order, so the same value gets the same color across a redraw.
+        let mut category_colors: HashMap<&str, (u32, u32)> = HashMap::new();
+        if let Some(attr) = entry.color_by.as_deref() {
+            for feature in &layer.features {
+                if let Some(v) = feature.attributes.get(attr) {
+                    let key: &str = match v {
+                        crate::gis_layer::AttributeValue::Text(s) => s.as_str(),
+                        _ => continue,
+                    };
+                    if !category_colors.contains_key(key) {
+                        let [r, g, b] = categorical_color(category_colors.len());
+                        let fill = pack_color(Color32::from_rgba_unmultiplied(r, g, b, entry.opacity));
+                        let stroke = pack_color(Color32::from_rgb(r, g, b));
+                        category_colors.insert(key, (fill, stroke));
+                    }
+                }
+            }
+        }
+
         for (id, feature) in layer.features.iter().enumerate() {
+            if layer.filter_mask.get(id).map(|b| !*b).unwrap_or(false) {
+                continue;
+            }
             let tess = &feature.tessellated;
             if tess.fill_idx.is_empty() && tess.outlines.is_empty() {
                 continue;
             }
             let is_selected = is_active && selected_id == Some(id);
-            let fill_color = if is_selected { fill_selected } else { fill_normal };
-            let stroke_color = if is_selected { stroke_selected } else { stroke_normal };
+            let (fill_by_attr, stroke_by_attr) = entry
+                .color_by
+                .as_deref()
+                .and_then(|attr| feature.attributes.get(attr))
+                .and_then(|v| match v {
+                    crate::gis_layer::AttributeValue::Text(s) => category_colors.get(s.as_str()),
+                    _ => None,
+                })
+                .copied()
+                .unzip();
+            let fill_color = if is_selected {
+                fill_selected
+            } else {
+                fill_by_attr.unwrap_or(fill_normal)
+            };
+            let stroke_color = if is_selected {
+                stroke_selected
+            } else {
+                stroke_by_attr.unwrap_or(stroke_normal)
+            };
 
             if !tess.fill_idx.is_empty() {
                 let base = fill_verts_out.len() as u32;
@@ -136,9 +198,9 @@ pub fn collect_gpu_vector_mesh(
                 if n < 2 {
                     continue;
                 }
-                for w in 0..n {
+                for w in 0..n - 1 {
                     let a = ring[w];
-                    let b = ring[(w + 1) % n];
+                    let b = ring[w + 1];
                     line_verts_out.push(GpuVertex {
                         position: [a[0] as f32, a[1] as f32],
                         color: stroke_color,

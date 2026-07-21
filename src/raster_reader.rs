@@ -199,6 +199,7 @@ pub fn build_layer_entry(
         show_points: true,
         name: name.clone(),
         color: [255, 255, 255],
+        color_by: None,
         opacity: 255,
         descriptor: LayerDescriptor {
             name,
@@ -225,6 +226,14 @@ pub fn build_layer_entry(
         kde_cache: None,
         saved_heatmaps: Vec::new(),
         active_saved_heatmap: None,
+        show_gridbin: false,
+        gridbin_cache: None,
+        gridbin_metric: crate::heatmap::HeatmapMetric::Density,
+        show_bivariate_grid: false,
+        bivariate_grid_cache: None,
+        saved_bivariate_grids: Vec::new(),
+        active_saved_bivariate_grid: None,
+        batch_load: None,
     }
 }
 
@@ -284,19 +293,29 @@ pub fn write_geotiff(
     values: &[f32],
     bbox: [f64; 4],
 ) -> Result<()> {
+    write_geotiff_multiband(path, width, height, std::slice::from_ref(&values.to_vec()), bbox)
+}
+
+/// Writes one band per TIFF page (matches `decode_bands`' multi-page read
+/// path), each page carrying its own geo tags — `read_geo_extent` reads
+/// whatever page the decoder is left on, so every page needs them, not just
+/// the first.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_geotiff_multiband(
+    path: &std::path::Path,
+    width: usize,
+    height: usize,
+    bands: &[Vec<f32>],
+    bbox: [f64; 4],
+) -> Result<()> {
     use tiff::encoder::{colortype::Gray32Float, TiffEncoder};
 
     let [xmin, ymin, xmax, ymax] = bbox;
     let file = std::fs::File::create(path)?;
     let mut tiff = TiffEncoder::new(file)?;
-    let mut img = tiff.new_image::<Gray32Float>(width as u32, height as u32)?;
 
     let pixel_scale_x = (xmax - xmin) / width as f64;
     let pixel_scale_y = (ymax - ymin) / height as f64;
-    img.encoder()
-        .write_tag(Tag::ModelPixelScaleTag, &[pixel_scale_x, pixel_scale_y, 0.0][..])?;
-    img.encoder()
-        .write_tag(Tag::ModelTiepointTag, &[0.0, 0.0, 0.0, xmin, ymax, 0.0][..])?;
     // Minimal GeoKeyDirectory: geographic WGS84 (EPSG:4326), pixel-is-area.
     let geo_keys: [u16; 16] = [
         1, 1, 0, 3, // KeyDirectoryVersion, KeyRevision, MinorRevision, NumberOfKeys
@@ -304,9 +323,16 @@ pub fn write_geotiff(
         1025, 0, 1, 1, // GTRasterTypeGeoKey = 1 (PixelIsArea)
         2048, 0, 1, 4326, // GeographicTypeGeoKey = 4326 (WGS 84)
     ];
-    img.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geo_keys[..])?;
 
-    img.write_data(values)?;
+    for band in bands {
+        let mut img = tiff.new_image::<Gray32Float>(width as u32, height as u32)?;
+        img.encoder()
+            .write_tag(Tag::ModelPixelScaleTag, &[pixel_scale_x, pixel_scale_y, 0.0][..])?;
+        img.encoder()
+            .write_tag(Tag::ModelTiepointTag, &[0.0, 0.0, 0.0, xmin, ymax, 0.0][..])?;
+        img.encoder().write_tag(Tag::GeoKeyDirectoryTag, &geo_keys[..])?;
+        img.write_data(band)?;
+    }
     Ok(())
 }
 

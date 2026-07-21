@@ -55,8 +55,6 @@ pub struct LayerSnapshot {
     #[serde(default)]
     pub quadtree_capacity: Option<usize>,
     #[serde(default)]
-    pub hilbert_order: Option<u32>,
-    #[serde(default)]
     pub built_rtree: bool,
     #[serde(default)]
     pub uncertainty: Option<UncertaintySnapshot>,
@@ -111,15 +109,11 @@ pub fn str_to_measurement_type(s: &str) -> crate::uncertainty_quadtree::Measurem
 pub fn index_kind_to_str(kind: &crate::spatial_index::IndexKind) -> String {
     match kind {
         crate::spatial_index::IndexKind::Quadtree => "Quadtree".to_string(),
-        crate::spatial_index::IndexKind::Hilbert => "Hilbert".to_string(),
     }
 }
 
-pub fn str_to_index_kind(s: &str) -> crate::spatial_index::IndexKind {
-    match s {
-        "Hilbert" => crate::spatial_index::IndexKind::Hilbert,
-        _ => crate::spatial_index::IndexKind::Quadtree,
-    }
+pub fn str_to_index_kind(_s: &str) -> crate::spatial_index::IndexKind {
+    crate::spatial_index::IndexKind::Quadtree
 }
 
 pub fn heatmap_metric_to_str(metric: &crate::heatmap::HeatmapMetric) -> String {
@@ -153,6 +147,11 @@ pub struct PendingSnapshotRestore {
     pub viewport: ViewportSnapshot,
     pub display: DisplaySnapshot,
     pub analysis: AnalysisSnapshot,
+    /// Selections queued for (layer index, selections, active index) but not
+    /// yet turned into `LayerSelection`s — held back until that layer's
+    /// filters have actually resolved (filter_mask updated), so a restored
+    /// selection's ids reflect the filter, not a stale unfiltered index.
+    pub pending_selections: Vec<(usize, Vec<SelectionSnapshot>, Option<usize>)>,
 }
 
 pub fn parse_comparitor_best(raw: &str) -> AttributeValue {

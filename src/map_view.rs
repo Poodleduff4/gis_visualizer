@@ -1,6 +1,6 @@
 use bitvec::vec::BitVec;
 
-use crate::app::ClickTarget;
+use crate::app::{ClickTarget, SelectShape};
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{
     bake_raster_rgba, LayerEntry, LayerKind, LayerSelection, RasterData, TessellatedGeom,
@@ -95,8 +95,12 @@ pub fn show_map(
     selected_index_cell_data: &mut Option<UncertaintyMeasure>,
     roi_toggle: &mut Option<[f64; 4]>,
     select_mode: bool,
+    select_shape: SelectShape,
     select_drag_start: &mut Option<Pos2>,
+    select_polygon: &mut Vec<[f64; 2]>,
     selection_result: &mut Option<[f64; 4]>,
+    polygon_selection_result: &mut Option<Vec<[f64; 2]>>,
+    vector_line_width: f32,
 ) {
     let ctx = ui.ctx().clone();
     let rect = response.rect;
@@ -116,7 +120,7 @@ pub fn show_map(
     }
 
     // Box-select: rubber-band drag while select_mode is on.
-    if select_mode {
+    if select_mode && select_shape == SelectShape::Rectangle {
         if response.drag_started() {
             *select_drag_start = response.interact_pointer_pos();
         }
@@ -144,6 +148,48 @@ pub fn show_map(
                     wx0.max(wx1),
                     wy0.max(wy1),
                 ]);
+            }
+        }
+    }
+
+    // Polygon-select: click to add vertices, double-/right-click to close
+    // the ring and commit the selection, Escape to cancel.
+    if select_mode && select_shape == SelectShape::Polygon {
+        if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let w = viewport.screen_to_world(pos.x, pos.y, rect);
+                select_polygon.push(w);
+            }
+        }
+        if (response.double_clicked() || response.secondary_clicked()) && select_polygon.len() >= 3 {
+            *polygon_selection_result = Some(std::mem::take(select_polygon));
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            select_polygon.clear();
+        }
+
+        if !select_polygon.is_empty() {
+            let mut screen_pts: Vec<Pos2> = select_polygon
+                .iter()
+                .map(|p| viewport.world_to_screen(p[0], p[1], rect))
+                .collect();
+            let vertex_count = screen_pts.len();
+            if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
+                if rect.contains(hover) {
+                    screen_pts.push(hover);
+                }
+            }
+            for w in screen_pts.windows(2) {
+                painter.line_segment([w[0], w[1]], Stroke::new(1.5, Color32::YELLOW));
+            }
+            for p in &screen_pts[..vertex_count] {
+                painter.circle_filled(*p, 3.0, Color32::YELLOW);
+            }
+            if vertex_count >= 3 {
+                painter.line_segment(
+                    [screen_pts[vertex_count - 1], screen_pts[0]],
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 0, 120)),
+                );
             }
         }
     }
@@ -237,13 +283,18 @@ pub fn show_map(
                     viewport,
                     rect,
                     is_selected,
-                    render_points,
                     fill,
                     stroke,
+                    vector_line_width,
                 );
             }
         }
     }
+
+    // Vector-layer point/multipoint features always CPU-paint here — see
+    // `render_vector_points`'s doc comment for why they can't just ride the
+    // GPU fill/outline mesh path like polygons/lines do.
+    render_vector_points(&painter, layers, active_entry, viewport, rect, *selected_id);
 
     // Status line at bottom of map
     if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -447,13 +498,13 @@ fn render_tessellated(
     viewport: &Viewport,
     rect: Rect,
     selected: bool,
-    render_points: bool,
     layer_fill: Color32,
     layer_stroke: Color32,
+    line_width: f32,
 ) {
     let fill = if selected { FILL_SELECTED } else { layer_fill };
     let stroke_color = if selected { STROKE_SELECTED } else { layer_stroke };
-    let stroke = Stroke::new(1.0, stroke_color);
+    let stroke = Stroke::new(line_width, stroke_color);
 
     // Filled polygon mesh
     if !tess.fill_idx.is_empty() {
@@ -481,42 +532,92 @@ fn render_tessellated(
             .iter()
             .map(|v| viewport.world_to_screen(v[0], v[1], rect))
             .collect();
-        painter.add(Shape::closed_line(pts, stroke));
+        painter.add(Shape::line(pts, stroke));
     }
+}
 
-    if render_points {
-        for &[wx, wy] in &tess.points {
-            let pos = viewport.world_to_screen(wx, wy, rect);
-            let half = POINT_RADIUS;
-            let r = Rect::from_center_size(pos, Vec2::splat(half * 2.0));
-            painter.rect(r, 0.0, fill, stroke, egui::StrokeKind::Outside);
+/// Draws every visible Vector layer's Point/MultiPoint features as small,
+/// screen-space-constant-size squares. Unlike fill/outline geometry (which
+/// GPU mode renders via `collect_gpu_vector_mesh`'s triangulated mesh),
+/// points need a size that doesn't scale with zoom, which the world-space
+/// GPU vertex buffer can't express — so, like the LISA/local-variance
+/// overlays, they're always CPU-painted here regardless of GPU/CPU mode
+/// rather than being gated behind `render_points` (which really means "no
+/// GPU available").
+pub fn render_vector_points(
+    painter: &Painter,
+    layers: &[LayerEntry],
+    active_entry: Option<&LayerEntry>,
+    viewport: &Viewport,
+    rect: Rect,
+    selected_id: Option<usize>,
+) {
+    let [xmin, ymin, xmax, ymax] = viewport.viewport_bbox(rect);
+    let active_layer_name = active_entry.map(|e| e.name.as_str());
+    for entry in layers.iter().filter(|e| e.visible) {
+        let LayerKind::Vector(layer) = &entry.data else {
+            continue;
+        };
+        let is_active = active_layer_name == Some(entry.name.as_str());
+        let layer_fill = Color32::from_rgba_unmultiplied(
+            entry.color[0],
+            entry.color[1],
+            entry.color[2],
+            entry.opacity,
+        );
+        let layer_stroke_color = Color32::from_rgb(entry.color[0], entry.color[1], entry.color[2]);
+
+        for id in layer.features_in_bbox(xmin, ymin, xmax, ymax) {
+            let feature = &layer.features[id];
+            if feature.tessellated.points.is_empty() {
+                continue;
+            }
+            let is_selected = is_active && selected_id == Some(id);
+            let fill = if is_selected { FILL_SELECTED } else { layer_fill };
+            let stroke = Stroke::new(
+                1.0,
+                if is_selected { STROKE_SELECTED } else { layer_stroke_color },
+            );
+            for &[wx, wy] in &feature.tessellated.points {
+                let pos = viewport.world_to_screen(wx, wy, rect);
+                let r = Rect::from_center_size(pos, Vec2::splat(POINT_RADIUS * 2.0));
+                painter.rect(r, 0.0, fill, stroke, egui::StrokeKind::Outside);
+            }
         }
     }
 }
 
 /// Draw a GeoTIFF raster as a single textured rect spanning its full-globe
-/// bbox [-180,-90,180,90]. `texture_cache` is re-baked only when `dirty` (or
-/// empty) — baking + uploading a fresh texture every frame isn't free.
+/// bbox [-180,-90,180,90]. `texture_cache[layer_idx]` is re-baked only when
+/// `dirty` (or not yet baked) — baking + uploading a fresh texture every
+/// frame isn't free. Called once per visible raster layer (each with its own
+/// `layer_idx`/opacity) so multiple rasters alpha-blend on top of each other
+/// instead of the topmost one fully occluding the rest.
 pub fn render_raster_overlay(
     ui: &Ui,
     painter: &Painter,
     raster: &RasterData,
     viewport: &Viewport,
     rect: Rect,
-    texture_cache: &mut Option<egui::TextureHandle>,
+    texture_cache: &mut std::collections::HashMap<usize, egui::TextureHandle>,
+    layer_idx: usize,
     dirty: bool,
     opacity: u8,
 ) {
-    if dirty || texture_cache.is_none() {
+    if dirty || !texture_cache.contains_key(&layer_idx) {
         let rgba = bake_raster_rgba(raster);
         let image = egui::ColorImage::from_rgba_unmultiplied([raster.width, raster.height], &rgba);
-        *texture_cache = Some(ui.ctx().load_texture(
-            "raster_overlay",
+        let texture = ui.ctx().load_texture(
+            format!("raster_overlay_{layer_idx}"),
             image,
-            egui::TextureOptions::LINEAR,
-        ));
+            // NEAREST, not LINEAR: matches QGIS's default resampling — crisp
+            // cell edges at native/zoomed-in scale instead of blurring
+            // neighboring pixels together.
+            egui::TextureOptions::NEAREST,
+        );
+        texture_cache.insert(layer_idx, texture);
     }
-    let Some(texture) = texture_cache else { return };
+    let Some(texture) = texture_cache.get(&layer_idx) else { return };
 
     let [xmin, ymin, xmax, ymax] = raster.extent;
     let top_left = viewport.world_to_screen(xmin, ymax, rect);
