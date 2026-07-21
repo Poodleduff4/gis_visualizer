@@ -14,4 +14,4 @@ mod sdk_test;
 pub use manifest::{discover_plugins, ParamKind, PluginManifest, PluginParam};
 pub use process::{PluginProcess, PluginProcessError};
 pub use protocol::{HostReply, HostRequest, LayerSummary, LayerWant, LogLevel, PluginCall, PluginResult};
-pub use runner::{run_plugin, PluginEvent};
+pub use runner::{run_plugin, PluginEvent, PluginHandle};

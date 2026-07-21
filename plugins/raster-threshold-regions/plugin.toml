@@ -12,8 +12,8 @@ layer_kind = "raster"
 [[params]]
 name = "band"
 label = "Band name (blank = first band)"
-kind = "text"
-default = ""
+kind = "attribute"
+attribute_of = "layer"
 
 [[params]]
 name = "threshold"

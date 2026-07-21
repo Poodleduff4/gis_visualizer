@@ -3,7 +3,7 @@ use bitvec::{bitarr, bitvec, vec::BitVec, BitArr};
 use flatgeobuf::{
     ColumnType, FallibleStreamingIterator, FeatureProperties, FgbReader, GeometryType, Header,
 };
-use geo_types::Geometry;
+use geo_types::{Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use geozero::{error::GeozeroError, ColumnValue, PropertyProcessor, ToGeo};
 use std::{
     collections::HashMap,
@@ -18,7 +18,7 @@ use std::fs::File;
 // On desktop datafusion re-exports these from the same crate version.
 use arrow::array::{
     Array, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
-    StringArray, UInt32Array, UInt64Array,
+    ListArray, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::datatypes::DataType;
@@ -168,11 +168,14 @@ pub(crate) fn vector_file_type(path: &str) -> anyhow::Result<VectorFileType> {
     }
 }
 
-/// How much of a file to read: everything, or only what intersects a bbox.
+/// How much of a file to read: everything, only what intersects a bbox, or
+/// a contiguous slice of features (progressive/batch loading).
 #[derive(Clone, Copy)]
 pub enum ReadOp {
     Full,
     Bbox([f64; 4]),
+    /// Skip `offset` features, then read up to `limit` of them.
+    Range { offset: u64, limit: u64 },
 }
 
 // ── FlatGeobuf point-batch helpers — shared by every full-scan / bbox-scan
@@ -255,6 +258,25 @@ enum GeometrySource {
     WkbColumn,
 }
 
+/// Reads just the WKB header's byte order + geometry-type code (1=Point,
+/// 2=LineString, 3=Polygon, …), stripping the Z/M/ZM thousands-place flag
+/// some writers set (EWKB-style 1001/2001/…) so callers only see the base
+/// 2D type. Used to sniff whether a GeoParquet `geometry` column actually
+/// holds points before committing to the point-cloud loading path — the
+/// column's Arrow type alone (Binary) can't tell point from line/polygon.
+fn wkb_header_geom_type(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 5 {
+        return None;
+    }
+    let le = bytes[0] == 1;
+    let raw = if le {
+        u32::from_le_bytes(bytes[1..5].try_into().ok()?)
+    } else {
+        u32::from_be_bytes(bytes[1..5].try_into().ok()?)
+    };
+    Some(raw % 1000)
+}
+
 fn decode_wkb_point(bytes: &[u8]) -> Option<[f64; 2]> {
     if bytes.len() < 21 {
         return None;
@@ -301,6 +323,26 @@ fn pq_extract_i64(arr: &dyn Array, i: usize) -> Option<i64> {
     } else {
         None
     }
+}
+
+/// Generic per-cell Arrow -> `AttributeValue` decode for the GeoParquet
+/// vector path (unlike `pq_attr_col`, which builds typed point-cloud
+/// columns up front, vector features hold a loose `HashMap` so the type
+/// is decided per value instead).
+fn pq_attr_value(arr: &dyn Array, i: usize) -> Option<AttributeValue> {
+    if arr.is_null(i) {
+        return None;
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        return Some(AttributeValue::Text(a.value(i).to_string()));
+    }
+    if let Some(v) = pq_extract_i64(arr, i) {
+        return Some(AttributeValue::Integer(v));
+    }
+    if let Some(v) = pq_extract_f64(arr, i) {
+        return Some(AttributeValue::Float(v));
+    }
+    None
 }
 
 fn pq_attr_col(dt: &DataType, cap: usize) -> crate::point_cloud_layer::AttributeColumn {
@@ -386,6 +428,131 @@ fn parquet_geo_crs_label(kv: Option<&Vec<parquet::format::KeyValue>>) -> Option<
                 Some("custom CRS".to_string())
             }
         }
+    }
+}
+
+/// Parses the GeoParquet spec's "geo" key-value metadata entry for the
+/// primary geometry column's `encoding`. GeoParquet supports two families:
+/// `"WKB"` (a `Binary` column of well-known-binary blobs, the default when
+/// this key is missing) and the "native GeoArrow" encodings — `"point"`,
+/// `"linestring"`, `"polygon"`, `"multipoint"`, `"multilinestring"`,
+/// `"multipolygon"` — where the column is itself a (possibly nested) Arrow
+/// `List<Struct<x, y>>` and there's no WKB to decode at all. Lowercased so
+/// callers can match without re-normalizing case.
+fn parquet_geo_encoding(kv: Option<&Vec<parquet::format::KeyValue>>) -> Option<String> {
+    let geo_json = kv?.iter().find(|k| k.key == "geo")?.value.as_ref()?;
+    let geo: serde_json::Value = serde_json::from_str(geo_json).ok()?;
+    let primary = geo
+        .get("primary_column")
+        .and_then(|v| v.as_str())
+        .unwrap_or("geometry");
+    geo.get("columns")?
+        .get(primary)?
+        .get("encoding")?
+        .as_str()
+        .map(|s| s.to_lowercase())
+}
+
+/// A single coordinate pair or an ordered list of nested `CoordNest`s,
+/// mirroring the shape of a native-GeoArrow geometry column: a `linestring`
+/// column is `List<Struct<x,y>>` (one level of nesting around points), a
+/// `polygon` column is `List<List<Struct<x,y>>>` (rings around points), a
+/// `multipolygon` column adds one more level still. Recursing through
+/// `ListArray`/`StructArray` without hard-coding a depth lets one function
+/// (`geoarrow_extract_row`) read any of the encodings — the encoding name
+/// only matters once turning this into a `geo_types::Geometry`.
+enum CoordNest {
+    Point([f64; 2]),
+    List(Vec<CoordNest>),
+}
+
+/// Recursively unpacks one row of a native-GeoArrow geometry column: peels
+/// off `ListArray` levels until it reaches the `Struct<x: f64, y: f64>`
+/// leaf. Returns `None` on a null slot or an unexpected (non list/struct)
+/// column shape.
+fn geoarrow_extract_row(array: &dyn Array, row: usize) -> Option<CoordNest> {
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+        let value = list.value(row);
+        let mut items = Vec::with_capacity(value.len());
+        for i in 0..value.len() {
+            items.push(geoarrow_extract_row(value.as_ref(), i)?);
+        }
+        return Some(CoordNest::List(items));
+    }
+    if let Some(st) = array.as_any().downcast_ref::<StructArray>() {
+        let x = st.column_by_name("x")?.as_any().downcast_ref::<Float64Array>()?.value(row);
+        let y = st.column_by_name("y")?.as_any().downcast_ref::<Float64Array>()?.value(row);
+        return Some(CoordNest::Point([x, y]));
+    }
+    None
+}
+
+fn coordnest_flatten(nest: &CoordNest, out: &mut Vec<Coord<f64>>) {
+    match nest {
+        CoordNest::Point([x, y]) => out.push(Coord { x: *x, y: *y }),
+        CoordNest::List(items) => {
+            for item in items {
+                coordnest_flatten(item, out);
+            }
+        }
+    }
+}
+
+fn coordnest_to_linestring(nest: &CoordNest) -> LineString<f64> {
+    let mut coords = Vec::new();
+    coordnest_flatten(nest, &mut coords);
+    LineString(coords)
+}
+
+fn coordnest_to_polygon(nest: &CoordNest) -> Option<Polygon<f64>> {
+    let CoordNest::List(rings) = nest else { return None };
+    let mut rings = rings.iter().map(coordnest_to_linestring);
+    let exterior = rings.next()?;
+    Some(Polygon::new(exterior, rings.collect()))
+}
+
+/// Converts one row's already-extracted `CoordNest` into the
+/// `geo_types::Geometry` matching `encoding` (a lowercased GeoParquet
+/// native-encoding name — see `parquet_geo_encoding`). `None` means the
+/// nesting depth didn't match what `encoding` expects (a malformed file).
+fn coordnest_to_geometry(nest: CoordNest, encoding: &str) -> Option<Geometry<f64>> {
+    match encoding {
+        "point" => match nest {
+            CoordNest::Point([x, y]) => Some(Geometry::Point(Point::new(x, y))),
+            _ => None,
+        },
+        "multipoint" => match nest {
+            CoordNest::List(pts) => Some(Geometry::MultiPoint(MultiPoint(
+                pts.into_iter()
+                    .filter_map(|p| match p {
+                        CoordNest::Point([x, y]) => Some(Point::new(x, y)),
+                        _ => None,
+                    })
+                    .collect(),
+            ))),
+            _ => None,
+        },
+        "linestring" => match &nest {
+            CoordNest::List(_) => Some(Geometry::LineString(coordnest_to_linestring(&nest))),
+            _ => None,
+        },
+        "multilinestring" => match nest {
+            CoordNest::List(lines) => Some(Geometry::MultiLineString(MultiLineString(
+                lines.iter().map(coordnest_to_linestring).collect(),
+            ))),
+            _ => None,
+        },
+        "polygon" => coordnest_to_polygon(&nest).map(Geometry::Polygon),
+        "multipolygon" => match nest {
+            CoordNest::List(polys) => Some(Geometry::MultiPolygon(MultiPolygon(
+                polys.iter().filter_map(coordnest_to_polygon).collect(),
+            ))),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -503,6 +670,95 @@ fn extract_points(
     Ok(Some(BatchMessage::Points(dest_idx, points, columns)))
 }
 
+/// Vector-geometry counterpart to `extract_points`: decodes each row's
+/// `geometry` WKB into a full `geo_types::Geometry` (points, lines,
+/// polygons — whatever the file holds) rather than reducing it to an
+/// `[x, y]` pair, so files like line-based transit routes actually load
+/// instead of every row silently failing `decode_wkb_point`'s
+/// Point-only check. Only reachable for `GeometrySource::WkbColumn` — an
+/// XY-columns file is definitionally points-only, so callers route those
+/// through `extract_points` instead.
+fn extract_vector_batch(
+    batch: &RecordBatch,
+    dest_idx: usize,
+    id_base: u32,
+    selected_fields: Option<&[String]>,
+    encoding: &str,
+) -> anyhow::Result<Option<BatchMessage>> {
+    let nrows = batch.num_rows();
+    if nrows == 0 {
+        return Ok(None);
+    }
+    let Some(geom_col) = batch.column_by_name("geometry") else {
+        return Ok(None);
+    };
+
+    // WKB: cast to Binary up front and decode each row's bytes via geozero.
+    // Native GeoArrow (`encoding` is one of "point"/"linestring"/…): the
+    // column is already a nested `List<Struct<x,y>>` Arrow array, so each
+    // row is walked directly with `geoarrow_extract_row` instead — there's
+    // no bytes to decode.
+    let is_wkb = encoding == "wkb";
+    let casted = is_wkb.then(|| arrow::compute::cast(geom_col, &ArrowDataType::Binary)).transpose()?;
+    if is_wkb && casted.is_none() {
+        return Ok(None);
+    }
+
+    let schema = batch.schema();
+    let attr_fields: Vec<&str> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .filter(|n| *n != "geometry" && *n != "idx")
+        .filter(|n| selected_fields.is_none_or(|f| f.iter().any(|s| s == n)))
+        .collect();
+
+    let mut features = Vec::with_capacity(nrows);
+    for i in 0..nrows {
+        let geo = if is_wkb {
+            let casted = casted.as_ref().expect("checked above");
+            let wkb_bytes = if let Some(a) = casted.as_any().downcast_ref::<BinaryArray>() {
+                if a.is_null(i) {
+                    continue;
+                }
+                a.value(i)
+            } else if let Some(a) = casted.as_any().downcast_ref::<LargeBinaryArray>() {
+                if a.is_null(i) {
+                    continue;
+                }
+                a.value(i)
+            } else {
+                continue;
+            };
+            let Ok(geo) = geozero::wkb::Wkb(wkb_bytes).to_geo() else {
+                continue;
+            };
+            geo
+        } else {
+            let Some(nest) = geoarrow_extract_row(geom_col.as_ref(), i) else {
+                continue;
+            };
+            let Some(geo) = coordnest_to_geometry(nest, encoding) else {
+                continue;
+            };
+            geo
+        };
+        let mut attributes = HashMap::new();
+        for name in &attr_fields {
+            if let Some(col) = batch.column_by_name(name) {
+                if let Some(v) = pq_attr_value(col.as_ref(), i) {
+                    attributes.insert((*name).to_string(), v);
+                }
+            }
+        }
+        features.push(GisFeature::new(id_base as usize + i, geo, attributes));
+    }
+    if features.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(BatchMessage::Vector(dest_idx, features)))
+}
+
 pub struct GeoParquetReader;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -522,10 +778,55 @@ impl GeoParquetReader {
         Ok(ctx)
     }
 
+    /// Reads one non-null `geometry` value and decodes its WKB header to
+    /// find the actual geometry type stored in the column. `detect_geometry_source`
+    /// only tells us *how* geometry is encoded (WKB column vs. XY columns),
+    /// not *what kind* of geometry it is — without this, every GeoParquet
+    /// file was assumed to hold points, so lines/polygons loaded 0 features
+    /// (every row silently failed the point-only WKB decode).
+    async fn sniff_wkb_geometry_type(ctx: &SessionContext) -> Option<u32> {
+        let batches = ctx
+            .sql("SELECT geometry FROM layer WHERE geometry IS NOT NULL LIMIT 1")
+            .await
+            .ok()?
+            .collect()
+            .await
+            .ok()?;
+        let batch = batches.first()?;
+        let casted = arrow::compute::cast(batch.column(0), &ArrowDataType::Binary).ok()?;
+        let bytes = if let Some(a) = casted.as_any().downcast_ref::<BinaryArray>() {
+            (!a.is_empty()).then(|| a.value(0))?
+        } else if let Some(a) = casted.as_any().downcast_ref::<LargeBinaryArray>() {
+            (!a.is_empty()).then(|| a.value(0))?
+        } else {
+            return None;
+        };
+        wkb_header_geom_type(bytes)
+    }
+
     async fn load_descriptor_async(path: &str) -> anyhow::Result<LayerDescriptor> {
         let ctx = Self::make_ctx(path).await?;
         let schema = ctx.table("layer").await?.schema().as_arrow().clone();
         let geom_src = detect_geometry_source(&schema);
+        let encoding = Self::file_geo_encoding(path);
+        let geometry_type = match &geom_src {
+            GeometrySource::XYColumns { .. } => GeometryType(1),
+            GeometrySource::WkbColumn if encoding == "wkb" => {
+                match Self::sniff_wkb_geometry_type(&ctx).await {
+                    Some(1) => GeometryType(1),
+                    _ => GeometryType(0),
+                }
+            }
+            // Native GeoArrow encoding: the "geo" metadata already names
+            // the geometry kind directly, no need to sniff row bytes.
+            GeometrySource::WkbColumn => {
+                if encoding == "point" {
+                    GeometryType(1)
+                } else {
+                    GeometryType(0)
+                }
+            }
+        };
 
         let count_batches = ctx.sql("SELECT COUNT(*) FROM layer").await?.collect().await?;
         let num_features = count_batches
@@ -566,7 +867,7 @@ impl GeoParquetReader {
             name,
             num_features,
             field_names,
-            geometry_type: GeometryType(1), // Point
+            geometry_type,
             location: GisFilePath::LocalFile(path.to_string()),
             crs_epsg: crs.as_deref().and_then(parse_epsg_from_label),
             crs,
@@ -581,6 +882,22 @@ impl GeoParquetReader {
         let file = std::fs::File::open(path).ok()?;
         let reader = parquet::file::reader::SerializedFileReader::new(file).ok()?;
         parquet_geo_crs_label(reader.metadata().file_metadata().key_value_metadata())
+    }
+
+    /// The primary geometry column's GeoParquet `encoding`, lowercased and
+    /// defaulted to `"wkb"` when the file's "geo" metadata omits it (or has
+    /// no "geo" key at all — an ordinary XY-columns file, say). Every loader
+    /// below calls this once to decide whether `extract_points`/
+    /// `extract_vector_batch` should cast `geometry` to `Binary` and decode
+    /// WKB, or walk it as a native nested `List<Struct<x,y>>` instead.
+    fn file_geo_encoding(path: &str) -> String {
+        use parquet::file::reader::FileReader;
+        (|| -> Option<String> {
+            let file = std::fs::File::open(path).ok()?;
+            let reader = parquet::file::reader::SerializedFileReader::new(file).ok()?;
+            parquet_geo_encoding(reader.metadata().file_metadata().key_value_metadata())
+        })()
+        .unwrap_or_else(|| "wkb".to_string())
     }
 
     pub fn load_descriptor(path: &str) -> anyhow::Result<LayerDescriptor> {
@@ -653,6 +970,211 @@ impl GeoParquetReader {
     ) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(Self::load_point_layer_batched_async(path, dest_idx, tx, selected_fields))
+    }
+
+    /// Full-scan loader for GeoParquet files whose `geometry` column holds
+    /// non-point geometry (lines/polygons), used instead of
+    /// `load_point_layer_batched` once `load_descriptor`'s WKB sniff finds
+    /// something other than Point.
+    async fn load_vector_layer_batched_async(
+        path: &str,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let ctx = Self::make_ctx(path).await?;
+        let schema = ctx.table("layer").await?.schema().as_arrow().clone();
+        let geom_src = detect_geometry_source(&schema);
+        let encoding = Self::file_geo_encoding(path);
+        let sel = Self::build_select(&geom_src, selected_fields.as_deref(), &schema);
+
+        let batches = ctx
+            .sql(&format!("SELECT {} FROM layer", sel))
+            .await?
+            .collect()
+            .await?;
+
+        let mut id_base: u32 = 0;
+        for batch in &batches {
+            let nrows = batch.num_rows();
+            if let Some(msg) =
+                extract_vector_batch(batch, dest_idx, id_base, selected_fields.as_deref(), &encoding)?
+            {
+                tx.send(msg).ok();
+            }
+            id_base += nrows as u32;
+        }
+        Ok(())
+    }
+
+    pub fn load_vector_layer_batched(
+        path: &str,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(Self::load_vector_layer_batched_async(path, dest_idx, tx, selected_fields))
+    }
+
+    /// Batch/progressive-load entry point: seeks straight to `offset` and
+    /// reads at most `limit` rows. Bypasses DataFusion — its SQL
+    /// `LIMIT`/`OFFSET` isn't pushed down to row-group skipping, so it
+    /// re-decodes every row from the start of the file on every call, which
+    /// made later batches quadratically slower. Row groups are cheap to skip
+    /// via metadata (no decode), so only the row groups actually covering
+    /// `[offset, offset+limit)` get read — real seeking.
+    pub fn load_point_layer_range(
+        path: &str,
+        offset: u64,
+        limit: u64,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let file = File::open(path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let schema = builder.schema().as_ref().clone();
+        let geom_src = detect_geometry_source(&schema);
+
+        let row_group_counts: Vec<u64> =
+            builder.metadata().row_groups().iter().map(|rg| rg.num_rows() as u64).collect();
+        let mut cumulative = 0u64;
+        let mut selected_rgs = Vec::new();
+        let mut skip_in_first = 0u64;
+        let mut started = false;
+        for (i, &count) in row_group_counts.iter().enumerate() {
+            let rg_start = cumulative;
+            let rg_end = cumulative + count;
+            if rg_end > offset && rg_start < offset + limit {
+                if !started {
+                    skip_in_first = offset - rg_start;
+                    started = true;
+                }
+                selected_rgs.push(i);
+            }
+            cumulative = rg_end;
+            if rg_start >= offset + limit {
+                break;
+            }
+        }
+
+        // Default reader batch_size is 1024 rows, independent of row-group
+        // size — without raising it, a 100k-row batch still gets decoded
+        // (and sent/extended into the layer) in ~100 small pieces. Size it
+        // to the whole range so it collapses to as few `BatchMessage`s as
+        // possible (merged across row-group boundaries by the reader).
+        let reader = builder
+            .with_row_groups(selected_rgs)
+            .with_batch_size(limit.max(1) as usize)
+            .build()?;
+        let mut id_base: u32 = offset as u32;
+        let mut to_skip = skip_in_first as usize;
+        let mut remaining = limit as usize;
+        for result in reader {
+            if remaining == 0 {
+                break;
+            }
+            let mut batch = result?;
+            if to_skip > 0 {
+                let n = batch.num_rows();
+                if to_skip >= n {
+                    to_skip -= n;
+                    continue;
+                }
+                batch = batch.slice(to_skip, n - to_skip);
+                to_skip = 0;
+            }
+            if batch.num_rows() > remaining {
+                batch = batch.slice(0, remaining);
+            }
+            let nrows = batch.num_rows();
+            if let Some(msg) =
+                extract_points(&batch, dest_idx, &geom_src, None, selected_fields.as_deref(), id_base)?
+            {
+                tx.send(msg).ok();
+            }
+            id_base += nrows as u32;
+            remaining -= nrows;
+        }
+        Ok(())
+    }
+
+    /// Vector-geometry counterpart to `load_point_layer_range`: same
+    /// row-group seeking, but decodes full geometries via
+    /// `extract_vector_batch` instead of point-only coordinates.
+    pub fn load_vector_layer_range(
+        path: &str,
+        offset: u64,
+        limit: u64,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let encoding = Self::file_geo_encoding(path);
+        let file = File::open(path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+
+        let row_group_counts: Vec<u64> =
+            builder.metadata().row_groups().iter().map(|rg| rg.num_rows() as u64).collect();
+        let mut cumulative = 0u64;
+        let mut selected_rgs = Vec::new();
+        let mut skip_in_first = 0u64;
+        let mut started = false;
+        for (i, &count) in row_group_counts.iter().enumerate() {
+            let rg_start = cumulative;
+            let rg_end = cumulative + count;
+            if rg_end > offset && rg_start < offset + limit {
+                if !started {
+                    skip_in_first = offset - rg_start;
+                    started = true;
+                }
+                selected_rgs.push(i);
+            }
+            cumulative = rg_end;
+            if rg_start >= offset + limit {
+                break;
+            }
+        }
+
+        let reader = builder
+            .with_row_groups(selected_rgs)
+            .with_batch_size(limit.max(1) as usize)
+            .build()?;
+        let mut id_base: u32 = offset as u32;
+        let mut to_skip = skip_in_first as usize;
+        let mut remaining = limit as usize;
+        for result in reader {
+            if remaining == 0 {
+                break;
+            }
+            let mut batch = result?;
+            if to_skip > 0 {
+                let n = batch.num_rows();
+                if to_skip >= n {
+                    to_skip -= n;
+                    continue;
+                }
+                batch = batch.slice(to_skip, n - to_skip);
+                to_skip = 0;
+            }
+            if batch.num_rows() > remaining {
+                batch = batch.slice(0, remaining);
+            }
+            let nrows = batch.num_rows();
+            if let Some(msg) =
+                extract_vector_batch(&batch, dest_idx, id_base, selected_fields.as_deref(), &encoding)?
+            {
+                tx.send(msg).ok();
+            }
+            id_base += nrows as u32;
+            remaining -= nrows;
+        }
+        Ok(())
     }
 
     /// Bbox-filtered stream. XY-column files push bbox into SQL; WKB files filter in Rust.
@@ -1044,6 +1566,87 @@ impl GeoJsonReader {
         }
         Ok(())
     }
+
+    /// Like [`Self::load_point_batches_from_bytes`], but restricted to the
+    /// `[offset, offset+limit)` slice of features — GeoJSON has no native
+    /// byte offsets, so this still re-parses the whole file each call.
+    pub fn load_point_batches_range_from_bytes(
+        bytes: &[u8],
+        offset: u64,
+        limit: u64,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let fc = geojson_parse_collection(bytes)?;
+        const BATCH_SIZE: usize = 10_000;
+        let selected = selected_fields.unwrap_or_default();
+        let start = (offset as usize).min(fc.features.len());
+        let end = ((offset + limit) as usize).min(fc.features.len());
+        let mut batch: Vec<(u32, [f64; 2])> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_cols = geojson_make_batch_cols(&fc, &selected, BATCH_SIZE);
+        let mut id_counter = offset as u32;
+        for feature in &fc.features[start..end] {
+            let Some(Geometry::Point(p)) = geojson_feature_geometry(feature) else {
+                continue;
+            };
+            geojson_push_attrs(&mut batch_cols, feature.properties.as_ref());
+            batch.push((id_counter, [p.x(), p.y()]));
+            id_counter += 1;
+            if batch.len() >= BATCH_SIZE {
+                tx.send(BatchMessage::Points(
+                    dest_idx,
+                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                    std::mem::replace(&mut batch_cols, geojson_make_batch_cols(&fc, &selected, BATCH_SIZE)),
+                ))
+                .ok();
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::load_vector_batches_from_bytes`], but restricted to the
+    /// `[offset, offset+limit)` slice of features.
+    pub fn load_vector_batches_range_from_bytes(
+        bytes: &[u8],
+        offset: u64,
+        limit: u64,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let fc = geojson_parse_collection(bytes)?;
+        const BATCH_SIZE: usize = 10_000;
+        let selected_set: std::collections::HashSet<String> = selected_fields
+            .map(|f| f.into_iter().collect())
+            .unwrap_or_default();
+        let start = (offset as usize).min(fc.features.len());
+        let end = ((offset + limit) as usize).min(fc.features.len());
+        let mut batch: Vec<GisFeature> = Vec::with_capacity(BATCH_SIZE);
+        let mut count = offset as usize;
+        for feature in &fc.features[start..end] {
+            let Some(geo) = geojson_feature_geometry(feature) else {
+                continue;
+            };
+            let attributes = geojson_attrs_map(feature.properties.as_ref(), &selected_set);
+            batch.push(GisFeature::new(count, geo, attributes));
+            count += 1;
+            if batch.len() >= BATCH_SIZE {
+                tx.send(BatchMessage::Vector(
+                    dest_idx,
+                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                ))
+                .ok();
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Vector(dest_idx, batch))?;
+        }
+        Ok(())
+    }
 }
 
 pub struct GisReader {}
@@ -1146,20 +1749,85 @@ impl GisReader {
                 }
                 Self::stream_fgb_bbox_impl(str_path, bbox, dest_idx, tx, selected_fields, cancel)
             }
+            (VectorFileType::FlatGeobuf, ReadOp::Range { offset, limit }) => {
+                let reader = FgbReader::open(BufReader::new(File::open(str_path)?))?;
+                if is_points {
+                    Self::load_point_layer_range_impl(
+                        reader,
+                        offset,
+                        limit,
+                        dest_idx,
+                        tx,
+                        selected_fields,
+                    )
+                } else {
+                    Self::load_layer_range_impl(reader, offset, limit, dest_idx, tx, selected_fields)
+                }
+            }
             (VectorFileType::GeoParquet, ReadOp::Full) => {
-                GeoParquetReader::load_point_layer_batched(str_path, dest_idx, tx, selected_fields)
+                if is_points {
+                    GeoParquetReader::load_point_layer_batched(str_path, dest_idx, tx, selected_fields)
+                } else {
+                    GeoParquetReader::load_vector_layer_batched(str_path, dest_idx, tx, selected_fields)
+                }
             }
             (VectorFileType::GeoParquet, ReadOp::Bbox(bbox)) => {
+                if !is_points {
+                    bail!("bbox streaming is only supported for point layers");
+                }
                 GeoParquetReader::stream_bbox_sync(str_path, bbox, dest_idx, tx, selected_fields, cancel)
+            }
+            (VectorFileType::GeoParquet, ReadOp::Range { offset, limit }) => {
+                if is_points {
+                    GeoParquetReader::load_point_layer_range(
+                        str_path,
+                        offset,
+                        limit,
+                        dest_idx,
+                        tx,
+                        selected_fields,
+                    )
+                } else {
+                    GeoParquetReader::load_vector_layer_range(
+                        str_path,
+                        offset,
+                        limit,
+                        dest_idx,
+                        tx,
+                        selected_fields,
+                    )
+                }
             }
             // GeoJSON has no spatial index and viewport filtering already happens in the
             // shaders, so Bbox behaves exactly like Full here — just load everything.
-            (VectorFileType::GeoJson, _) => {
+            (VectorFileType::GeoJson, ReadOp::Full | ReadOp::Bbox(_)) => {
                 let bytes = std::fs::read(str_path)?;
                 if is_points {
                     GeoJsonReader::load_point_batches_from_bytes(&bytes, dest_idx, tx, selected_fields)
                 } else {
                     GeoJsonReader::load_vector_batches_from_bytes(&bytes, dest_idx, tx, selected_fields)
+                }
+            }
+            (VectorFileType::GeoJson, ReadOp::Range { offset, limit }) => {
+                let bytes = std::fs::read(str_path)?;
+                if is_points {
+                    GeoJsonReader::load_point_batches_range_from_bytes(
+                        &bytes,
+                        offset,
+                        limit,
+                        dest_idx,
+                        tx,
+                        selected_fields,
+                    )
+                } else {
+                    GeoJsonReader::load_vector_batches_range_from_bytes(
+                        &bytes,
+                        offset,
+                        limit,
+                        dest_idx,
+                        tx,
+                        selected_fields,
+                    )
                 }
             }
         }
@@ -1226,6 +1894,107 @@ impl GisReader {
         while let Some(feature) = iter.next()? {
             if let Some(row) = extract_point_row(feature, &mut batch_cols, &mut id_counter) {
                 batch.push(row);
+            }
+            if batch.len() >= BATCH_SIZE {
+                tx.send(BatchMessage::Points(
+                    dest_idx,
+                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                    std::mem::replace(&mut batch_cols, make_batch_cols(&col_schema, BATCH_SIZE)),
+                ))
+                .ok();
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Points(dest_idx, batch, batch_cols))?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::load_layer_batched_impl`], but skips `offset` features
+    /// and stops after collecting `limit` of them.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_layer_range_impl<R: Read + Seek>(
+        reader: FgbReader<R>,
+        offset: u64,
+        limit: u64,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let mut iter = reader.select_all()?;
+        let selected_set: std::collections::HashSet<String> = selected_fields
+            .map(|f| f.into_iter().collect())
+            .unwrap_or_default();
+        const BATCH_SIZE: usize = 10_000;
+        let mut batch: Vec<GisFeature> = Vec::with_capacity(BATCH_SIZE);
+        let mut count = offset as usize;
+        let mut skipped = 0u64;
+        let mut taken = 0u64;
+        while taken < limit {
+            let Some(feature) = iter.next()? else { break };
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            let geo = match feature.to_geo() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            let attributes: HashMap<String, AttributeValue> = if !selected_set.is_empty() {
+                let mut collector = PairCollector {
+                    selected: &selected_set,
+                    pairs: Vec::new(),
+                };
+                feature.process_properties(&mut collector).ok();
+                collector.pairs.into_iter().collect()
+            } else {
+                HashMap::new()
+            };
+            batch.push(GisFeature::new(count, geo, attributes));
+            count += 1;
+            taken += 1;
+            if batch.len() >= BATCH_SIZE {
+                tx.send(BatchMessage::Vector(
+                    dest_idx,
+                    std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+                ))
+                .ok();
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(BatchMessage::Vector(dest_idx, batch))?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::load_point_layer_batched_impl`], but skips `offset`
+    /// features and stops after collecting `limit` of them.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_point_layer_range_impl<R: Read + Seek>(
+        reader: FgbReader<R>,
+        offset: u64,
+        limit: u64,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        const BATCH_SIZE: usize = 10_000;
+        let col_schema = fgb_column_schema(reader.header(), selected_fields.as_deref());
+        let mut iter = reader.select_all()?;
+        let mut batch: Vec<(u32, [f64; 2])> = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_cols = make_batch_cols(&col_schema, BATCH_SIZE);
+        let mut id_counter = offset as u32;
+        let mut skipped = 0u64;
+        let mut taken = 0u64;
+        while taken < limit {
+            let Some(feature) = iter.next()? else { break };
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if let Some(row) = extract_point_row(feature, &mut batch_cols, &mut id_counter) {
+                batch.push(row);
+                taken += 1;
             }
             if batch.len() >= BATCH_SIZE {
                 tx.send(BatchMessage::Points(
@@ -1478,8 +2247,17 @@ impl GisReader {
                 field_names: field_names.unwrap_or(Vec::new()),
                 index: None,
                 bbox: None,
-                viewport_mask: bitvec![0;descriptor.num_features as usize],
-                filter_mask: bitvec![1;descriptor.num_features as usize],
+                // Empty, matching the empty `points` above — pre-sizing
+                // these to the full file's feature count here (as before)
+                // desyncs them from `points` during progressive/batch
+                // loading: `filter_mask` would already cover rows that
+                // haven't streamed in yet, so its `count_ones()` (the
+                // "filtered" count shown in the sidebar) stops tracking
+                // newly-loaded points at all. Both masks now grow in
+                // lockstep with `points` as batches merge in (see
+                // `apply_batch_message`/`flush_batch_staging`).
+                viewport_mask: bitvec![0; 0],
+                filter_mask: bitvec![1; 0],
             }),
             _ => LayerKind::Vector(GisLayer {
                 name: descriptor.name.clone(),
@@ -1525,6 +2303,7 @@ impl GisReader {
             bivariate_grid_cache: None,
             saved_bivariate_grids: Vec::new(),
             active_saved_bivariate_grid: None,
+            batch_load: None,
         }
     }
 }
@@ -1657,5 +2436,161 @@ mod geojson_tests {
         assert_eq!(features.len(), 2);
         assert!(matches!(features[0].geometry, Geometry::Point(_)));
         assert!(matches!(features[1].geometry, Geometry::Polygon(_)));
+    }
+
+    #[test]
+    fn geojson_range_covers_file_without_overlap_or_gaps() {
+        let bytes = std::fs::read("assets/sample_points.geojson").unwrap();
+        let total = geojson_parse_collection(&bytes).unwrap().features.len() as u64;
+        assert_eq!(total, 5);
+
+        let batch_size = 2u64;
+        let mut seen_ids: Vec<u32> = Vec::new();
+        let mut offset = 0u64;
+        while offset < total {
+            let limit = batch_size.min(total - offset);
+            let (tx, rx) = mpsc::sync_channel(10);
+            GeoJsonReader::load_point_batches_range_from_bytes(
+                &bytes, offset, limit, 0, tx, None,
+            )
+            .unwrap();
+            for msg in rx.try_iter() {
+                let BatchMessage::Points(_, pts, _) = msg else { panic!("expected Points batch") };
+                seen_ids.extend(pts.iter().map(|(id, _)| *id));
+            }
+            offset += limit;
+        }
+        seen_ids.sort();
+        assert_eq!(seen_ids, (0..total as u32).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod range_load_native_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn collect_point_ids(path: &str, op: ReadOp) -> Vec<u32> {
+        let (tx, rx) = mpsc::sync_channel(10_000);
+        GisReader::read_file(
+            GisFilePath::LocalFile(path.to_string()),
+            0,
+            true,
+            op,
+            None,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for msg in rx.try_iter() {
+            if let BatchMessage::Points(_, pts, _) = msg {
+                ids.extend(pts.iter().map(|(id, _)| *id));
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn fgb_range_batches_cover_file_without_overlap() {
+        let path = "assets/pickup_points_smol.fgb";
+        let full = collect_point_ids(path, ReadOp::Full);
+        let total = full.len() as u64;
+        assert!(total > 0);
+
+        let batch_size = (total / 7).max(1);
+        let mut seen: Vec<u32> = Vec::new();
+        let mut offset = 0u64;
+        while offset < total {
+            let limit = batch_size.min(total - offset);
+            seen.extend(collect_point_ids(path, ReadOp::Range { offset, limit }));
+            offset += limit;
+        }
+        seen.sort();
+        let mut expected = full;
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn parquet_range_batches_cover_file_without_overlap() {
+        let path = "assets/pickup_points.parquet";
+        let first_1000 = collect_point_ids(path, ReadOp::Range { offset: 0, limit: 1_000 });
+        assert_eq!(first_1000.len(), 1_000);
+        let next_1000 = collect_point_ids(path, ReadOp::Range { offset: 1_000, limit: 1_000 });
+        assert_eq!(next_1000.len(), 1_000);
+        let mut combined: Vec<u32> = first_1000.iter().chain(next_1000.iter()).copied().collect();
+        combined.sort();
+        combined.dedup();
+        assert_eq!(combined.len(), 2_000, "ranges must not overlap");
+    }
+}
+
+#[cfg(test)]
+mod range_perf_probe {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    #[test]
+    fn parquet_range_late_offset_is_fast() {
+        let path = "assets/pickup_points.parquet";
+        let (tx, rx) = mpsc::sync_channel(10_000);
+        let start = Instant::now();
+        GisReader::read_file(
+            GisFilePath::LocalFile(path.to_string()),
+            0,
+            true,
+            ReadOp::Range { offset: 10_000_000, limit: 100_000 },
+            None,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        let mut n = 0usize;
+        for msg in rx.try_iter() {
+            if let BatchMessage::Points(_, pts, _) = msg {
+                n += pts.len();
+            }
+        }
+        eprintln!("late-offset batch: {n} points in {elapsed:?}");
+        assert!(elapsed.as_secs_f64() < 1.0, "late-offset batch took {elapsed:?}, expected sub-second seek");
+    }
+}
+
+#[cfg(test)]
+mod range_batch_count_probe {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    #[test]
+    fn parquet_range_sends_few_batch_messages() {
+        let path = "assets/pickup_points.parquet";
+        let (tx, rx) = mpsc::sync_channel(10_000);
+        let start = Instant::now();
+        GisReader::read_file(
+            GisFilePath::LocalFile(path.to_string()),
+            0,
+            true,
+            ReadOp::Range { offset: 0, limit: 100_000 },
+            None,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        let mut msg_count = 0usize;
+        let mut total = 0usize;
+        for msg in rx.try_iter() {
+            if let BatchMessage::Points(_, pts, _) = msg {
+                msg_count += 1;
+                total += pts.len();
+            }
+        }
+        eprintln!("100k batch: {msg_count} messages, {total} points, {elapsed:?}");
+        assert_eq!(total, 100_000);
+        assert!(msg_count <= 3, "expected batch to collapse into a few messages, got {msg_count}");
     }
 }

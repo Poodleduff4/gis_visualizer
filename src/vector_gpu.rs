@@ -1,19 +1,53 @@
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor};
+use wgpu::util::DeviceExt;
 
 // Same viewport-normalize-to-NDC math as point_cloud.rs's POINT_SHADER, minus
-// the per-instance billboard-quad logic — vertices here are literal world
-// positions, drawn with VertexStepMode::Vertex (no instancing).
+// the per-instance billboard-quad logic — fill/outline vertices here are
+// literal world positions, drawn with VertexStepMode::Vertex (no instancing).
+// Line segments (`vs_line`) are the exception: each instance is a segment's
+// two endpoints, expanded into a screen-space-constant-width quad here in
+// the shader — mirrors point_cloud.rs's per-instance billboard-quad trick so
+// line width stays a fixed pixel width regardless of zoom, and the CPU side
+// never needs to re-tessellate outlines when the width slider changes.
 const VECTOR_SHADER: &str = r#"
 struct ViewportUniform {
     world_min:   vec2<f32>,
     world_size:  vec2<f32>,
     screen_min:  vec2<f32>,
     screen_size: vec2<f32>,
+    line_width:  f32,
+    _pad0:       f32,
+    _pad1:       f32,
+    _pad2:       f32,
 }
 
 @group(0) @binding(0)
 var<uniform> viewport: ViewportUniform;
+
+fn world_to_screen(world_pos: vec2<f32>) -> vec2<f32> {
+    let normalized = (world_pos - viewport.world_min) / viewport.world_size;
+    return vec2<f32>(
+        viewport.screen_min.x + normalized.x * viewport.screen_size.x,
+        viewport.screen_min.y + (1.0 - normalized.y) * viewport.screen_size.y,
+    );
+}
+
+fn screen_to_ndc(screen_pos: vec2<f32>) -> vec2<f32> {
+    let local = screen_pos - viewport.screen_min;
+    return vec2<f32>(
+        local.x / viewport.screen_size.x * 2.0 - 1.0,
+        1.0 - local.y / viewport.screen_size.y * 2.0,
+    );
+}
+
+fn unpack_color(packed_color: u32) -> vec4<f32> {
+    let r = f32((packed_color)        & 0xFFu) / 255.0;
+    let g = f32((packed_color >> 8u)  & 0xFFu) / 255.0;
+    let b = f32((packed_color >> 16u) & 0xFFu) / 255.0;
+    let a = f32((packed_color >> 24u) & 0xFFu) / 255.0;
+    return vec4<f32>(r, g, b, a);
+}
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -25,25 +59,41 @@ fn vs_main(
     @location(0) world_pos:    vec2<f32>,
     @location(1) packed_color: u32,
 ) -> VertexOut {
-    let normalized = (world_pos - viewport.world_min) / viewport.world_size;
-    let screen_pos = vec2<f32>(
-        viewport.screen_min.x + normalized.x * viewport.screen_size.x,
-        viewport.screen_min.y + (1.0 - normalized.y) * viewport.screen_size.y,
-    );
-    let local = screen_pos - viewport.screen_min;
-    let ndc = vec2<f32>(
-        local.x / viewport.screen_size.x * 2.0 - 1.0,
-        1.0 - local.y / viewport.screen_size.y * 2.0,
-    );
+    let ndc = screen_to_ndc(world_to_screen(world_pos));
+    var out: VertexOut;
+    out.clip_pos = vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
+    out.color    = unpack_color(packed_color);
+    return out;
+}
 
-    let r = f32((packed_color)        & 0xFFu) / 255.0;
-    let g = f32((packed_color >> 8u)  & 0xFFu) / 255.0;
-    let b = f32((packed_color >> 16u) & 0xFFu) / 255.0;
-    let a = f32((packed_color >> 24u) & 0xFFu) / 255.0;
+// `corner` (per-vertex, from a static unit-quad buffer): x in [-0.5, 0.5]
+// is the fraction along the segment, y in [-0.5, 0.5] is the across-segment
+// offset in half-widths. `world_a`/`world_b` (per-instance) are the
+// segment's endpoints; `packed_color` is duplicated on both so either works.
+@vertex
+fn vs_line(
+    @location(0) corner:       vec2<f32>,
+    @location(1) world_a:      vec2<f32>,
+    @location(2) packed_color: u32,
+    @location(3) world_b:      vec2<f32>,
+) -> VertexOut {
+    let screen_a = world_to_screen(world_a);
+    let screen_b = world_to_screen(world_b);
+    var dir = screen_b - screen_a;
+    let len = length(dir);
+    if (len > 0.0001) {
+        dir = dir / len;
+    } else {
+        dir = vec2<f32>(1.0, 0.0);
+    }
+    let perp = vec2<f32>(-dir.y, dir.x);
+    let center = mix(screen_a, screen_b, corner.x + 0.5);
+    let screen_pos = center + perp * corner.y * viewport.line_width;
+    let ndc = screen_to_ndc(screen_pos);
 
     var out: VertexOut;
     out.clip_pos = vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
-    out.color    = vec4<f32>(r, g, b, a);
+    out.color    = unpack_color(packed_color);
     return out;
 }
 
@@ -92,6 +142,8 @@ struct ViewportUniform {
     world_size: [f32; 2],
     screen_min: [f32; 2],
     screen_size: [f32; 2],
+    line_width: f32,
+    _pad: [f32; 3],
 }
 
 struct OffscreenTarget {
@@ -121,6 +173,50 @@ fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+/// Per-vertex (step mode Vertex) unit-quad corner buffer for `vs_line`'s
+/// instanced line-segment quads — same 6-vertex-per-instance trick as
+/// point_cloud.rs's `quad_vertex_buffer`.
+fn line_corner_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: 8,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: 0,
+            shader_location: 0,
+        }],
+    }
+}
+
+/// Per-instance (step mode Instance) buffer reading straight out of the same
+/// flat `[a, b, a, b, ...]` `GpuVertex` pairs `collect_gpu_vector_mesh`
+/// already produces — no CPU-side reshaping needed. Stride covers 2
+/// `GpuVertex`s (one segment); `world_b` is read from the second one's
+/// `position` field at a byte offset into the same stride.
+fn line_instance_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: 24,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 0,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: 8,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 12,
+                shader_location: 3,
+            },
+        ],
+    }
+}
+
 pub struct VectorPipeline {
     fill_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
@@ -130,6 +226,7 @@ pub struct VectorPipeline {
     pub fill_vertex_buffer: wgpu::Buffer,
     pub fill_index_buffer: wgpu::Buffer,
     pub line_vertex_buffer: wgpu::Buffer,
+    line_quad_corner_buffer: wgpu::Buffer,
     pub uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pub fill_index_count: u32,
@@ -210,7 +307,35 @@ impl VectorPipeline {
             })
         };
         let fill_pipeline = make_pipeline(wgpu::PrimitiveTopology::TriangleList, "vector fill pipeline");
-        let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList, "vector line pipeline");
+
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("vector line pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_line"),
+                compilation_options: Default::default(),
+                buffers: &[line_corner_buffer_layout(), line_instance_buffer_layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, ..Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         // ── Blit pipeline — identical to point_cloud.rs's ───────────────────────
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -300,6 +425,17 @@ impl VectorPipeline {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Static unit quad: x = fraction along the segment, y = across-segment
+        // offset in half-widths — mirrors point_cloud.rs's quad_vertex_buffer.
+        let line_quad_corners: [[f32; 2]; 6] = [
+            [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5],
+            [-0.5, -0.5], [0.5, 0.5], [-0.5, 0.5],
+        ];
+        let line_quad_corner_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vector line quad corners"),
+            contents: bytemuck::cast_slice(&line_quad_corners),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
         Self {
             fill_pipeline,
@@ -310,6 +446,7 @@ impl VectorPipeline {
             fill_vertex_buffer,
             fill_index_buffer,
             line_vertex_buffer,
+            line_quad_corner_buffer,
             uniform_buffer,
             bind_group,
             fill_index_count: 0,
@@ -413,6 +550,10 @@ pub struct VectorCallback {
     pub screen_min: [f32; 2],
     pub screen_size: [f32; 2],
     pub render_dirty: bool,
+    /// Desired on-screen line width in logical (not physical) pixels —
+    /// scaled by `pixels_per_point` before upload, same convention as
+    /// `screen_min`/`screen_size` above.
+    pub line_width: f32,
 }
 
 impl CallbackTrait for VectorCallback {
@@ -442,6 +583,8 @@ impl CallbackTrait for VectorCallback {
             world_size: self.world_size,
             screen_min: [self.screen_min[0] * ppp, self.screen_min[1] * ppp],
             screen_size: [self.screen_size[0] * ppp, self.screen_size[1] * ppp],
+            line_width: self.line_width * ppp,
+            _pad: [0.0; 3],
         };
         queue.write_buffer(&pipeline.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 
@@ -475,8 +618,11 @@ impl CallbackTrait for VectorCallback {
                 if pipeline.line_vertex_count > 0 {
                     rp.set_pipeline(&pipeline.line_pipeline);
                     rp.set_bind_group(0, &pipeline.bind_group, &[]);
-                    rp.set_vertex_buffer(0, pipeline.line_vertex_buffer.slice(..));
-                    rp.draw(0..pipeline.line_vertex_count, 0..1);
+                    rp.set_vertex_buffer(0, pipeline.line_quad_corner_buffer.slice(..));
+                    rp.set_vertex_buffer(1, pipeline.line_vertex_buffer.slice(..));
+                    // Each instance consumes one (a, b) `GpuVertex` pair.
+                    let instance_count = pipeline.line_vertex_count / 2;
+                    rp.draw(0..6, 0..instance_count);
                 }
             }
             pipeline.render_dirty = false;

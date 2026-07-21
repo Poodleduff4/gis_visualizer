@@ -1,0 +1,21 @@
+name = "binned-3d-map"
+entrypoint = "main.py"
+python = "python3"
+capabilities = ["read_layers"]
+
+[[params]]
+name = "layer"
+label = "Layer"
+kind = "layer"
+
+[[params]]
+name = "bins"
+label = "Grid bins per axis"
+kind = "integer"
+default = 20
+
+[[params]]
+name = "title"
+label = "Plot title (blank = layer name)"
+kind = "text"
+default = ""

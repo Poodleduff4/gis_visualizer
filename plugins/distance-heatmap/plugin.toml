@@ -1,0 +1,33 @@
+name = "distance-heatmap"
+entrypoint = "main.py"
+python = "python3"
+capabilities = ["read_layers", "add_layer"]
+
+[[params]]
+name = "source_layer"
+label = "Source layer (e.g. taxi departures)"
+kind = "layer"
+
+[[params]]
+name = "target_layer"
+label = "Target layer (e.g. transit routes)"
+kind = "layer"
+
+[[params]]
+name = "cell_size"
+label = "Grid cell size (map units, e.g. meters)"
+kind = "float"
+default = 500.0
+
+[[params]]
+name = "stat"
+label = "Bin aggregation"
+kind = "choice"
+options = ["mean", "median", "max", "min"]
+default = "mean"
+
+[[params]]
+name = "max_search_distance"
+label = "Max search distance (0 = unlimited, speeds up huge target layers)"
+kind = "float"
+default = 0.0

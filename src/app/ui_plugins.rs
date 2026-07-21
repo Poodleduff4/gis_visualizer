@@ -16,12 +16,14 @@ pub(super) enum ParamEditValue {
     /// Selected layer index, if any — `None` until the user picks one (or
     /// `ui` auto-selects the sole matching layer).
     Layer(Option<usize>),
+    /// Selected option string, if any.
+    Choice(Option<String>),
 }
 
 impl ParamEditValue {
     fn from_default(kind: ParamKind, default: Option<&toml::Value>) -> Self {
         match kind {
-            ParamKind::Text => Self::Text(
+            ParamKind::Text | ParamKind::Attribute => Self::Text(
                 default
                     .and_then(toml::Value::as_str)
                     .unwrap_or_default()
@@ -45,6 +47,9 @@ impl ParamEditValue {
             // same layer. Left unselected; `ui` auto-picks when there's
             // exactly one candidate.
             ParamKind::Layer => Self::Layer(None),
+            // Defaults to the manifest's `default` if it names one of the
+            // param's own `options`; otherwise left unselected.
+            ParamKind::Choice => Self::Choice(default.and_then(toml::Value::as_str).map(str::to_string)),
         }
     }
 
@@ -65,15 +70,37 @@ impl ParamEditValue {
             Self::Layer(sel) => sel
                 .map(|idx| serde_json::Value::from(idx as u64))
                 .ok_or_else(|| format!("{label}: select a layer")),
+            Self::Choice(sel) => sel
+                .clone()
+                .map(serde_json::Value::String)
+                .ok_or_else(|| format!("{label}: select an option")),
         }
     }
 
     /// `layer_options` is `(layer index, display name)` pairs already
     /// filtered to this param's `layer_kind` — empty/ignored for every kind
-    /// but `Layer`. `id_salt` keys the dropdown's egui id so two `Layer`
-    /// params in the same plugin don't collide.
-    fn ui(&mut self, ui: &mut egui::Ui, id_salt: &str, layer_options: &[(usize, String)]) {
+    /// but `Layer`. `attribute_options` is the referenced layer's field
+    /// names, non-empty only for `Attribute`. `id_salt` keys the dropdown's
+    /// egui id so two params of the same kind in one plugin don't collide.
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        id_salt: &str,
+        layer_options: &[(usize, String)],
+        attribute_options: &[String],
+        choice_options: &[String],
+    ) {
         match self {
+            Self::Text(s) if !attribute_options.is_empty() => {
+                let selected_text = if s.is_empty() { "Select an attribute…" } else { s.as_str() };
+                egui::ComboBox::from_id_salt(("plugin_attribute_param", id_salt.to_string()))
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for f in attribute_options {
+                            ui.selectable_value(s, f.clone(), f);
+                        }
+                    });
+            }
             Self::Text(s) => {
                 ui.text_edit_singleline(s);
             }
@@ -106,6 +133,21 @@ impl ParamEditValue {
                             .color(ui.visuals().error_fg_color),
                     );
                 }
+            }
+            Self::Choice(sel) => {
+                if sel.is_none() {
+                    if let Some(only) = choice_options.first() {
+                        *sel = Some(only.clone());
+                    }
+                }
+                let selected_text = sel.clone().unwrap_or_else(|| "Select an option…".to_string());
+                egui::ComboBox::from_id_salt(("plugin_choice_param", id_salt.to_string()))
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for opt in choice_options {
+                            ui.selectable_value(sel, Some(opt.clone()), opt);
+                        }
+                    });
             }
         }
     }
@@ -157,14 +199,14 @@ impl GisEditorApp {
     pub(super) fn poll_plugin_events(&mut self) {
         // Taken out of `self` for the loop's duration: `LayerRequest` needs
         // `&mut self` to answer the plugin, which a live borrow of
-        // `self.plugin_events_rx` would forbid. Put back at the end unless
+        // `self.plugin_handle` would forbid. Put back at the end unless
         // the run finished or the channel disconnected.
-        let Some(rx) = self.plugin_events_rx.take() else {
+        let Some(handle) = self.plugin_handle.take() else {
             return;
         };
         let mut keep = true;
         loop {
-            match rx.try_recv() {
+            match handle.events.try_recv() {
                 Ok(PluginEvent::Log { level, msg }) => self.plugin_log.push((level, msg)),
                 Ok(PluginEvent::Progress { pct, msg }) => {
                     self.plugin_log
@@ -195,7 +237,7 @@ impl GisEditorApp {
             }
         }
         if keep {
-            self.plugin_events_rx = Some(rx);
+            self.plugin_handle = Some(handle);
         }
     }
 
@@ -234,6 +276,15 @@ impl GisEditorApp {
                                     if running {
                                         ui.spinner();
                                         ui.label(&name);
+                                        if ui
+                                            .button("Terminate")
+                                            .on_hover_text("Kill the plugin process")
+                                            .clicked()
+                                        {
+                                            if let Some(handle) = &self.plugin_handle {
+                                                handle.terminate();
+                                            }
+                                        }
                                     } else if ui.selectable_label(false, &name).clicked() {
                                         self.plugin_config_open = Some(name.clone());
                                     }
@@ -314,6 +365,41 @@ impl GisEditorApp {
                         .num_columns(2)
                         .spacing([12.0, 6.0])
                         .show(ui, |ui| {
+                            // Attribute params need their sibling Layer
+                            // param's *currently selected* layer, which is
+                            // only known once that param's own value exists
+                            // — computed up front so the loop below can
+                            // borrow `values` mutably per-param.
+                            let attribute_options: HashMap<String, Vec<String>> = manifest
+                                .params
+                                .iter()
+                                .filter(|p| p.kind == ParamKind::Attribute)
+                                .filter_map(|p| {
+                                    let layer_param = p.attribute_of.as_deref()?;
+                                    let ParamEditValue::Layer(Some(idx)) = values.get(layer_param)?
+                                    else {
+                                        return None;
+                                    };
+                                    let fields = match &layers.get(*idx)?.data {
+                                        crate::gis_layer::LayerKind::Points(pc) => {
+                                            pc.field_names.clone()
+                                        }
+                                        crate::gis_layer::LayerKind::Vector(gl) => {
+                                            gl.field_names.clone()
+                                        }
+                                        // Raster layers have no attributes —
+                                        // list band names instead, since a
+                                        // "band name" text param is the same
+                                        // idea (pick one of a fixed set the
+                                        // layer already has).
+                                        crate::gis_layer::LayerKind::Raster(r) => {
+                                            r.bands.iter().map(|b| b.name.clone()).collect()
+                                        }
+                                    };
+                                    Some((p.name.clone(), fields))
+                                })
+                                .collect();
+
                             for p in &manifest.params {
                                 if let Some(v) = values.get_mut(&p.name) {
                                     ui.label(p.display_label());
@@ -328,9 +414,17 @@ impl GisEditorApp {
                                             })
                                             .map(|(i, l)| (i, l.name.clone()))
                                             .collect();
-                                        v.ui(ui, &p.name, &options);
+                                        v.ui(ui, &p.name, &options, &[], &[]);
+                                    } else if p.kind == ParamKind::Attribute {
+                                        let fields = attribute_options
+                                            .get(&p.name)
+                                            .map(Vec::as_slice)
+                                            .unwrap_or(&[]);
+                                        v.ui(ui, &p.name, &[], fields, &[]);
+                                    } else if p.kind == ParamKind::Choice {
+                                        v.ui(ui, &p.name, &[], &[], &p.options);
                                     } else {
-                                        v.ui(ui, &p.name, &[]);
+                                        v.ui(ui, &p.name, &[], &[], &[]);
                                     }
                                     ui.end_row();
                                 }
@@ -364,7 +458,7 @@ impl GisEditorApp {
                     self.plugin_running = Some(name.clone());
                     self.plugin_log
                         .push((LogLevel::Info, format!("Running {name}…")));
-                    self.plugin_events_rx = Some(plugin::run_plugin(manifest, args));
+                    self.plugin_handle = Some(plugin::run_plugin(manifest, args));
                     self.plugin_config_open = None;
                 }
                 Err(e) => {

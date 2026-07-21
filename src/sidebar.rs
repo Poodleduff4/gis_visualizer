@@ -107,7 +107,7 @@ pub fn show_sidebar(
             let val = &filter.comparitor_raw;
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{attr} {op} {val}")).monospace());
-                if ui.small_button("✕").clicked() {
+                if ui.small_button("X").clicked() {
                     to_remove = Some(idx);
                 }
             });

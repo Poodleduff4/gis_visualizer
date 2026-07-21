@@ -233,6 +233,7 @@ pub fn build_layer_entry(
         bivariate_grid_cache: None,
         saved_bivariate_grids: Vec::new(),
         active_saved_bivariate_grid: None,
+        batch_load: None,
     }
 }
 

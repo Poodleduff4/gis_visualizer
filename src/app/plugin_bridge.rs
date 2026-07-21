@@ -49,15 +49,23 @@ impl GisEditorApp {
             }
 
             PluginCall::AddLayer { name, arrow_ipc } => {
-                match plugin::bridge::decode_vector_layer(&arrow_ipc, name.clone()) {
-                    Ok(gl) => {
-                        let data = plugin::bridge::vector_layer_to_points(&gl)
-                            .map(LayerKind::Points)
-                            .unwrap_or(LayerKind::Vector(gl));
+                match plugin::bridge::decode_layer_from_arrow(&arrow_ipc, name.clone()) {
+                    Ok(data) => {
+                        let is_raster = matches!(data, LayerKind::Raster(_));
+                        let data = match data {
+                            LayerKind::Vector(gl) => plugin::bridge::vector_layer_to_points(&gl)
+                                .map(LayerKind::Points)
+                                .unwrap_or(LayerKind::Vector(gl)),
+                            other => other,
+                        };
                         self.layers.push(plugin::bridge::layer_entry_for(name, data));
                         self.points_dirty = true;
                         self.globe_points_dirty = true;
                         self.map_render_ttl = 3;
+                        if is_raster {
+                            self.raster_dirty = true;
+                            self.flat_raster_dirty = true;
+                        }
                         HostReply::Ack
                     }
                     Err(e) => HostReply::Err(e.to_string()),
@@ -70,15 +78,23 @@ impl GisEditorApp {
                     .get(layer_id as usize)
                     .map(|e| e.name.clone())
                     .unwrap_or_else(|| format!("layer-{layer_id}"));
-                match plugin::bridge::decode_vector_layer(&arrow_ipc, name) {
-                    Ok(gl) => match self.layers.get_mut(layer_id as usize) {
+                match plugin::bridge::decode_layer_from_arrow(&arrow_ipc, name) {
+                    Ok(data) => match self.layers.get_mut(layer_id as usize) {
                         Some(entry) => {
-                            entry.data = plugin::bridge::vector_layer_to_points(&gl)
-                                .map(LayerKind::Points)
-                                .unwrap_or(LayerKind::Vector(gl));
+                            let is_raster = matches!(data, LayerKind::Raster(_));
+                            entry.data = match data {
+                                LayerKind::Vector(gl) => plugin::bridge::vector_layer_to_points(&gl)
+                                    .map(LayerKind::Points)
+                                    .unwrap_or(LayerKind::Vector(gl)),
+                                other => other,
+                            };
                             self.points_dirty = true;
                             self.globe_points_dirty = true;
                             self.map_render_ttl = 3;
+                            if is_raster {
+                                self.raster_dirty = true;
+                                self.flat_raster_dirty = true;
+                            }
                             HostReply::Ack
                         }
                         None => HostReply::Err(format!("no layer with id {layer_id}")),

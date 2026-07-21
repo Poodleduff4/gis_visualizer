@@ -12,11 +12,11 @@ layer_kind = "points"
 [[params]]
 name = "x_col"
 label = "x_col"
-kind = "text"
-default = "x_col"
+kind = "attribute"
+attribute_of = "layer"
 
 [[params]]
 name = "y_col"
 label = "y_col"
-kind = "text"
-default = "y_col"
+kind = "attribute"
+attribute_of = "layer"

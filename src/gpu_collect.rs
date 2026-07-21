@@ -198,9 +198,9 @@ pub fn collect_gpu_vector_mesh(
                 if n < 2 {
                     continue;
                 }
-                for w in 0..n {
+                for w in 0..n - 1 {
                     let a = ring[w];
-                    let b = ring[(w + 1) % n];
+                    let b = ring[w + 1];
                     line_verts_out.push(GpuVertex {
                         position: [a[0] as f32, a[1] as f32],
                         color: stroke_color,

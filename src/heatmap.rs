@@ -285,6 +285,7 @@ impl HeatmapLayer {
 pub enum HeatmapKind {
     Quadtree,
     Kde,
+    KdeEntropy,
     GridBin,
 }
 

@@ -486,6 +486,58 @@ impl LayerKind {
             ids
         }
     }
+
+    /// Ids of features/points inside the polygon ring `polygon` (world-space
+    /// vertices, implicitly closed). Prunes candidates via the polygon's
+    /// bbox (reusing `ids_in_bbox_with_fallback`, so it gets the same
+    /// index-or-scan fallback and filter-mask handling), then tests each
+    /// candidate exactly: point-in-polygon for a Points layer, geometry
+    /// intersection for a Vector layer. Empty for fewer than 3 vertices.
+    pub fn ids_in_polygon(&self, polygon: &[[f64; 2]]) -> Vec<usize> {
+        use geo::{Contains, Intersects};
+
+        if polygon.len() < 3 {
+            return Vec::new();
+        }
+        let bbox = polygon.iter().fold(
+            [f64::MAX, f64::MAX, f64::MIN, f64::MIN],
+            |acc, p| {
+                [
+                    acc[0].min(p[0]),
+                    acc[1].min(p[1]),
+                    acc[2].max(p[0]),
+                    acc[3].max(p[1]),
+                ]
+            },
+        );
+        let candidates = self.ids_in_bbox_with_fallback(bbox);
+        let ring: geo_types::LineString<f64> =
+            polygon.iter().map(|p| (p[0], p[1])).collect();
+        let poly = geo_types::Polygon::new(ring, vec![]);
+
+        match self {
+            LayerKind::Vector(gl) => candidates
+                .into_iter()
+                .filter(|&id| {
+                    gl.features
+                        .get(id)
+                        .map(|f| f.geometry.intersects(&poly))
+                        .unwrap_or(false)
+                })
+                .collect(),
+            LayerKind::Points(pc) => candidates
+                .into_iter()
+                .filter(|&i| {
+                    pc.points
+                        .get(i)
+                        .map(|(_, p)| poly.contains(&geo_types::Point::new(p[0], p[1])))
+                        .unwrap_or(false)
+                })
+                .collect(),
+            LayerKind::Raster(_) => Vec::new(),
+        }
+    }
+
     pub fn feature_count(&self) -> usize {
         match self {
             LayerKind::Vector(gis_layer) => gis_layer.features.len(),
@@ -640,8 +692,133 @@ pub struct LayerEntry {
     pub saved_bivariate_grids: Vec<crate::bivariate::SavedBivariateGrid>,
     /// Index into `saved_bivariate_grids` currently loaded into `bivariate_grid_cache`.
     pub active_saved_bivariate_grid: Option<usize>,
+    /// Set when this layer was loaded with "Batch load" on — tracks which
+    /// batches have been pulled in so far, so the batch manager window can
+    /// offer "load next" / "load range" for the rest of the file.
+    pub batch_load: Option<BatchLoadState>,
 }
-impl LayerEntry {}
+
+/// Progressive-load bookkeeping for a layer loaded via `ReadOp::Range`.
+/// `batch_size`/`selected_fields` are captured from the initial load so
+/// later batches use the same schema; `loaded` records which 0-based batch
+/// indices have been pulled in (out-of-order range loads leave gaps).
+pub struct BatchLoadState {
+    pub batch_size: u64,
+    pub is_points: bool,
+    pub selected_fields: Option<Vec<String>>,
+    pub total_batches: u64,
+    pub loaded: std::collections::HashSet<u64>,
+}
+
+impl LayerEntry {
+    /// Builds a new layer containing only `ids` (positions into this
+    /// layer's points/features) — the shared subsetting logic behind
+    /// "create layer from selection" and "create layer from sample".
+    /// `None` for a Raster source (rasters aren't feature-indexed).
+    pub fn subset_by_ids(&self, ids: &[usize], new_name: String) -> Option<LayerEntry> {
+        let mut descriptor = self.descriptor.clone();
+        descriptor.name = new_name.clone();
+        descriptor.num_features = ids.len() as u64;
+
+        let data = match &self.data {
+            LayerKind::Points(pc) => {
+                let n = ids.len();
+                let new_points: Vec<(u32, [f64; 2])> =
+                    ids.iter().map(|&id| pc.points[id]).collect();
+                let new_attrs: Vec<AttributeColumn> = pc
+                    .attributes
+                    .iter()
+                    .map(|col| match col {
+                        AttributeColumn::Text(v) => {
+                            AttributeColumn::Text(ids.iter().map(|&id| v[id].clone()).collect())
+                        }
+                        AttributeColumn::Integer(v) => {
+                            AttributeColumn::Integer(ids.iter().map(|&id| v[id]).collect())
+                        }
+                        AttributeColumn::Float(v) => {
+                            AttributeColumn::Float(ids.iter().map(|&id| v[id]).collect())
+                        }
+                    })
+                    .collect();
+                let mut new_pc = PointCloudLayer {
+                    points: std::sync::Arc::new(new_points),
+                    attributes: new_attrs,
+                    field_names: pc.field_names.clone(),
+                    index: None,
+                    bbox: None,
+                    viewport_mask: bitvec::bitvec![0; n],
+                    filter_mask: bitvec::bitvec![1; n],
+                };
+                new_pc.ensure_bbox();
+                LayerKind::Points(new_pc)
+            }
+            LayerKind::Vector(gl) => {
+                let new_features: Vec<GisFeature> = ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(new_id, &old_id)| {
+                        gl.features.get(old_id).map(|f| {
+                            GisFeature::new(new_id, f.geometry.clone(), f.attributes.clone())
+                        })
+                    })
+                    .collect();
+                let world_bbox = new_features.iter().map(|f| f.bbox()).fold(
+                    [f64::MAX, f64::MAX, f64::MIN, f64::MIN],
+                    |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
+                );
+                LayerKind::Vector(GisLayer {
+                    name: new_name.clone(),
+                    file_path: String::new(),
+                    filter_mask: bitvec::bitvec![1; new_features.len()],
+                    features: new_features,
+                    field_names: gl.field_names.clone(),
+                    extra_field_names: gl.extra_field_names.clone(),
+                    quadtree: None,
+                    point_only: gl.point_only,
+                    world_bbox,
+                })
+            }
+            LayerKind::Raster(_) => return None,
+        };
+
+        Some(LayerEntry {
+            data,
+            visible: true,
+            show_points: true,
+            name: new_name,
+            color: self.color,
+            color_by: None,
+            opacity: self.opacity,
+            descriptor,
+            filters: Vec::new(),
+            filter_logic: FilterLogic::default(),
+            roi_bboxes: Vec::new(),
+            selections: Vec::new(),
+            active_selection: None,
+            // Features are already-transformed copies of the source layer's
+            // data, not a fresh streamed load.
+            crs_transform: None,
+            show_index: false,
+            index_kind: IndexKind::Quadtree,
+            show_heatmap: false,
+            heatmap_metric: crate::heatmap::HeatmapMetric::Density,
+            heatmap_cache: None,
+            heatmap_dirty: true,
+            show_kde: false,
+            kde_cache: None,
+            saved_heatmaps: Vec::new(),
+            active_saved_heatmap: None,
+            show_gridbin: false,
+            gridbin_cache: None,
+            gridbin_metric: crate::heatmap::HeatmapMetric::Density,
+            show_bivariate_grid: false,
+            bivariate_grid_cache: None,
+            saved_bivariate_grids: Vec::new(),
+            active_saved_bivariate_grid: None,
+            batch_load: None,
+        })
+    }
+}
 
 /// A saved box-selection: a bbox plus the ids of features/points it captured.
 /// For `LayerKind::Vector`, `ids` are `GisFeature.id` values (== their index in

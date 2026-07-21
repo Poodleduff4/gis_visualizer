@@ -239,11 +239,22 @@ impl GisEditorApp {
                                         self.color_picker_layer = Some(i);
                                         ui.close_kind(egui::UiKind::Menu);
                                     }
+                                    if ui.button("Rename…").clicked() {
+                                        self.rename_layer_idx = Some(i);
+                                        self.rename_layer_buffer = entry.name.clone();
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
+                                    if entry.batch_load.is_some()
+                                        && ui.button("Batch Load Manager…").clicked()
+                                    {
+                                        self.batch_load_window_idx = Some(i);
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
                                 });
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.small_button("✕").clicked() {
+                                        if ui.small_button("X").clicked() {
                                             remove_idx = Some(i);
                                         }
                                     },
@@ -276,7 +287,7 @@ impl GisEditorApp {
                                             {
                                                 set_active_selection = Some((i, sidx));
                                             }
-                                            if ui.small_button("✕").clicked() {
+                                            if ui.small_button("X").clicked() {
                                                 remove_selection = Some((i, sidx));
                                             }
                                         });
@@ -297,7 +308,7 @@ impl GisEditorApp {
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    if ui.small_button("✕").clicked() {
+                                                    if ui.small_button("X").clicked() {
                                                         remove_heatmap = Some((i, hidx));
                                                     }
                                                     if ui
@@ -319,6 +330,9 @@ impl GisEditorApp {
                                                             "🔲"
                                                         }
                                                         crate::heatmap::HeatmapKind::Kde => "🎯",
+                                                        crate::heatmap::HeatmapKind::KdeEntropy => {
+                                                            "🌡"
+                                                        }
                                                         crate::heatmap::HeatmapKind::GridBin => {
                                                             "🟩"
                                                         }
@@ -360,7 +374,7 @@ impl GisEditorApp {
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    if ui.small_button("✕").clicked() {
+                                                    if ui.small_button("X").clicked() {
                                                         remove_bivariate = Some((i, bidx));
                                                     }
                                                     if ui
@@ -627,6 +641,20 @@ impl GisEditorApp {
                             self.raster_dirty = true;
                             self.flat_raster_dirty = true;
                             self.map_render_ttl = 3;
+
+                            // Promoted to its own layer — drop the source
+                            // snapshot so it doesn't linger duplicated.
+                            let entry = &mut self.layers[li];
+                            entry.saved_bivariate_grids.remove(bidx);
+                            let fixup = |sel: &mut Option<usize>| match *sel {
+                                Some(s) if s == bidx => *sel = None,
+                                Some(s) if s > bidx => *sel = Some(s - 1),
+                                _ => {}
+                            };
+                            fixup(&mut entry.active_saved_bivariate_grid);
+                            if entry.active_saved_bivariate_grid.is_none() {
+                                entry.show_bivariate_grid = false;
+                            }
                         }
                     }
                     #[cfg(not(target_arch = "wasm32"))]
@@ -669,6 +697,7 @@ impl GisEditorApp {
                                 .fold(f64::INFINITY, f64::min);
                             let (width, height, _actual_cell_size, values) =
                                 crate::heatmap::rasterize_cells(&saved.cells, saved.bbox, cell_size);
+                            let kind = saved.kind;
                             let layer = crate::raster_reader::build_layer_entry(
                                 saved.name.clone(),
                                 width,
@@ -683,6 +712,30 @@ impl GisEditorApp {
                             self.raster_dirty = true;
                             self.flat_raster_dirty = true;
                             self.map_render_ttl = 3;
+
+                            // Promoted to its own layer — drop the source
+                            // snapshot so it doesn't linger duplicated, and
+                            // turn off whichever live overlay toggle matches
+                            // this saved heatmap's kind so it doesn't keep
+                            // rendering on top of the new raster layer.
+                            let entry = &mut self.layers[li];
+                            entry.saved_heatmaps.remove(hidx);
+                            let fixup = |sel: &mut Option<usize>| match *sel {
+                                Some(s) if s == hidx => *sel = None,
+                                Some(s) if s > hidx => *sel = Some(s - 1),
+                                _ => {}
+                            };
+                            fixup(&mut entry.active_saved_heatmap);
+                            if entry.active_saved_heatmap.is_none() {
+                                match kind {
+                                    crate::heatmap::HeatmapKind::Quadtree => entry.show_heatmap = false,
+                                    crate::heatmap::HeatmapKind::Kde
+                                    | crate::heatmap::HeatmapKind::KdeEntropy => {
+                                        entry.show_kde = false
+                                    }
+                                    crate::heatmap::HeatmapKind::GridBin => entry.show_gridbin = false,
+                                }
+                            }
                         }
                     }
                     #[cfg(not(target_arch = "wasm32"))]

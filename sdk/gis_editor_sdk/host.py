@@ -1,5 +1,5 @@
 from . import protocol
-from .geo import arrow_to_geodataframe, arrow_to_raster, geodataframe_to_arrow
+from .geo import arrow_to_geodataframe, arrow_to_raster, geodataframe_to_arrow, raster_to_arrow
 from .protocol import HostError
 
 __all__ = ["Host", "Layer", "LayerSummary", "HostError"]
@@ -81,6 +81,33 @@ class Host:
 
     def update_layer(self, layer_id: int, gdf) -> None:
         arrow_ipc = geodataframe_to_arrow(gdf)
+        reply = self._call({"UpdateLayer": {"layer_id": layer_id, "arrow_ipc": arrow_ipc}})
+        protocol.unwrap(reply, "Ack")
+
+    def add_raster_layer(
+        self,
+        name: str,
+        bands: dict,
+        extent: tuple[float, float, float, float],
+        units: str = "",
+    ) -> None:
+        """`bands`: `{name: 2D numpy array of shape (height, width)}`, row 0
+        = north — same convention `Layer.to_raster()` returns. `extent`:
+        `(xmin, ymin, xmax, ymax)` in the map's CRS units. The host renders
+        the first band through its blue->red colormap immediately, same as
+        a loaded GeoTIFF."""
+        arrow_ipc = raster_to_arrow(bands, extent, units)
+        reply = self._call({"AddLayer": {"name": name, "arrow_ipc": arrow_ipc}})
+        protocol.unwrap(reply, "Ack")
+
+    def update_raster_layer(
+        self,
+        layer_id: int,
+        bands: dict,
+        extent: tuple[float, float, float, float],
+        units: str = "",
+    ) -> None:
+        arrow_ipc = raster_to_arrow(bands, extent, units)
         reply = self._call({"UpdateLayer": {"layer_id": layer_id, "arrow_ipc": arrow_ipc}})
         protocol.unwrap(reply, "Ack")
 

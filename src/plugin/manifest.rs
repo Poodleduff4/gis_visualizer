@@ -38,6 +38,14 @@ pub enum ParamKind {
     /// selected layer's index (the same id `list_layers`/`get_layer` use)
     /// as a plain integer under `plugin_args`.
     Layer,
+    /// A dropdown of `attribute_of`'s currently-selected layer's field
+    /// names, instead of a free-text column name — the plugin still
+    /// receives a plain string under `plugin_args`, same as `Text`.
+    Attribute,
+    /// A dropdown over `options` (fixed list, set in the manifest) — the
+    /// plugin receives the selected string under `plugin_args`, same as
+    /// `Text`.
+    Choice,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +63,15 @@ pub struct PluginParam {
     /// shows every loaded layer regardless of kind.
     #[serde(default)]
     pub layer_kind: Option<String>,
+    /// Only meaningful (and required) when `kind = "attribute"`: the `name`
+    /// of this same plugin's `Layer`-kind param whose selected layer's
+    /// fields populate the dropdown.
+    #[serde(default)]
+    pub attribute_of: Option<String>,
+    /// Only meaningful (and required) when `kind = "choice"`: the fixed
+    /// list of options shown in the dropdown.
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 impl PluginParam {

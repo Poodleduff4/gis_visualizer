@@ -4,6 +4,7 @@
 
 use std::io::{BufReader, BufWriter};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::manifest::PluginManifest;
@@ -20,9 +21,24 @@ pub enum PluginProcessError {
 }
 
 pub struct PluginProcess {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+}
+
+/// A cloneable, thread-safe handle to a running plugin's child process,
+/// held by the UI thread so it can kill a hung/slow plugin from a Cancel
+/// button while the runner thread is blocked on `recv_call`'s blocking
+/// read. Killing the process closes its stdout, which unblocks that read.
+#[derive(Clone)]
+pub struct PluginKillHandle(Arc<Mutex<Child>>);
+
+impl PluginKillHandle {
+    pub fn kill(&self) {
+        if let Ok(mut child) = self.0.lock() {
+            let _ = child.kill();
+        }
+    }
 }
 
 impl PluginProcess {
@@ -40,7 +56,15 @@ impl PluginProcess {
         let stdin = BufWriter::new(child.stdin.take().expect("stdin was piped"));
         let stdout = BufReader::new(child.stdout.take().expect("stdout was piped"));
 
-        Ok(Self { child, stdin, stdout })
+        Ok(Self {
+            child: Arc::new(Mutex::new(child)),
+            stdin,
+            stdout,
+        })
+    }
+
+    pub fn kill_handle(&self) -> PluginKillHandle {
+        PluginKillHandle(self.child.clone())
     }
 
     pub fn send(&mut self, msg: &HostRequest) -> Result<(), PluginProcessError> {
@@ -60,13 +84,14 @@ impl PluginProcess {
         let _ = self.send(&HostRequest::Shutdown);
         let deadline = std::time::Instant::now() + grace;
         while std::time::Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
+            if let Ok(Some(_)) = self.child.lock().unwrap().try_wait() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
         Ok(())
     }
 }

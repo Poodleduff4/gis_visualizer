@@ -12,7 +12,7 @@ use crate::raster_reader::read_raster_descriptor_bytes;
 use crate::raster_reader::read_raster_descriptor_sync;
 use crate::uncertainty_quadtree::MeasurementType;
 
-use super::{ClickTarget, GisEditorApp, MapView};
+use super::{ClickTarget, GisEditorApp, MapView, SelectShape};
 
 impl GisEditorApp {
     pub(super) fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -86,6 +86,12 @@ impl GisEditorApp {
                             self.points_dirty = true;
                         }
                     }
+                    ui.horizontal(|ui| {
+                        ui.label("Vector line width:");
+                        ui.add(
+                            egui::Slider::new(&mut self.vector_line_width, 0.5..=10.0).step_by(0.5),
+                        );
+                    });
                     ui.separator();
                     ui.label("Click target:");
                     ui.radio_value(&mut self.click_target, ClickTarget::Feature, "Feature");
@@ -121,6 +127,12 @@ impl GisEditorApp {
                     }
                     if ui.button("Grid Binning (Hexbin)…").clicked() {
                         self.gridbin_window_open = true;
+                        ui.close_kind(UiKind::Menu);
+                    }
+                });
+                ui.menu_button("Sampling", |ui| {
+                    if ui.button("Sample Layer…").clicked() {
+                        self.sampling_window_open = true;
                         ui.close_kind(UiKind::Menu);
                     }
                 });
@@ -265,13 +277,30 @@ impl GisEditorApp {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                if ui
-                    .toggle_value(&mut self.select_mode, "🔲 Select mode")
-                    .changed()
-                    && self.select_mode
-                {
-                    self.select_drag_start = None;
-                }
+                ui.menu_button("Select", |ui| {
+                    if ui
+                        .radio_value(&mut self.select_shape, SelectShape::Rectangle, "🔲 Rectangle")
+                        .changed()
+                    {
+                        self.select_drag_start = None;
+                        self.select_polygon.clear();
+                    }
+                    if ui
+                        .radio_value(&mut self.select_shape, SelectShape::Polygon, "🔺 Polygon")
+                        .on_hover_text(
+                            "Click to add vertices, double-click or right-click to close",
+                        )
+                        .changed()
+                    {
+                        self.select_drag_start = None;
+                        self.select_polygon.clear();
+                    }
+                    ui.separator();
+                    if ui.toggle_value(&mut self.select_mode, "Select mode").changed() {
+                        self.select_drag_start = None;
+                        self.select_polygon.clear();
+                    }
+                });
             });
         });
     }

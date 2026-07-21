@@ -14,8 +14,12 @@ def run(host: Host, params: dict):
     polygon_id = int(params["polygon_layer"])
 
     layers = {l.id: l for l in host.list_layers()}
-    points_name = layers[points_id].name if points_id in layers else f"layer {points_id}"
-    polygon_name = layers[polygon_id].name if polygon_id in layers else f"layer {polygon_id}"
+    points_name = (
+        layers[points_id].name if points_id in layers else f"layer {points_id}"
+    )
+    polygon_name = (
+        layers[polygon_id].name if polygon_id in layers else f"layer {polygon_id}"
+    )
 
     host.progress(0.0, f"reading {points_name}")
     points: gpd.GeoDataFrame = host.get_layer(points_id).to_geodataframe()
@@ -24,12 +28,20 @@ def run(host: Host, params: dict):
     polygons: gpd.GeoDataFrame = host.get_layer(polygon_id).to_geodataframe()
 
     host.progress(0.7, "intersecting")
-    within_polygons = points.geometry.within(polygons.union_all())
-    result = points[within_polygons].copy()
+    result = None
+    if params["mode"] == "intersection":
+        within_polygons = points.geometry.within(polygons.union_all())
+        result = points[within_polygons].copy()
+    elif params["mode"] == "difference":
+        within_polygons = points.geometry.within(polygons.union_all())
+        result = points[~within_polygons].copy()
 
-    host.progress(0.9, "adding result layer")
-    host.add_layer(f"{points_name} in {polygon_name}", result)
-    host.log(f"kept {len(result)} of {len(points)} points from {points_name}")
+    if result is not None:
+        host.progress(0.9, "adding result layer")
+        host.add_layer(f"{points_name} in {polygon_name}", result)
+        host.log(f"kept {len(result)} of {len(points)} points from {points_name}")
+    else:
+        host.log("Error in gdf comparison!")
 
 
 if __name__ == "__main__":

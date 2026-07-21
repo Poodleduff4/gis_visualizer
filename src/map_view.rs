@@ -1,6 +1,6 @@
 use bitvec::vec::BitVec;
 
-use crate::app::ClickTarget;
+use crate::app::{ClickTarget, SelectShape};
 use crate::basemap::BasemapCache;
 use crate::gis_layer::{
     bake_raster_rgba, LayerEntry, LayerKind, LayerSelection, RasterData, TessellatedGeom,
@@ -95,8 +95,12 @@ pub fn show_map(
     selected_index_cell_data: &mut Option<UncertaintyMeasure>,
     roi_toggle: &mut Option<[f64; 4]>,
     select_mode: bool,
+    select_shape: SelectShape,
     select_drag_start: &mut Option<Pos2>,
+    select_polygon: &mut Vec<[f64; 2]>,
     selection_result: &mut Option<[f64; 4]>,
+    polygon_selection_result: &mut Option<Vec<[f64; 2]>>,
+    vector_line_width: f32,
 ) {
     let ctx = ui.ctx().clone();
     let rect = response.rect;
@@ -116,7 +120,7 @@ pub fn show_map(
     }
 
     // Box-select: rubber-band drag while select_mode is on.
-    if select_mode {
+    if select_mode && select_shape == SelectShape::Rectangle {
         if response.drag_started() {
             *select_drag_start = response.interact_pointer_pos();
         }
@@ -144,6 +148,48 @@ pub fn show_map(
                     wx0.max(wx1),
                     wy0.max(wy1),
                 ]);
+            }
+        }
+    }
+
+    // Polygon-select: click to add vertices, double-/right-click to close
+    // the ring and commit the selection, Escape to cancel.
+    if select_mode && select_shape == SelectShape::Polygon {
+        if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let w = viewport.screen_to_world(pos.x, pos.y, rect);
+                select_polygon.push(w);
+            }
+        }
+        if (response.double_clicked() || response.secondary_clicked()) && select_polygon.len() >= 3 {
+            *polygon_selection_result = Some(std::mem::take(select_polygon));
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            select_polygon.clear();
+        }
+
+        if !select_polygon.is_empty() {
+            let mut screen_pts: Vec<Pos2> = select_polygon
+                .iter()
+                .map(|p| viewport.world_to_screen(p[0], p[1], rect))
+                .collect();
+            let vertex_count = screen_pts.len();
+            if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
+                if rect.contains(hover) {
+                    screen_pts.push(hover);
+                }
+            }
+            for w in screen_pts.windows(2) {
+                painter.line_segment([w[0], w[1]], Stroke::new(1.5, Color32::YELLOW));
+            }
+            for p in &screen_pts[..vertex_count] {
+                painter.circle_filled(*p, 3.0, Color32::YELLOW);
+            }
+            if vertex_count >= 3 {
+                painter.line_segment(
+                    [screen_pts[vertex_count - 1], screen_pts[0]],
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 0, 120)),
+                );
             }
         }
     }
@@ -231,7 +277,16 @@ pub fn show_map(
                 let feature = &layer.features[id];
                 let tess = &feature.tessellated;
                 let is_selected = is_active && *selected_id == Some(id);
-                render_tessellated(&painter, tess, viewport, rect, is_selected, fill, stroke);
+                render_tessellated(
+                    &painter,
+                    tess,
+                    viewport,
+                    rect,
+                    is_selected,
+                    fill,
+                    stroke,
+                    vector_line_width,
+                );
             }
         }
     }
@@ -445,10 +500,11 @@ fn render_tessellated(
     selected: bool,
     layer_fill: Color32,
     layer_stroke: Color32,
+    line_width: f32,
 ) {
     let fill = if selected { FILL_SELECTED } else { layer_fill };
     let stroke_color = if selected { STROKE_SELECTED } else { layer_stroke };
-    let stroke = Stroke::new(1.0, stroke_color);
+    let stroke = Stroke::new(line_width, stroke_color);
 
     // Filled polygon mesh
     if !tess.fill_idx.is_empty() {
@@ -476,7 +532,7 @@ fn render_tessellated(
             .iter()
             .map(|v| viewport.world_to_screen(v[0], v[1], rect))
             .collect();
-        painter.add(Shape::closed_line(pts, stroke));
+        painter.add(Shape::line(pts, stroke));
     }
 }
 
@@ -532,31 +588,36 @@ pub fn render_vector_points(
 }
 
 /// Draw a GeoTIFF raster as a single textured rect spanning its full-globe
-/// bbox [-180,-90,180,90]. `texture_cache` is re-baked only when `dirty` (or
-/// empty) — baking + uploading a fresh texture every frame isn't free.
+/// bbox [-180,-90,180,90]. `texture_cache[layer_idx]` is re-baked only when
+/// `dirty` (or not yet baked) — baking + uploading a fresh texture every
+/// frame isn't free. Called once per visible raster layer (each with its own
+/// `layer_idx`/opacity) so multiple rasters alpha-blend on top of each other
+/// instead of the topmost one fully occluding the rest.
 pub fn render_raster_overlay(
     ui: &Ui,
     painter: &Painter,
     raster: &RasterData,
     viewport: &Viewport,
     rect: Rect,
-    texture_cache: &mut Option<egui::TextureHandle>,
+    texture_cache: &mut std::collections::HashMap<usize, egui::TextureHandle>,
+    layer_idx: usize,
     dirty: bool,
     opacity: u8,
 ) {
-    if dirty || texture_cache.is_none() {
+    if dirty || !texture_cache.contains_key(&layer_idx) {
         let rgba = bake_raster_rgba(raster);
         let image = egui::ColorImage::from_rgba_unmultiplied([raster.width, raster.height], &rgba);
-        *texture_cache = Some(ui.ctx().load_texture(
-            "raster_overlay",
+        let texture = ui.ctx().load_texture(
+            format!("raster_overlay_{layer_idx}"),
             image,
             // NEAREST, not LINEAR: matches QGIS's default resampling — crisp
             // cell edges at native/zoomed-in scale instead of blurring
             // neighboring pixels together.
             egui::TextureOptions::NEAREST,
-        ));
+        );
+        texture_cache.insert(layer_idx, texture);
     }
-    let Some(texture) = texture_cache else { return };
+    let Some(texture) = texture_cache.get(&layer_idx) else { return };
 
     let [xmin, ymin, xmax, ymax] = raster.extent;
     let top_left = viewport.world_to_screen(xmin, ymax, rect);

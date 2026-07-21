@@ -1,4 +1,4 @@
-name = "od-flow-lines"
+name = "od-endpoints"
 entrypoint = "main.py"
 capabilities = ["read_layers", "add_layer"]
 
@@ -21,7 +21,7 @@ kind = "attribute"
 attribute_of = "od_layer"
 
 [[params]]
-name = "bin_size"
-label = "Zone bin size, coordinate units (0 = no aggregation)"
-kind = "float"
-default = 0.0
+name = "endpoint_set"
+label = "Endpoints to output: origin, destination, or both"
+kind = "text"
+default = "both"

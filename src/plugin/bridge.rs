@@ -28,7 +28,10 @@ use geo::BoundingRect;
 use geozero::{wkb::Wkb, CoordDimensions, ToGeo, ToWkb};
 
 use crate::filter::FilterLogic;
-use crate::gis_layer::{AttributeValue, GisFeature, GisLayer, LayerEntry, LayerKind, RasterData};
+use crate::gis_layer::{
+    AttributeValue, GisFeature, GisLayer, LayerEntry, LayerKind, RasterBand, RasterData,
+    RasterDisplayMode,
+};
 use crate::gis_reader::{GisFilePath, LayerDescriptor};
 use crate::point_cloud_layer::{AttributeColumn, PointCloudLayer};
 
@@ -290,6 +293,107 @@ pub fn decode_vector_layer(bytes: &[u8], name: String) -> Result<GisLayer> {
     })
 }
 
+/// Decodes an Arrow IPC buffer produced by `encode_raster_layer`'s schema
+/// (one `Float32` column per band, `width`/`height`/`units`/`extent` as
+/// schema metadata) into a fresh `RasterData`. `data_min`/`data_max` per
+/// band are recomputed from the values rather than trusted from the
+/// plugin, since nothing round-trips them; `display_min`/`display_max`
+/// default to that range so the band renders through the full color ramp
+/// immediately, same as a freshly-loaded GeoTIFF.
+pub fn decode_raster_layer(bytes: &[u8]) -> Result<RasterData> {
+    let mut reader = StreamReader::try_new(bytes, None)?;
+    let meta = reader.schema().metadata().clone();
+    let width: usize = meta
+        .get("width")
+        .context("raster Arrow buffer missing 'width' metadata")?
+        .parse()
+        .context("'width' metadata isn't a valid integer")?;
+    let height: usize = meta
+        .get("height")
+        .context("raster Arrow buffer missing 'height' metadata")?
+        .parse()
+        .context("'height' metadata isn't a valid integer")?;
+    let units = meta.get("units").cloned().unwrap_or_default();
+    let extent_parts: Vec<f64> = meta
+        .get("extent")
+        .context("raster Arrow buffer missing 'extent' metadata")?
+        .split(',')
+        .map(|s| s.parse::<f64>())
+        .collect::<std::result::Result<_, _>>()
+        .context("'extent' metadata isn't 4 comma-separated numbers")?;
+    let extent: [f64; 4] = extent_parts
+        .try_into()
+        .map_err(|_| anyhow!("'extent' metadata must have exactly 4 values"))?;
+
+    let batch = reader
+        .next()
+        .context("Arrow IPC buffer contained no record batches")??;
+
+    let mut bands = Vec::with_capacity(batch.num_columns());
+    for field in batch.schema().fields() {
+        let arr = batch
+            .column_by_name(field.name())
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .with_context(|| format!("raster band '{}' isn't Float32-typed", field.name()))?;
+        let values: Vec<f32> = arr.values().to_vec();
+        if values.len() != width * height {
+            return Err(anyhow!(
+                "raster band '{}' has {} values, expected {}x{}={}",
+                field.name(),
+                values.len(),
+                width,
+                height,
+                width * height
+            ));
+        }
+
+        let (mut data_min, mut data_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &v in &values {
+            if !v.is_nan() {
+                data_min = data_min.min(v as f64);
+                data_max = data_max.max(v as f64);
+            }
+        }
+        if !data_min.is_finite() || !data_max.is_finite() {
+            data_min = 0.0;
+            data_max = 0.0;
+        }
+
+        bands.push(RasterBand {
+            name: field.name().clone(),
+            values,
+            data_min,
+            data_max,
+            display_min: data_min,
+            display_max: data_max,
+        });
+    }
+
+    Ok(RasterData {
+        width,
+        height,
+        bands,
+        units,
+        display_mode: RasterDisplayMode::Single(0),
+        extent,
+    })
+}
+
+/// Dispatches an `AddLayer`/`UpdateLayer` Arrow buffer to `decode_vector_layer`
+/// or `decode_raster_layer` based on schema shape — a raster buffer carries
+/// `width`/`height` schema metadata (see `encode_raster_layer`) that a
+/// vector buffer never has, so that's a cheap and unambiguous discriminator.
+pub fn decode_layer_from_arrow(bytes: &[u8], name: String) -> Result<LayerKind> {
+    let reader = StreamReader::try_new(bytes, None)?;
+    if reader.schema().metadata().contains_key("width") {
+        decode_raster_layer(bytes).map(LayerKind::Raster)
+    } else {
+        decode_vector_layer(bytes, name).map(LayerKind::Vector)
+    }
+}
+
 /// If every feature in `layer` is a bare `Point`, converts it into a
 /// `PointCloudLayer` instead of leaving it as a `GisLayer` — so a
 /// plugin-added point layer rides the exact same GPU-instanced point-cloud
@@ -432,6 +536,7 @@ pub fn layer_entry_for(name: String, data: LayerKind) -> LayerEntry {
         bivariate_grid_cache: None,
         saved_bivariate_grids: Vec::new(),
         active_saved_bivariate_grid: None,
+        batch_load: None,
     }
 }
 
@@ -547,6 +652,73 @@ mod tests {
             .unwrap();
         assert_eq!(elevation.value(0), 1.0);
         assert_eq!(elevation.value(3), 4.0);
+    }
+
+    #[test]
+    fn decode_raster_layer_round_trips_and_recomputes_data_range() {
+        use crate::gis_layer::{RasterBand, RasterDisplayMode};
+
+        let raster = RasterData {
+            width: 2,
+            height: 2,
+            bands: vec![RasterBand {
+                name: "elevation".into(),
+                values: vec![1.0, 2.0, 3.0, 4.0],
+                data_min: 999.0, // deliberately wrong — decode must recompute, not trust this
+                data_max: 999.0,
+                display_min: 1.0,
+                display_max: 4.0,
+            }],
+            units: "m".into(),
+            display_mode: RasterDisplayMode::Single(0),
+            extent: [-10.0, -20.0, 10.0, 20.0],
+        };
+
+        let bytes = encode_raster_layer(&raster).expect("encode");
+        let decoded = decode_raster_layer(&bytes).expect("decode");
+
+        assert_eq!(decoded.width, 2);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(decoded.units, "m");
+        assert_eq!(decoded.extent, [-10.0, -20.0, 10.0, 20.0]);
+        assert_eq!(decoded.bands.len(), 1);
+        assert_eq!(decoded.bands[0].values, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(decoded.bands[0].data_min, 1.0);
+        assert_eq!(decoded.bands[0].data_max, 4.0);
+        assert_eq!(decoded.bands[0].display_min, 1.0);
+        assert_eq!(decoded.bands[0].display_max, 4.0);
+    }
+
+    #[test]
+    fn decode_layer_from_arrow_dispatches_on_schema_metadata() {
+        use crate::gis_layer::{RasterBand, RasterDisplayMode};
+
+        let vector_bytes = encode_vector_layer(&sample_layer()).expect("encode vector");
+        match decode_layer_from_arrow(&vector_bytes, "test".into()).expect("decode vector") {
+            LayerKind::Vector(gl) => assert_eq!(gl.features.len(), 2),
+            _ => panic!("expected Vector"),
+        }
+
+        let raster = RasterData {
+            width: 1,
+            height: 1,
+            bands: vec![RasterBand {
+                name: "b".into(),
+                values: vec![5.0],
+                data_min: 5.0,
+                data_max: 5.0,
+                display_min: 5.0,
+                display_max: 5.0,
+            }],
+            units: String::new(),
+            display_mode: RasterDisplayMode::Single(0),
+            extent: [0.0, 0.0, 1.0, 1.0],
+        };
+        let raster_bytes = encode_raster_layer(&raster).expect("encode raster");
+        match decode_layer_from_arrow(&raster_bytes, "r".into()).expect("decode raster") {
+            LayerKind::Raster(r) => assert_eq!(r.bands[0].values, vec![5.0]),
+            _ => panic!("expected Raster"),
+        }
     }
 
     #[test]

@@ -14,3 +14,10 @@ name = "polygon_layer"
 label = "Polygon layer"
 kind = "layer"
 layer_kind = "vector"
+
+[[params]]
+name = "mode"
+label = "Mode"
+kind = "choice"
+options = ["intersection", "difference"]
+default = "intersection"

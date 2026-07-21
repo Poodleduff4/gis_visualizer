@@ -25,6 +25,7 @@ mod globe;
 mod sidebar;
 mod spatial_index;
 mod rtree_index;
+mod sampling;
 mod selection_stats;
 mod stats_core;
 mod uncertainty_quadtree;

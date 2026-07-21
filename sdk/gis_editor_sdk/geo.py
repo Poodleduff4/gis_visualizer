@@ -14,6 +14,7 @@ regardless of what kind it read from, not another multi-million-row point
 cloud.
 """
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import shapely
@@ -72,6 +73,42 @@ def arrow_to_raster(arrow_ipc: bytes) -> dict:
         "extent": extent,
         "bands": bands,
     }
+
+
+def raster_to_arrow(
+    bands: dict, extent: tuple[float, float, float, float], units: str = ""
+) -> bytes:
+    """Encodes a dict of 2D numpy arrays (`{name: array of shape (height,
+    width)}`, row 0 = north, matching the host's grid convention — see
+    `arrow_to_raster`) into the Arrow IPC schema `bridge::decode_raster_layer`
+    expects: one `Float32` column per band (row-major flattened), with
+    `width`/`height`/`units`/`extent` carried as schema metadata rather than
+    repeated per row.
+    """
+    names = list(bands.keys())
+    shapes = {bands[n].shape for n in names}
+    if len(shapes) != 1:
+        raise ValueError(f"all bands must share one (height, width) shape, got {shapes}")
+    (height, width) = next(iter(shapes))
+
+    fields = [pa.field(name, pa.float32(), nullable=False) for name in names]
+    arrays = [
+        pa.array(np.asarray(bands[name], dtype=np.float32).reshape(-1), type=pa.float32())
+        for name in names
+    ]
+
+    metadata = {
+        "width": str(width),
+        "height": str(height),
+        "units": units,
+        "extent": ",".join(str(float(v)) for v in extent),
+    }
+    schema = pa.schema(fields, metadata=metadata)
+    batch = pa.record_batch(arrays, schema=schema)
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, schema) as writer:
+        writer.write_batch(batch)
+    return sink.getvalue().to_pybytes()
 
 
 def geodataframe_to_arrow(gdf: gpd.GeoDataFrame) -> bytes:

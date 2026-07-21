@@ -1,16 +1,15 @@
 """Turns an OD (origin-destination) points layer into flow lines: one
 LineString per trip, origin taken from the layer's own geometry, destination
-from a `dest_lat_col`/`dest_lon_col` attribute pair. `mode_col`/`activity_col`
-(if present) are carried onto the output as `mode`/`activity_type` so the
-core app's per-attribute categorical coloring and attribute filtering (Layer
-Color window / filter panel) can be used directly on the result — this
-plugin only builds geometry, it doesn't do any styling itself.
+from a `dest_lat_col`/`dest_lon_col` attribute pair. Output is geometry only
+— no assumptions about mode/activity/weight-style attributes, since those
+aren't present in every OD dataset; downstream styling (categorical color,
+filtering) works off whatever attributes the source layer actually has.
 
 With `bin_size` > 0, origin and destination coordinates are snapped to a
-grid of that size (in the layer's own coordinate units) before rows are
-grouped by (mode, activity, origin bin, destination bin) and collapsed into
-one weighted flow line per group — keeps the output renderable when the
-source has hundreds of thousands of raw trips.
+grid of that size (in the layer's own coordinate units) and duplicate
+(origin bin, destination bin) pairs are collapsed into one flow line —
+keeps the output renderable when the source has hundreds of thousands of
+raw trips.
 """
 
 import geopandas as gpd
@@ -30,8 +29,6 @@ def run(host: Host, params: dict):
     layer_id = int(params["od_layer"])
     dest_lat_col = params.get("dest_lat_col") or "d_lat"
     dest_lon_col = params.get("dest_lon_col") or "d_lon"
-    mode_col = params.get("mode_col") or "mode"
-    activity_col = params.get("activity_col") or "activity_type"
     bin_size = float(params.get("bin_size", 0.0))
 
     target = next((l for l in host.list_layers() if l.id == layer_id), None)
@@ -52,33 +49,22 @@ def run(host: Host, params: dict):
         "d_lon": gdf[dest_lon_col],
         "d_lat": gdf[dest_lat_col],
     })
-    trips["mode"] = gdf[mode_col] if mode_col in gdf.columns else "unknown"
-    trips["activity_type"] = gdf[activity_col] if activity_col in gdf.columns else "unknown"
     trips = trips.dropna(subset=["o_lon", "o_lat", "d_lon", "d_lat"])
 
     if bin_size > 0:
         host.progress(0.5, f"binning {len(trips)} trips (bin size {bin_size})")
         for col in ("o_lon", "o_lat", "d_lon", "d_lat"):
             trips[col] = snap(trips[col], bin_size)
-        flows = (
-            trips.groupby(["o_lon", "o_lat", "d_lon", "d_lat", "mode", "activity_type"])
-            .size()
-            .reset_index(name="weight")
-        )
+        flows = trips.drop_duplicates(subset=["o_lon", "o_lat", "d_lon", "d_lat"])
     else:
-        flows = trips.copy()
-        flows["weight"] = 1
+        flows = trips
 
     host.progress(0.8, f"building {len(flows)} flow lines")
     geometry = [
         LineString([(row.o_lon, row.o_lat), (row.d_lon, row.d_lat)])
         for row in flows.itertuples()
     ]
-    result = gpd.GeoDataFrame(
-        flows[["mode", "activity_type", "weight"]],
-        geometry=geometry,
-        crs=gdf.crs,
-    )
+    result = gpd.GeoDataFrame(geometry=geometry, crs=gdf.crs)
 
     host.progress(0.95, "adding result layer")
     host.add_layer(f"{name} (OD flows)", result)
