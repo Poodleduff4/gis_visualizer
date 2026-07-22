@@ -1283,7 +1283,7 @@ impl GisEditorApp {
         self.kde_running = true;
         self.status = format!("Computing KDE ({} pts)…", points.len());
 
-        std::thread::spawn(move || {
+        let compute = move || {
             let cells = crate::kde::build_kde_grid(&points, weights.as_deref(), bbox, &params);
             let saved = crate::heatmap::SavedHeatmap::new(
                 format!(
@@ -1297,7 +1297,15 @@ impl GisEditorApp {
                 attribute_name.clone(),
             );
             let heatmap = crate::heatmap::HeatmapLayer::from_kde_cells(cells, attribute_name);
-            tx.send((idx, heatmap, saved)).ok();
+            (idx, heatmap, saved)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            tx.send(compute()).ok();
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            tx.send(compute()).ok();
         });
     }
 
@@ -1359,7 +1367,7 @@ impl GisEditorApp {
         self.kde_running = true;
         self.status = format!("Computing KDE entropy ({} pts)…", points.len());
 
-        std::thread::spawn(move || {
+        let compute = move || {
             let cells =
                 crate::kde::build_kde_entropy_grid(&points, weights.as_deref(), bbox, &params, window);
             let saved = crate::heatmap::SavedHeatmap::new(
@@ -1375,7 +1383,15 @@ impl GisEditorApp {
                 attribute_name.clone(),
             );
             let heatmap = crate::heatmap::HeatmapLayer::from_kde_cells(cells, attribute_name);
-            tx.send((idx, heatmap, saved)).ok();
+            (idx, heatmap, saved)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            tx.send(compute()).ok();
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            tx.send(compute()).ok();
         });
     }
 
@@ -1439,8 +1455,8 @@ impl GisEditorApp {
         self.bivariate_grid_running = true;
         self.status = format!("Computing bivariate grid ({} pts)…", points.len());
 
-        std::thread::spawn(move || {
-            let Some(layer) = crate::bivariate::BivariateGridLayer::build(
+        let compute = move || {
+            let layer = crate::bivariate::BivariateGridLayer::build(
                 &points,
                 &values_a,
                 &values_b,
@@ -1448,15 +1464,25 @@ impl GisEditorApp {
                 cell_size,
                 field_a,
                 field_b,
-            ) else {
-                return;
-            };
+            )?;
             let saved = crate::bivariate::SavedBivariateGrid::from_layer(
                 format!("Bivariate {} x {}", layer.attr_a, layer.attr_b),
                 cell_size,
                 &layer,
             );
-            tx.send((idx, layer, saved)).ok();
+            Some((idx, layer, saved))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            if let Some(result) = compute() {
+                tx.send(result).ok();
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(result) = compute() {
+                tx.send(result).ok();
+            }
         });
     }
 
@@ -1568,7 +1594,7 @@ impl GisEditorApp {
         self.gridbin_running = true;
         self.status = format!("Computing grid bins ({} pts)…", points.len());
 
-        std::thread::spawn(move || {
+        let compute = move || {
             let cells = crate::gridbin::build_gridbin(&points, values.as_deref(), bbox, cell_size);
             let raw_cells: Vec<([f64; 4], f32)> = cells
                 .iter()
@@ -1581,7 +1607,15 @@ impl GisEditorApp {
                 attribute_name.clone(),
             );
             let heatmap = crate::heatmap::HeatmapLayer::from_grid_cells(cells, attribute_name);
-            tx.send((idx, heatmap, saved)).ok();
+            (idx, heatmap, saved)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            tx.send(compute()).ok();
+        });
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            tx.send(compute()).ok();
         });
     }
 }

@@ -7,7 +7,7 @@ use geo_types::{Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiP
 use geozero::{error::GeozeroError, ColumnValue, PropertyProcessor, ToGeo};
 use std::{
     collections::HashMap,
-    io::{BufReader, Read, Seek},
+    io::{BufReader, Cursor, Read, Seek},
     sync::mpsc,
 };
 
@@ -29,12 +29,9 @@ use std::sync::{atomic::AtomicBool, Arc};
 #[cfg(not(target_arch = "wasm32"))]
 use datafusion::prelude::*;
 
-// Wasm: read parquet directly from bytes using the parquet crate.
-#[cfg(target_arch = "wasm32")]
+// Read parquet directly from in-memory bytes (used for wasm local files and,
+// on every target, for HTTP-fetched files) via the parquet crate's sync API.
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-#[cfg(target_arch = "wasm32")]
-use std::io::Cursor;
 
 #[cfg(target_arch = "wasm32")]
 pub type FgbReaderCache = std::rc::Rc<
@@ -166,6 +163,22 @@ pub(crate) fn vector_file_type(path: &str) -> anyhow::Result<VectorFileType> {
     } else {
         bail!("Unsupported vector file extension: {path}");
     }
+}
+
+/// Blocking full-file download for `GisFilePath::HttpLocation` on native —
+/// there's no async object-store/streaming wiring for `https://` GeoParquet
+/// or FlatGeobuf on desktop (unlike wasm, which streams FlatGeobuf via
+/// `HttpFgbReader` bbox range requests), so the whole file is fetched once
+/// and handed to the same in-memory parsers used for local files.
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_url_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+    let mut resp = ureq::get(url)
+        .header("User-Agent", "gis_editor/0.1")
+        .call()
+        .map_err(|e| anyhow::anyhow!("HTTP GET {url} failed: {e}"))?;
+    let mut bytes = Vec::new();
+    resp.body_mut().as_reader().read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// How much of a file to read: everything, only what intersects a bbox, or
@@ -1233,19 +1246,77 @@ impl GeoParquetReader {
     }
 }
 
-// ── GeoParquetReader — wasm impl (reads from in-memory bytes) ────────────
-
-#[cfg(target_arch = "wasm32")]
+// ── GeoParquetReader — in-memory-bytes impl ──────────────────────────────
+//
+// Same sync `parquet` crate API on every target: used for wasm local files
+// (picked via the file dialog) and, on every target, for HTTP-fetched bytes
+// (native has no async object-store wiring for `https://` GeoParquet, so
+// the whole file is downloaded once and handed to this reader instead of
+// DataFusion's path-based loader).
 impl GeoParquetReader {
-    pub fn load_descriptor_from_bytes(bytes: &[u8], name: &str) -> anyhow::Result<LayerDescriptor> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        let bytes = ::bytes::Bytes::copy_from_slice(bytes);
-        let raw: Arc<[u8]> = Arc::from(bytes.as_ref());
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+    /// Reads one non-null `geometry` value from the WKB column and decodes
+    /// its header to find the actual geometry type — mirrors
+    /// `sniff_wkb_geometry_type`, but synchronously over an already-built
+    /// reader instead of a DataFusion query.
+    fn sniff_wkb_geometry_type_from_bytes(
+        reader: impl Iterator<Item = Result<RecordBatch, arrow::error::ArrowError>>,
+        geom_idx: usize,
+    ) -> Option<u32> {
+        for batch in reader {
+            let batch = batch.ok()?;
+            let casted = arrow::compute::cast(batch.column(geom_idx), &ArrowDataType::Binary).ok()?;
+            let bytes = if let Some(a) = casted.as_any().downcast_ref::<BinaryArray>() {
+                (0..a.len()).find(|&i| !a.is_null(i)).map(|i| a.value(i))
+            } else if let Some(a) = casted.as_any().downcast_ref::<LargeBinaryArray>() {
+                (0..a.len()).find(|&i| !a.is_null(i)).map(|i| a.value(i))
+            } else {
+                None
+            };
+            if let Some(bytes) = bytes {
+                return wkb_header_geom_type(bytes);
+            }
+        }
+        None
+    }
+
+    pub fn load_descriptor_from_bytes(
+        bytes: &[u8],
+        name: &str,
+        location: GisFilePath,
+    ) -> anyhow::Result<LayerDescriptor> {
+        let pq_bytes = ::bytes::Bytes::copy_from_slice(bytes);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(pq_bytes)?;
         let schema = builder.schema().as_ref().clone();
         let num_features = builder.metadata().file_metadata().num_rows() as u64;
-        let crs = parquet_geo_crs_label(builder.metadata().file_metadata().key_value_metadata());
+        let kv = builder.metadata().file_metadata().key_value_metadata();
+        let crs = parquet_geo_crs_label(kv);
+        let encoding = parquet_geo_encoding(kv).unwrap_or_else(|| "wkb".to_string());
         let geom_src = detect_geometry_source(&schema);
+
+        let geometry_type = match &geom_src {
+            GeometrySource::XYColumns { .. } => GeometryType(1),
+            GeometrySource::WkbColumn if encoding == "wkb" => {
+                let geom_idx = schema.index_of("geometry").ok();
+                match geom_idx {
+                    Some(idx) => {
+                        let reader = builder.build()?;
+                        match Self::sniff_wkb_geometry_type_from_bytes(reader, idx) {
+                            Some(1) => GeometryType(1),
+                            _ => GeometryType(0),
+                        }
+                    }
+                    None => GeometryType(0),
+                }
+            }
+            GeometrySource::WkbColumn => {
+                if encoding == "point" {
+                    GeometryType(1)
+                } else {
+                    GeometryType(0)
+                }
+            }
+        };
+
         let geom_cols: std::collections::HashSet<String> = match &geom_src {
             GeometrySource::XYColumns { x_col, y_col } => {
                 [x_col.clone(), y_col.clone(), "idx".to_string()].into()
@@ -1267,8 +1338,8 @@ impl GeoParquetReader {
             name: display_name,
             num_features,
             field_names,
-            geometry_type: flatgeobuf::GeometryType(1),
-            location: GisFilePath::Bytes(raw, name.to_string()),
+            geometry_type,
+            location,
             crs_epsg: crs.as_deref().and_then(parse_epsg_from_label),
             crs,
         })
@@ -1297,6 +1368,33 @@ impl GeoParquetReader {
                 selected_fields.as_deref(),
                 id_base,
             )? {
+                tx.send(msg).ok();
+            }
+            id_base += nrows as u32;
+        }
+        Ok(())
+    }
+
+    /// Vector-geometry counterpart to `load_point_layer_batched_from_bytes`,
+    /// for GeoParquet files whose `geometry` column holds lines/polygons.
+    pub fn load_vector_layer_batched_from_bytes(
+        bytes: Arc<[u8]>,
+        dest_idx: usize,
+        tx: mpsc::SyncSender<BatchMessage>,
+        selected_fields: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let pq_bytes = ::bytes::Bytes::copy_from_slice(&bytes);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(pq_bytes)?;
+        let encoding = parquet_geo_encoding(builder.metadata().file_metadata().key_value_metadata())
+            .unwrap_or_else(|| "wkb".to_string());
+        let reader = builder.build()?;
+        let mut id_base: u32 = 0;
+        for result in reader {
+            let batch = result?;
+            let nrows = batch.num_rows();
+            if let Some(msg) =
+                extract_vector_batch(&batch, dest_idx, id_base, selected_fields.as_deref(), &encoding)?
+            {
                 tx.send(msg).ok();
             }
             id_base += nrows as u32;
@@ -1653,7 +1751,14 @@ pub struct GisReader {}
 
 impl GisReader {
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn load_layer_descriptor(path: &str) -> anyhow::Result<LayerDescriptor> {
+    pub fn load_layer_descriptor(location: &GisFilePath) -> anyhow::Result<LayerDescriptor> {
+        let path = match location {
+            GisFilePath::LocalFile(path) => path,
+            GisFilePath::HttpLocation(url) => return Self::load_layer_descriptor_from_url(url),
+            GisFilePath::Bytes(..) => {
+                bail!("Wrong GisFilePath type for native load_layer_descriptor")
+            }
+        };
         match vector_file_type(path)? {
             VectorFileType::GeoParquet => GeoParquetReader::load_descriptor(path),
             VectorFileType::FlatGeobuf => {
@@ -1668,6 +1773,33 @@ impl GisReader {
                     GisFilePath::LocalFile(path.to_string()),
                 )
             }
+        }
+    }
+
+    /// Descriptor counterpart to [`Self::read_http_location`]: downloads the
+    /// whole file once and hands the bytes to the same in-memory parsers
+    /// (`GeoParquetReader`/`GeoJsonReader` `_from_bytes`, or `FgbReader` over
+    /// a `Cursor`) used for locally-picked files, rather than DataFusion's
+    /// path-based loader — native has no async object-store wiring for
+    /// `https://` GeoParquet/FlatGeobuf.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_layer_descriptor_from_url(url: &str) -> anyhow::Result<LayerDescriptor> {
+        let bytes = fetch_url_bytes(url)?;
+        match vector_file_type(url)? {
+            VectorFileType::FlatGeobuf => {
+                let reader = FgbReader::open(Cursor::new(bytes))?;
+                Self::make_layer_descriptor(reader.header(), GisFilePath::HttpLocation(url.to_string()))
+            }
+            VectorFileType::GeoParquet => GeoParquetReader::load_descriptor_from_bytes(
+                &bytes,
+                url,
+                GisFilePath::HttpLocation(url.to_string()),
+            ),
+            VectorFileType::GeoJson => GeoJsonReader::load_descriptor_from_bytes(
+                &bytes,
+                url,
+                GisFilePath::HttpLocation(url.to_string()),
+            ),
         }
     }
 
@@ -1731,6 +1863,9 @@ impl GisReader {
         tx: mpsc::SyncSender<BatchMessage>,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
+        if let GisFilePath::HttpLocation(url) = &path {
+            return Self::read_http_location(url, dest_idx, is_points, selected_fields, tx);
+        }
         let GisFilePath::LocalFile(str_path) = &path else {
             bail!("Wrong GisFilePath type!");
         };
@@ -1828,6 +1963,57 @@ impl GisReader {
                         tx,
                         selected_fields,
                     )
+                }
+            }
+        }
+    }
+
+    /// `HttpLocation` counterpart to the `LocalFile` dispatch above: downloads
+    /// the whole file once (no bbox/range pushdown — same tradeoff GeoJSON
+    /// already makes locally, since viewport filtering happens in the
+    /// shaders regardless) and feeds the bytes to the same in-memory parsers
+    /// used for wasm's locally-picked files.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_http_location(
+        url: &str,
+        dest_idx: usize,
+        is_points: bool,
+        selected_fields: Option<Vec<String>>,
+        tx: mpsc::SyncSender<BatchMessage>,
+    ) -> anyhow::Result<()> {
+        let bytes = fetch_url_bytes(url)?;
+        match vector_file_type(url)? {
+            VectorFileType::FlatGeobuf => {
+                let reader = FgbReader::open(Cursor::new(bytes))?;
+                if is_points {
+                    Self::load_point_layer_batched_impl(reader, dest_idx, tx, selected_fields)
+                } else {
+                    Self::load_layer_batched_impl(reader, dest_idx, tx, selected_fields)
+                }
+            }
+            VectorFileType::GeoParquet => {
+                let bytes: Arc<[u8]> = bytes.into();
+                if is_points {
+                    GeoParquetReader::load_point_layer_batched_from_bytes(
+                        bytes,
+                        dest_idx,
+                        tx,
+                        selected_fields,
+                    )
+                } else {
+                    GeoParquetReader::load_vector_layer_batched_from_bytes(
+                        bytes,
+                        dest_idx,
+                        tx,
+                        selected_fields,
+                    )
+                }
+            }
+            VectorFileType::GeoJson => {
+                if is_points {
+                    GeoJsonReader::load_point_batches_from_bytes(&bytes, dest_idx, tx, selected_fields)
+                } else {
+                    GeoJsonReader::load_vector_batches_from_bytes(&bytes, dest_idx, tx, selected_fields)
                 }
             }
         }
@@ -2082,7 +2268,14 @@ impl GisReader {
                         selected_fields,
                     )
                 }
-                (VectorFileType::GeoParquet, false) => Ok(()),
+                (VectorFileType::GeoParquet, false) => {
+                    GeoParquetReader::load_vector_layer_batched_from_bytes(
+                        bytes.clone(),
+                        dest_idx,
+                        tx,
+                        selected_fields,
+                    )
+                }
                 (VectorFileType::GeoJson, true) => {
                     GeoJsonReader::load_point_batches_from_bytes(bytes, dest_idx, tx, selected_fields)
                 }

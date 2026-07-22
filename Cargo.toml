@@ -41,6 +41,7 @@ serde_bytes = "0.11"
 thiserror = "2"
 proj4rs = { version = "0.1", features = ["crs-definitions"] }
 crs-definitions = "0.4"
+bytes = "1"
 
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -75,7 +76,6 @@ web-sys = { version = "0.3", features = [
 ] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-bytes = "1"
 gloo-timers = { version = "0.3", features = ["futures"] }
 
 

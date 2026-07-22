@@ -1158,6 +1158,7 @@ impl GisEditorApp {
     /// earlier would bake in a stale, unfiltered result. See
     /// `open_snapshot_layer`/the layer-settings-restore block in `mod.rs`,
     /// which defers into `pending_selections` instead of building ids inline.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn resolve_pending_snapshot_selections(&mut self) {
         let Some(restore) = &self.snapshot_restore else { return };
         if restore.pending_selections.is_empty() {

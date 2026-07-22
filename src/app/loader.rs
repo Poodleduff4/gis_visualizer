@@ -13,7 +13,7 @@ use super::{GisEditorApp, LoadMode};
 impl GisEditorApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn open_file(&mut self, path: GisFilePath) {
-        match GisReader::load_layer_descriptor(&path.to_string()) {
+        match GisReader::load_layer_descriptor(&path) {
             Ok(descriptor) => self.apply_layer(descriptor, path),
             Err(e) => self.status = format!("Error reading layers: {e}"),
         }
@@ -44,7 +44,11 @@ impl GisEditorApp {
                         &name,
                         GisFilePath::Bytes(bytes.clone(), name.clone()),
                     ),
-                    _ => GeoParquetReader::load_descriptor_from_bytes(&bytes, &name),
+                    _ => GeoParquetReader::load_descriptor_from_bytes(
+                        &bytes,
+                        &name,
+                        GisFilePath::Bytes(bytes.clone(), name.clone()),
+                    ),
                 };
                 match result {
                     Ok(descriptor) => {

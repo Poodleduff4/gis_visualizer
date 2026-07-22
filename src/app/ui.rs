@@ -16,6 +16,7 @@ impl eframe::App for GisEditorApp {
         self.show_sidebar_panel(ui);
         self.apply_filters(ui);
         self.roi_progressive_rebuild();
+        #[cfg(not(target_arch = "wasm32"))]
         self.resolve_pending_snapshot_selections();
         self.poll_spatial_analysis(ui);
         self.rebuild_indices_on_slider_change();
